@@ -1472,7 +1472,8 @@ trimTrailingWhitespace:(BOOL)trimSelectionTrailingSpaces
                               lineContainsNonImage = YES;
                           }
                           if (theChar.image) {
-                              if (attributeProvider && theChar.foregroundColor == 0 && theChar.backgroundColor == 0) {
+                              VT100GridCoord imagePos = GetPositionOfImageInChar(theChar);
+                              if (attributeProvider && imagePos.x == 0 && imagePos.y == 0) {
                                   iTermImageInfo *imageInfo = GetImageInfo(theChar.code);
                                   NSImage *image = imageInfo.image.images.firstObject;
                                   if (image) {

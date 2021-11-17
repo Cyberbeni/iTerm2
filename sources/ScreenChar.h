@@ -232,12 +232,12 @@ typedef struct screen_char_t {
     // With 24-bit semantics:
     //   foreground/backgroundColor gives red component and fg/bgGreen, fg/bgBlue
     //     give the rest of the color's components
-    // For images, foregroundColor doubles as the x index.
+    // For images, foregroundColor doubles as the x index,
+    //             fgGreen doubles as the y index.
     unsigned int foregroundColor : 8;
     unsigned int fgGreen : 8;
     unsigned int fgBlue  : 8;
 
-    // For images, backgroundColor doubles as the y index.
     unsigned int backgroundColor : 8;
     unsigned int bgGreen : 8;
     unsigned int bgBlue  : 8;

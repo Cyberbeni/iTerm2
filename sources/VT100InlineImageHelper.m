@@ -176,6 +176,10 @@
                       height:&height
                         grid:grid
                 decodedImage:decodedImage];
+    
+    // TODO: Pass correct background color
+    c.backgroundColor = ALTSEM_DEFAULT;
+    c.backgroundColorMode = ColorModeAlternate;
 
     [self writeBaseCharacter:c
                       toGrid:grid

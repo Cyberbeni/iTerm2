@@ -30,6 +30,7 @@ static void iTermMakeBackgroundColorRun(iTermBackgroundColorRun *run,
         run->isMatch = NO;
     }
     if (theLine[coord.x].image) {
+        // TODO: non-default background color draws over image
         run->bgColor = run->bgGreen = run->bgBlue = ALTSEM_DEFAULT;
         run->bgColorMode = ColorModeAlternate;
     } else {
