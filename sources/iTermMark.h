@@ -9,17 +9,18 @@
 #import <Foundation/Foundation.h>
 #import "IntervalTree.h"
 
-@protocol iTermMark <NSObject, IntervalTreeObject>
+@class iTermMark;
 
-// Should the mark be seen by the user? Returns YES by default.
-@property(nonatomic, readonly) BOOL isVisible;
-
+@protocol iTermMark <NSObject, IntervalTreeImmutableObject>
+- (iTermMark *)progenitor;
 @end
 
 // This is a base class for marks but should never be used directly.
-@interface iTermMark : NSObject<iTermMark>
+@interface iTermMark : NSObject<iTermMark, IntervalTreeObject, NSCopying>
+@property (nonatomic, readonly) BOOL isDoppelganger;
 
 - (instancetype)initWithDictionary:(NSDictionary *)dict;
 - (NSDictionary *)dictionaryValue;
+- (id<iTermMark>)doppelganger;
 
 @end

@@ -11,6 +11,7 @@
 #import "iTermCumulativeSumCache.h"
 #import "iTermTuple.h"
 #import "LineBlock.h"
+#import "LineBlock+SwiftInterop.h"
 #import "NSArray+iTerm.h"
 
 @interface iTermLineBlockArray()<iTermLineBlockObserver>
@@ -28,6 +29,7 @@
 - (void)setFirstValueWithBlock:(NSInteger (^)(int width))block;
 - (void)setLastValueWithBlock:(NSInteger (^)(int width))block;
 - (void)appendValue:(NSInteger)value;
+- (NSSet<NSNumber *> *)cachedWidths;
 @end
 
 @implementation iTermLineBlockCacheCollection {
@@ -52,8 +54,26 @@
     return theCopy;
 }
 
+- (NSString *)dumpWidths:(NSSet<NSNumber *> *)widths {
+    return [[_caches mapWithBlock:^id(iTermTuple<NSNumber *,iTermCumulativeSumCache *> *anObject) {
+        if ([widths containsObject:anObject.firstObject]) {
+            return [NSString stringWithFormat:@"Cache for width %@:\n%@", anObject.firstObject, anObject.secondObject];
+        } else {
+            return nil;
+        }
+    }] componentsJoinedByString:@"\n\n"];
+}
+
 - (NSString *)dumpForCrashlog {
-    return [_caches debugDescription];
+    return [[_caches mapWithBlock:^id(iTermTuple<NSNumber *,iTermCumulativeSumCache *> *anObject) {
+        return [NSString stringWithFormat:@"Cache for width %@:\n%@", anObject.firstObject, anObject.secondObject];
+    }] componentsJoinedByString:@"\n\n"];
+}
+
+- (NSSet<NSNumber *> *)cachedWidths {
+    return [NSSet setWithArray:[_caches mapWithBlock:^id(iTermTuple<NSNumber *,iTermCumulativeSumCache *> *anObject) {
+        return [anObject firstObject];
+    }]];
 }
 
 - (void)setCapacity:(int)capacity {
@@ -156,8 +176,15 @@
     for (LineBlock *block in _blocks) {
         [block removeObserver:self];
     }
+
+    // Do this serially to avoid lock contention.
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.iterm2.free-line-blocks", DISPATCH_QUEUE_SERIAL);
+    });
     NSMutableArray<LineBlock *> *blocks = _blocks;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_async(queue, ^{
         [blocks removeAllObjects];
     });
 }
@@ -166,6 +193,31 @@
     return [_numLinesCaches dumpForCrashlog];
 }
 
+- (NSString *)dumpWidths:(NSSet<NSNumber *> *)widths {
+    return [_numLinesCaches dumpWidths:widths];
+}
+
+- (NSSet<NSNumber *> *)cachedWidths {
+    return _numLinesCaches.cachedWidths;
+}
+
+- (BOOL)isEqual:(id)object {
+    iTermLineBlockArray *other = [iTermLineBlockArray castFrom:object];
+    if (!other) {
+        return NO;
+    }
+    if (self.count != other.count) {
+        return NO;
+    }
+    for (NSInteger i = 0; i < self.count; i++) {
+        LineBlock *lhs = self[i];
+        LineBlock *rhs = other[i];
+        if (![lhs isEqual:rhs]) {
+            return NO;
+        }
+    }
+    return YES;
+}
 #pragma mark - High level methods
 
 - (void)setResizing:(BOOL)resizing {
@@ -249,35 +301,46 @@
 }
 
 - (NSInteger)indexOfBlockContainingLineNumber:(int)lineNumber width:(int)width remainder:(out nonnull int *)remainderPtr {
+    VLog(@"indexOfBlockContainingLineNumber:%@ width:%@", @(lineNumber), @(width));
     [self buildCacheForWidth:width];
     [self updateCacheIfNeeded];
 
     __block int r = 0;
     const NSInteger result = [self internalIndexOfBlockContainingLineNumber:lineNumber width:width remainder:&r];
     if (remainderPtr) {
+        VLog(@"indexOfBlockContainingLineNumber: remainderPtr <- %@", @(r));
         *remainderPtr = r;
     }
+    VLog(@"indexOfBlockContainingLineNumber:%@ width:%@ returning %@", @(lineNumber), @(width), @(result));
     return result;
 }
 
 - (NSInteger)internalIndexOfBlockContainingLineNumber:(int)lineNumber
                                                 width:(int)width
                                             remainder:(out nonnull int *)remainderPtr {
+    VLog(@"internalIndexOfBlockContainingLineNumber:%@ width:%@", @(lineNumber), @(width));
+    
     [self buildCacheForWidth:width];
     [self updateCacheIfNeeded];
     iTermCumulativeSumCache *numLinesCache = [_numLinesCaches numLinesCacheForWidth:width];
-    const NSInteger index = [numLinesCache indexContainingValue:lineNumber];
+    BOOL roundUp = YES;
+    const NSInteger index = [numLinesCache indexContainingValue:lineNumber roundUp:&roundUp];
 
     if (index == NSNotFound) {
+        VLog(@"internalIndexOfBlockContainingLineNumber returning NSNotFound because indexContainingvalue:roundUp returned NSNotFound");
         return NSNotFound;
     }
 
     if (remainderPtr) {
+        VLog(@"internalIndexOfBlockContainingLineNumber: Have a remainder pointer");
         if (index == 0) {
+            VLog(@"internalIndexOfBlockContainingLineNumber: index==0: *remainderPtr <- %@", @(lineNumber));
             *remainderPtr = lineNumber;
         } else {
             const NSInteger absoluteLineNumber = lineNumber - numLinesCache.offset;
             *remainderPtr = absoluteLineNumber - [numLinesCache sumAtIndex:index - 1];
+            VLog(@"internalIndexOfBlockContainingLineNumber: index!=0: absoluteLineNumber=%@, *remainderPtr <- %@",
+                  @(absoluteLineNumber), @(*remainderPtr));
         }
     }
     return index;
@@ -296,7 +359,9 @@
     if (remainderPtr) {
         *remainderPtr = remainder;
         int nl = [block getNumLinesWithWrapWidth:width];
-        assert(*remainderPtr < nl);
+        if (!block.isEmpty) {
+            assert(*remainderPtr < nl);
+        }
     }
     return block;
 }
@@ -310,11 +375,11 @@
 
 - (void)enumerateLinesInRange:(NSRange)range
                         width:(int)width
-                        block:(void (^)(screen_char_t * _Nonnull,
+                        block:(void (^)(const screen_char_t * _Nonnull,
                                         int,
                                         int,
                                         screen_char_t,
-                                        iTermMetadata,
+                                        iTermImmutableMetadata,
                                         BOOL * _Nullable))callback {
     int remainder;
     NSInteger startIndex = [self indexOfBlockContainingLineNumber:range.location width:width remainder:&remainder];
@@ -340,15 +405,15 @@
             int length, eol;
             screen_char_t continuation;
             int temp = line;
-            iTermMetadata metadata;
-            screen_char_t *chars = [block getWrappedLineWithWrapWidth:width
-                                                              lineNum:&temp
-                                                           lineLength:&length
-                                                    includesEndOfLine:&eol
-                                                              yOffset:NULL
-                                                         continuation:&continuation
-                                                 isStartOfWrappedLine:NULL
-                                                             metadata:&metadata];
+            iTermImmutableMetadata metadata;
+            const screen_char_t *chars = [block getWrappedLineWithWrapWidth:width
+                                                                    lineNum:&temp
+                                                                 lineLength:&length
+                                                          includesEndOfLine:&eol
+                                                                    yOffset:NULL
+                                                               continuation:&continuation
+                                                       isStartOfWrappedLine:NULL
+                                                                   metadata:&metadata];
             if (chars == NULL) {
                 return;
             }
@@ -412,77 +477,191 @@
 }
 
 - (LineBlock *)blockContainingPosition:(long long)position
+                               yOffset:(int)yOffset
                                  width:(int)width
                              remainder:(int *)remainderPtr
-                           blockOffset:(int *)yoffsetPtr
+                           blockOffset:(int *)blockOffsetPtr
                                  index:(int *)indexPtr {
+    if (position < 0) {
+        DLog(@"Block with negative position %@ requested, returning nil", @(position));
+        return nil;
+    }
     if (width > 0) {
         [self buildCacheForWidth:width];
     }
     [self updateCacheIfNeeded];
     if (width > 0 && _rawSpaceCache) {
         int r=0, y=0, i=0;
-        LineBlock *result = [self fast_blockContainingPosition:position width:width remainder:&r blockOffset:yoffsetPtr ? &y : NULL index:&i];
+        LineBlock *result = [self fast_blockContainingPosition:position
+                                                       yOffset:yOffset
+                                                         width:width
+                                                     remainder:&r
+                                                   blockOffset:blockOffsetPtr ? &y : NULL
+                                                         index:&i];
         if (remainderPtr) {
             *remainderPtr = r;
         }
-        if (yoffsetPtr) {
-            *yoffsetPtr = y;
+        if (blockOffsetPtr) {
+            *blockOffsetPtr = y;
         }
         if (indexPtr) {
             *indexPtr = i;
         }
         return result;
     } else {
-        return [self slow_blockContainingPosition:position width:width remainder:remainderPtr blockOffset:yoffsetPtr index:indexPtr];
+        return [self slow_blockContainingPosition:position
+                                          yOffset:yOffset
+                                            width:width
+                                        remainder:remainderPtr
+                                      blockOffset:blockOffsetPtr
+                                            index:indexPtr];
     }
 }
 
 - (LineBlock *)fast_blockContainingPosition:(long long)position
+                                    yOffset:(int)originalDesiredYOffset
                                       width:(int)width
                                   remainder:(int *)remainderPtr
-                                blockOffset:(int *)yoffsetPtr
+                                blockOffset:(int *)blockOffsetPtr
                                       index:(int *)indexPtr {
     [self buildCacheForWidth:width];
     [self updateCacheIfNeeded];
-    NSInteger index = [_rawSpaceCache indexContainingValue:position];
+    BOOL roundUp = NO;
+    NSInteger index = [_rawSpaceCache indexContainingValue:position roundUp:&roundUp];
     if (index == NSNotFound) {
         return nil;
+    }
+    LineBlock *block = _blocks[index];
+
+    // To avoid double-counting Y offsetes, reduce the offset in lines within the block by the number
+    // of empty lines that were skipped.
+    int dy = 0;
+
+    int desiredYOffset = originalDesiredYOffset;
+    if (roundUp) {
+        // Seek forward until we find a block that contains this position.
+        if (block.numberOfTrailingEmptyLines <= desiredYOffset) {
+            // Skip over trailing lines.
+            const int emptyCount = block.numberOfTrailingEmptyLines;
+            desiredYOffset -= emptyCount;
+            // In the diagrams below the | indicates the location given by position.
+            //
+            // Cases 1 and 2 involve the unfortunate behavior that occurds for the position after a
+            // non-empty line not belonging to the next wrapped line but to the location just after
+            // the last character on the non-empty line.
+            //
+            // 1. The block has trailing empty lines
+            //        abc
+            //        xyz|
+            //        (empty)
+            //    In this case, advancing to the next block moves the cursor down two lines:
+            //    first to the start of the empty line and then to the start of the line after it.
+            //
+            // 2. The block does not have trailing empty lines
+            //        abc
+            //        xyz|
+            //    In this case, advancing to the next block moves the cursor down one line: just to
+            //    the beginning of the line that starts the next block.
+            //
+            // 3. The block has only empty lines.
+            //        |(empty)
+            //        (empty)
+            //    In this case, advancing the the next block moves the cursor down by the number of
+            //    empty lines in this block.
+            dy += emptyCount;
+            if (!block.allLinesAreEmpty) {
+                // case 1 or 2
+                dy += 1;
+            }
+            index += 1;
+            block = _blocks[index];
+
+            // Skip over entirely empty blocks.
+            while (!block.containsAnyNonEmptyLine &&
+                   block.numberOfLeadingEmptyLines <= desiredYOffset &&
+                   index + 1 < _blocks.count) {
+                const int emptyCount = block.numberOfTrailingEmptyLines;
+                desiredYOffset -= emptyCount;
+                // Here this is no +1. We begin with something like:
+                //     |(empty)
+                //     (empty)
+                // Moving the cursor to the next block advances by exactly as many lines as the
+                // number of lines in the block.
+                dy += emptyCount;
+                index += 1;
+                block = _blocks[index];
+            }
+        }
     }
 
     if (remainderPtr) {
         *remainderPtr = position - [_rawSpaceCache sumOfValuesInRange:NSMakeRange(0, index)];
+        assert(*remainderPtr >= 0);
     }
-    if (yoffsetPtr) {
-        *yoffsetPtr = [[_numLinesCaches numLinesCacheForWidth:width] sumOfValuesInRange:NSMakeRange(0, index)];
+    if (blockOffsetPtr) {
+        *blockOffsetPtr = [[_numLinesCaches numLinesCacheForWidth:width] sumOfValuesInRange:NSMakeRange(0, index)] - dy;
     }
     if (indexPtr) {
         *indexPtr = index;
     }
-    return _blocks[index];
+    return block;
 }
 
+// TODO: Test the case where the position is at the start of block 1 (pos=1, desiredYOffset=1) in this example:
+// block 0
+// x
+//
+// block 1
+// (empty)
+// (empty)
+// y
+
 - (LineBlock *)slow_blockContainingPosition:(long long)position
+                                    yOffset:(int)desiredYOffset
                                       width:(int)width
                                   remainder:(int *)remainderPtr
-                                blockOffset:(int *)yoffsetPtr
+                                blockOffset:(int *)blockOffsetPtr
                                       index:(int *)indexPtr {
     long long p = position;
+    int emptyLinesLeftToSkip = desiredYOffset;
     int yoffset = 0;
     int index = 0;
     for (LineBlock *block in _blocks) {
         const int used = [block rawSpaceUsed];
-        if (p >= used) {
+        BOOL found = NO;
+        if (p > used) {
+            // It's definitely not in this block.
             p -= used;
-            if (yoffsetPtr) {
+            if (blockOffsetPtr) {
                 yoffset += [block getNumLinesWithWrapWidth:width];
             }
+        } else if (p == used) {
+            // It might be in this block!
+            if (blockOffsetPtr) {
+                yoffset += [block getNumLinesWithWrapWidth:width];
+            }
+            const int numTrailingEmptyLines = [block numberOfTrailingEmptyLines];
+            if (numTrailingEmptyLines < emptyLinesLeftToSkip) {
+                // Need to keep consuming empty lines.
+                emptyLinesLeftToSkip -= numTrailingEmptyLines;
+                p = 0;
+            } else {
+                // This block has enough trailing blank lines.
+                found = YES;
+            }
         } else {
+            // It was not in the previous block and this one has enough raw spaced used that it must
+            // contain it.
+            found = YES;
+        }
+        if (found) {
+            // It is in this block.
+            assert(p >= 0);
             if (remainderPtr) {
                 *remainderPtr = p;
             }
-            if (yoffsetPtr) {
-                *yoffsetPtr = yoffset;
+            if (blockOffsetPtr) {
+                *blockOffsetPtr = yoffset;
             }
             if (indexPtr) {
                 *indexPtr = index;
@@ -494,24 +673,39 @@
     return nil;
 }
 
+- (NSInteger)numberOfWrappedLinesForWidth:(int)width
+                          upToBlockAtIndex:(NSInteger)limit {
+    [self buildCacheForWidth:width];
+    [self updateCacheIfNeeded];
+
+    return [[_numLinesCaches numLinesCacheForWidth:width] sumOfValuesInRange:NSMakeRange(0, limit)];
+}
+
+- (void)findUncompressedBlocks {
+    if (_blocks.count == 0) {
+        return;
+    }
+    for (NSInteger i = 0; i < _blocks.count; i++) {
+        if (!_blocks[i].isOnlyUncompressed) {
+            break;
+        }
+        _lastUncompressedHeadBlock = @(_blocks[i].absoluteBlockNumber);
+    }
+    if (_lastUncompressedHeadBlock.longLongValue == self.lastBlock.absoluteBlockNumber) {
+        return;
+    }
+    for (NSInteger i = _blocks.count - 1; i >= 0; i--) {
+        if (!_blocks[i].isOnlyUncompressed) {
+            break;
+        }
+        _firstUncompressedTailBlock = @(_blocks[i].absoluteBlockNumber);
+    }
+}
+
 #pragma mark - Low level method
 
 - (id)objectAtIndexedSubscript:(NSUInteger)index {
     return _blocks[index];
-}
-
-- (void)replaceLastBlockWithCopy {
-    [self updateCacheIfNeeded];
-    NSInteger index = _blocks.count;
-    if (index == 0) {
-        return;
-    }
-    index--;
-    [_blocks[index] removeObserver:self];
-    _blocks[index] = [_blocks[index] copy];
-    [_blocks[index] addObserver:self];
-    _head = _blocks.firstObject;
-    _tail = _blocks.lastObject;
 }
 
 - (void)addBlock:(LineBlock *)block {
@@ -533,6 +727,7 @@
 
 - (void)removeFirstBlock {
     [self updateCacheIfNeeded];
+    [_blocks.firstObject invalidate];
     [_blocks.firstObject removeObserver:self];
     [_numLinesCaches removeFirstValue];
     [_rawSpaceCache removeFirstValue];
@@ -550,6 +745,7 @@
 
 - (void)removeLastBlock {
     [self updateCacheIfNeeded];
+    [_blocks.lastObject invalidate];
     [_blocks.lastObject removeObserver:self];
     [_blocks removeLastObject];
     [_numLinesCaches removeLastValue];
@@ -567,6 +763,10 @@
     return _blocks.lastObject;
 }
 
+- (LineBlock *)firstBlock {
+    return _blocks.firstObject;
+}
+
 - (void)updateCacheForBlock:(LineBlock *)block {
     if (_rawSpaceCache) {
         assert(_rawSpaceCache.count == _blocks.count);
@@ -577,14 +777,16 @@
     if (block == _blocks.firstObject) {
         _headDirty = NO;
         [_numLinesCaches setFirstValueWithBlock:^NSInteger(int width) {
-            return [block getNumLinesWithWrapWidth:width];
+            const int value = [block getNumLinesWithWrapWidth:width];
+            return value;
         }];
         [_rawSpaceCache setFirstValue:[block rawSpaceUsed]];
         [_rawLinesCache setFirstValue:[block numRawLines]];
     } else if (block == _blocks.lastObject) {
         _tailDirty = NO;
         [_numLinesCaches setLastValueWithBlock:^NSInteger(int width) {
-            return [block getNumLinesWithWrapWidth:width];
+            const int value = [block getNumLinesWithWrapWidth:width];
+            return value;
         }];
         [_rawSpaceCache setLastValue:[block rawSpaceUsed]];
         [_rawLinesCache setLastValue:[block numRawLines]];
@@ -598,11 +800,15 @@
     if (_rawLinesCache == nil) {
         return;
     }
-    [self updateCacheIfNeeded];
+    [self reallyUpdateCacheIfNeeded];
+    const int w = [[[self cachedWidths] anyObject] intValue];
     for (int i = 0; i < _blocks.count; i++) {
         LineBlock *block = _blocks[i];
         assert([block hasObserver:self]);
         BOOL ok = [block numRawLines] == [_rawLinesCache valueAtIndex:i];
+        if (ok && w > 0) {
+            ok = [block getNumLinesWithWrapWidth:w] == [[_numLinesCaches numLinesCacheForWidth:w] valueAtIndex:i];
+        }
         if (!ok) {
             [self oopsWithWidth:0 block:^{
                 DLog(@"Sanity check failed");
@@ -613,6 +819,13 @@
 }
 
 - (void)updateCacheIfNeeded {
+    [self reallyUpdateCacheIfNeeded];
+#ifdef DEBUG_LINEBUFFER_MERGE
+    [self sanityCheck];
+#endif
+}
+
+- (void)reallyUpdateCacheIfNeeded {
     if (_headDirty) {
         [self updateCacheForBlock:_blocks.firstObject];
     }
@@ -625,19 +838,21 @@
 
 - (id)copyWithZone:(NSZone *)zone {
     iTermLineBlockArray *theCopy = [[self.class alloc] init];
-    theCopy->_blocks = [_blocks mutableCopy];
+    theCopy->_blocks = [NSMutableArray array];
+    for (LineBlock *block in _blocks) {
+        LineBlock *copiedBlock = [block cowCopy];
+        [copiedBlock addObserver:theCopy];
+        [theCopy->_blocks addObject:copiedBlock];
+    }
     theCopy->_numLinesCaches = [_numLinesCaches copy];
     theCopy->_rawSpaceCache = [_rawSpaceCache copy];
     theCopy->_rawLinesCache = [_rawLinesCache copy];
     theCopy->_mayHaveDoubleWidthCharacter = _mayHaveDoubleWidthCharacter;
-    theCopy->_head = _head;
+    theCopy->_head = theCopy->_blocks.firstObject;
     theCopy->_headDirty = _headDirty;
-    theCopy->_tail = _tail;
+    theCopy->_tail = theCopy->_blocks.lastObject;
     theCopy->_tailDirty = _tailDirty;
     theCopy->_resizing = _resizing;
-    for (LineBlock *block in _blocks) {
-        [block addObserver:theCopy];
-    }
 
     return theCopy;
 }
@@ -647,9 +862,19 @@
 - (void)lineBlockDidChange:(LineBlock *)lineBlock {
     if (lineBlock == _head) {
         _headDirty = YES;
+        if (!_lastUncompressedHeadBlock || lineBlock.absoluteBlockNumber > _lastUncompressedHeadBlock.longLongValue) {
+            _lastUncompressedHeadBlock = @(lineBlock.absoluteBlockNumber);
+        }
     } else if (lineBlock == _tail) {
         _tailDirty = YES;
+        if (!_firstUncompressedTailBlock || lineBlock.absoluteBlockNumber < _firstUncompressedTailBlock.longLongValue) {
+            _firstUncompressedTailBlock = @(lineBlock.absoluteBlockNumber);
+        }
     }
+}
+
+- (void)lineBlockDidDecompress:(LineBlock *)lineBlock {
+    _needsPurge = YES;
 }
 
 @end

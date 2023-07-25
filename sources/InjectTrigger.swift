@@ -21,20 +21,24 @@ class InjectTrigger: Trigger {
         return "Use \\e for esc, \\a for ^G."
     }
 
-    override func performAction(withCapturedStrings capturedStrings: UnsafePointer<NSString>,
+    override func performAction(withCapturedStrings strings: [String],
                                 capturedRanges: UnsafePointer<NSRange>,
-                                captureCount: Int,
-                                in session: PTYSession,
+                                in session: iTermTriggerSession,
                                 onString s: iTermStringLine,
                                 atAbsoluteLineNumber lineNumber: Int64,
                                 useInterpolation: Bool,
                                 stop: UnsafeMutablePointer<ObjCBool>) -> Bool {
-        let buffer = UnsafeBufferPointer(start: capturedStrings, count: captureCount)
-        let strings = Array(buffer).compactMap { $0 as String? }
+        let scopeProvider = session.triggerSessionVariableScopeProvider(self)
+        let scheduler = scopeProvider.triggerCallbackScheduler()
         paramWithBackreferencesReplaced(withValues: strings,
-                                        scope: session.genericScope,
-                                        useInterpolation: useInterpolation) { message in
-            session.inject(message.data(using: .utf8))
+                                        absLine: lineNumber,
+                                        scope: scopeProvider,
+                                        useInterpolation: useInterpolation).then { message in
+            if let data = (message as String).data(using: .utf8) {
+                scheduler.scheduleTriggerCallback {
+                    session.triggerSession(self, inject: data);
+                }
+            }
         }
         return false
     }

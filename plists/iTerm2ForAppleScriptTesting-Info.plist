@@ -96,6 +96,8 @@
 			<string>Owner</string>
 		</dict>
 	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>An application in iTerm2 wants to use Bluetooth.</string>
 	<key>NSCalendarsUsageDescription</key>
 	<string>An application in iTerm2 wants to use Calendar data.</string>
 	<key>NSCameraUsageDescription</key>
@@ -110,6 +112,8 @@
 	<string>An application in iTerm2 wants to use your location information while active.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>An application in iTerm2 wants to use your microphone.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>An application in iTerm2 wants to use speech recognition.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>An application in iTerm2 wants to use your reminders.</string>
 	<key>NSServices</key>
@@ -290,8 +294,6 @@
 	<string>iTermApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
-        <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
-        <true/>
 	<key>OSAScriptingDefinition</key>
 	<string>iTerm2.sdef</string>
 	<key>SUFeedURLForTesting</key>

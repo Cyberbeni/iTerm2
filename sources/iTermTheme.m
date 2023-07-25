@@ -89,7 +89,7 @@
                                                  adjustedDimmingAmount:(CGFloat)adjustedDimmingAmount
                                                      transparencyAlpha:(CGFloat)transparencyAlpha {
     iTermPreferencesTabStyle preferredStyle = [iTermPreferences intForKey:kPreferenceKeyTabStyle];
-    if (!tabColor) {
+    if (!tabColor || self.useMinimalStyle) {
         return [self dimmedBackgroundColorWithAppearance:effectiveAppearance
                                   sessionBackgroundColor:sessionBackgroundColor
                                         isFirstResponder:isFirstResponder
@@ -99,13 +99,9 @@
     }
     NSColor *undimmedColor = tabColor;
 
-    if (self.useMinimalStyle) {
-        undimmedColor = sessionBackgroundColor;
-    } else {
-        undimmedColor = [self backgroundColorForDecorativeSubviewsForTabColor:undimmedColor
-                                                                     tabStyle:[effectiveAppearance it_tabStyle:preferredStyle]
-                                                       sessionBackgroundColor:sessionBackgroundColor];
-    }
+    undimmedColor = [self backgroundColorForDecorativeSubviewsForTabColor:undimmedColor
+                                                                 tabStyle:[effectiveAppearance it_tabStyle:preferredStyle]
+                                                   sessionBackgroundColor:sessionBackgroundColor];
     if (isFirstResponder) {
         return undimmedColor;
     }
@@ -166,13 +162,9 @@
         if (!color) {
             return nil;
         }
-        return [colorMap colorByDimmingTextColor:[color colorUsingColorSpace:[NSColorSpace sRGBColorSpace]]];
-    } else if (@available(macOS 10.14, *)) {
-        return [NSColor labelColor];
-    } else if ([effectiveAppearance.name isEqualToString:NSAppearanceNameVibrantDark]) {
-        return [NSColor colorWithWhite:0.75 alpha:1];
+        return [colorMap colorByDimmingTextColor:[color colorUsingColorSpace:[NSColorSpace it_defaultColorSpace]]];
     } else {
-        return [NSColor blackColor];
+        return [NSColor labelColor];
     }
 }
 

@@ -464,38 +464,26 @@ maximumExtendedDynamicRangeColorComponentValue:(CGFloat)maximumExtendedDynamicRa
     }
 }
 
-// Assumes premultiplied alpha and little endian. Floating point must be 16 bit.
-- (MTLPixelFormat)pixelFormatForBitmapRep:(NSBitmapImageRep *)rep {
-    const MTLPixelFormat unsupportedFormatsMask = (NSBitmapFormatAlphaNonpremultiplied |
-                                                   NSBitmapFormatSixteenBitBigEndian |
-                                                   NSBitmapFormatThirtyTwoBitBigEndian |
-                                                   NSBitmapFormatThirtyTwoBitLittleEndian |
-                                                   NSBitmapFormatSixteenBitLittleEndian);  // Doesn't apply to 16-bit ints, not quite sure what this is for.
-    if (rep.bitmapFormat & unsupportedFormatsMask) {
-        return MTLPixelFormatInvalid;
-    }
-    if (rep.bitmapFormat & NSBitmapFormatFloatingPointSamples) {
-        // Note that 16-bit floats don't have NSBitmapFormatSixteenBitLittleEndian set. That's only for ints.
-        return MTLPixelFormatRGBA16Float;
-    }
-    const NSInteger bitsPerSample = rep.bitsPerPixel / rep.samplesPerPixel;
-    if (bitsPerSample == 16) {
-        return MTLPixelFormatRGBA16Unorm;
-    }
-    return MTLPixelFormatRGBA8Unorm;
-}
-
 - (nullable id<MTLTexture>)textureFromImage:(iTermImageWrapper *)wrapper
                                     context:(iTermMetalBufferPoolContext *)context
                                        pool:(iTermTexturePool *)pool
                                  colorSpace:(NSColorSpace *)colorSpace {
     iTermImageWrapper *image = wrapper;
     if (!image.image) {
+        DLog(@"No image in wrapper");
         return nil;
     }
 
     NSBitmapImageRep *bitmap = [image bitmapInColorSpace:colorSpace];
-    if ([self pixelFormatForBitmapRep:bitmap] == MTLPixelFormatInvalid) {
+    DLog(@"bitmap in colorspace %@ is %@", colorSpace, bitmap);
+    // You can get an alpha-first bitmap sometimes! If my mac decides to use the LG HDR WFHD display
+    // as the main display then that's what you get. Metal doesn't support these, so we have to
+    // manually twiddle the bits around. There doesn't seem to be a better system. And
+    // MTKTextureLoader doesn't do the right thing either - the colors are screwed up - so screw
+    // MTKTextureLoader.
+    bitmap = [bitmap it_bitmapWithAlphaLast];
+    DLog(@"bitmap after moving alpha last=%@", bitmap);
+    if ([bitmap metalPixelFormat] == MTLPixelFormatInvalid) {
         return [self legacyTextureFromImage:image
                                     context:context
                                        pool:pool
@@ -509,15 +497,19 @@ maximumExtendedDynamicRangeColorComponentValue:(CGFloat)maximumExtendedDynamicRa
                toWidth:&width
                 height:&height
           notExceeding:4096];
+    DLog(@"converted size from %@ to %@",
+         NSStringFromSize(bitmap.size), NSStringFromSize(NSMakeSize(width, height)));
     if (width == 0 || height == 0) {
         return nil;
     }
 
     if (width != bitmap.size.width || height != bitmap.size.height) {
+        DLog(@"Rescale bitmap to new size");
         bitmap = [bitmap it_bitmapScaledTo:NSMakeSize(width, height)];
+        DLog(@"bitmap=%@", bitmap);
     }
     MTLTextureDescriptor *textureDescriptor =
-    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[self pixelFormatForBitmapRep:bitmap]
+    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[bitmap metalPixelFormat]
                                                        width:width
                                                       height:height
                                                    mipmapped:NO];

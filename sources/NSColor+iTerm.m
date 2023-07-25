@@ -9,9 +9,12 @@
 #import "NSColor+iTerm.h"
 
 #import "DebugLogging.h"
+#import "iTermAdvancedSettingsModel.h"
 #import "iTermPreferences.h"
 #import "NSAppearance+iTerm.h"
+#import "NSArray+iTerm.h"
 #import "NSImage+iTerm.h"
+#import "NSNumber+iTerm.h"
 #import "NSStringITerm.h"
 #import "NSView+iTerm.h"
 #import "SolidColorView.h"
@@ -28,6 +31,7 @@ NSString *const kEncodedColorDictionaryAlphaComponent = @"Alpha Component";
 NSString *const kEncodedColorDictionaryColorSpace = @"Color Space";
 NSString *const kEncodedColorDictionarySRGBColorSpace = @"sRGB";
 NSString *const kEncodedColorDictionaryCalibratedColorSpace = @"Calibrated";
+NSString *const kEncodedColorDictionaryP3ColorSpace = @"P3";
 
 CGFloat PerceivedBrightness(CGFloat r, CGFloat g, CGFloat b) {
     return (kRedComponentBrightness * r +
@@ -182,15 +186,29 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
 
 + (instancetype)withLABColor:(iTermLABColor)lab {
     iTermSRGBColor srgb = iTermSRGBFromLAB(lab);
-    return [NSColor colorWithSRGBRed:srgb.r green:srgb.g blue:srgb.b alpha:1];
+    return [[NSColor colorWithSRGBRed:srgb.r green:srgb.g blue:srgb.b alpha:1] it_colorInDefaultColorSpace];
 }
 
 - (NSString *)shortDescription {
     return [NSString stringWithFormat:@"(%.2f, %.2f, %.2f)",
             self.redComponent, self.greenComponent, self.blueComponent];
 }
+
++ (NSColor *)colorPreservingColorspaceFromString:(NSString *)s {
+    if ([s hasPrefix:@"#"] && (s.length == 7 || s.length == 13)) {
+        return [[self colorFromHexString:s] colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+    }
+    if ([s hasPrefix:@"p3#"] && (s.length == 9 || s.length == 15)) {
+        return [[self colorFromHexString:s] colorUsingColorSpace:[NSColorSpace displayP3ColorSpace]];
+    }
+    return [self colorWithString:s];
+}
+
 + (NSColor *)colorWithString:(NSString *)s {
-    if ([s hasPrefix:@"#"] && s.length == 7) {
+    if ([s hasPrefix:@"#"] && (s.length == 7 || s.length == 13)) {
+        return [self colorFromHexString:s];
+    }
+    if ([s hasPrefix:@"p3#"] && (s.length == 9 || s.length == 15)) {
         return [self colorFromHexString:s];
     }
     NSData *data = [[[NSData alloc] initWithBase64EncodedString:s options:0] autorelease];
@@ -219,27 +237,17 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
 + (NSColor *)colorWith8BitRed:(int)red
                         green:(int)green
                          blue:(int)blue {
-    return [NSColor colorWithSRGBRed:red / 255.0
-                               green:green / 255.0
-                                blue:blue / 255.0
-                               alpha:1];
-}
-
-+ (NSColor *)colorWith8BitRed:(int)red
-                        green:(int)green
-                         blue:(int)blue
-                       muting:(double)muting
-                backgroundRed:(CGFloat)bgRed
-              backgroundGreen:(CGFloat)bgGreen
-               backgroundBlue:(CGFloat)bgBlue {
-    CGFloat r = (red / 255.0) * (1 - muting) + bgRed * muting;
-    CGFloat g = (green / 255.0) * (1 - muting) + bgGreen * muting;
-    CGFloat b = (blue / 255.0) * (1 - muting) + bgBlue * muting;
-
-    return [NSColor colorWithSRGBRed:r
-                               green:g
-                                blue:b
-                               alpha:1];
+    if ([iTermAdvancedSettingsModel p3]) {
+        return [NSColor colorWithDisplayP3Red:red / 255.0
+                                        green:green / 255.0
+                                         blue:blue / 255.0
+                                        alpha:1];
+    } else {
+        return [NSColor colorWithSRGBRed:red / 255.0
+                                   green:green / 255.0
+                                    blue:blue / 255.0
+                                   alpha:1];
+    }
 }
 
 + (void)getComponents:(CGFloat *)result
@@ -326,11 +334,18 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
         // The first 16 colors aren't supported here.
         return nil;
     }
-    NSColor* srgb = [NSColor colorWithSRGBRed:r
+    if ([iTermAdvancedSettingsModel p3]) {
+        return [NSColor colorWithDisplayP3Red:r
                                         green:g
                                          blue:b
                                         alpha:1];
-    return [srgb colorUsingColorSpace:[NSColorSpace genericRGBColorSpace]];
+    } else {
+        NSColor* srgb = [NSColor colorWithSRGBRed:r
+                                            green:g
+                                             blue:b
+                                            alpha:1];
+        return [srgb colorUsingColorSpace:[NSColorSpace genericRGBColorSpace]];
+    }
 }
 
 + (void)getComponents:(CGFloat *)result
@@ -426,6 +441,41 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
 }
 
 - (NSDictionary *)dictionaryValue {
+    if ([iTermAdvancedSettingsModel p3]) {
+        NSColor *color = [self colorUsingColorSpace:[NSColorSpace displayP3ColorSpace]];
+        CGFloat red, green, blue, alpha;
+        [color getRed:&red green:&green blue:&blue alpha:&alpha];
+        return @{ kEncodedColorDictionaryColorSpace: kEncodedColorDictionaryP3ColorSpace,
+                  kEncodedColorDictionaryRedComponent: @(red),
+                  kEncodedColorDictionaryGreenComponent: @(green),
+                  kEncodedColorDictionaryBlueComponent: @(blue),
+                  kEncodedColorDictionaryAlphaComponent: @(alpha) };
+    }
+    return [self srgbDictionaryValue];
+}
+
+- (NSDictionary *)dictionaryValuePreservingColorSpace {
+    NSString *colorSpace;
+    if ([[self colorSpace] isEqual:[NSColorSpace sRGBColorSpace]]) {
+        colorSpace = kEncodedColorDictionarySRGBColorSpace;
+    } else if ([[self colorSpace] isEqual:[NSColorSpace displayP3ColorSpace]]) {
+        colorSpace = kEncodedColorDictionaryP3ColorSpace;
+    } else if ([self.colorSpace isEqual:[NSColorSpace deviceRGBColorSpace]]) {
+        colorSpace = kEncodedColorDictionaryCalibratedColorSpace;
+    } else {
+        DLog(@"Convert color in space %@ to calibrated", self.colorSpace);
+        return [[self colorUsingColorSpace:[NSColorSpace deviceRGBColorSpace]] dictionaryValuePreservingColorSpace];
+    }
+    CGFloat red, green, blue, alpha;
+    [self getRed:&red green:&green blue:&blue alpha:&alpha];
+    return @{ kEncodedColorDictionaryColorSpace: colorSpace,
+              kEncodedColorDictionaryRedComponent: @(red),
+              kEncodedColorDictionaryGreenComponent: @(green),
+              kEncodedColorDictionaryBlueComponent: @(blue),
+              kEncodedColorDictionaryAlphaComponent: @(alpha) };
+}
+
+- (NSDictionary *)srgbDictionaryValue {
     NSColor *color = [self colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
     CGFloat red, green, blue, alpha;
     [color getRed:&red green:&green blue:&blue alpha:&alpha];
@@ -450,24 +500,65 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
     return [NSColor colorWithColorSpace:self.colorSpace components:x count:4];
 }
 
+// Also update +colorFromHexString: when adding colorspaces here.
 - (NSString *)hexString {
     NSDictionary *dict = [self dictionaryValue];
+    return [NSColor hexStringForDictionary:dict];
+}
+
++ (NSString *)hexStringForDictionary:(NSDictionary *)dict {
+    if ([dict[kEncodedColorDictionaryColorSpace] isEqual:kEncodedColorDictionaryP3ColorSpace]) {
+        int red = round([dict[kEncodedColorDictionaryRedComponent] doubleValue] * 65535);
+        int green = round([dict[kEncodedColorDictionaryGreenComponent] doubleValue] * 65535);
+        int blue = round([dict[kEncodedColorDictionaryBlueComponent] doubleValue] * 65535);
+        return [NSString stringWithFormat:@"p3#%04x%04x%04x", red, green, blue];
+    }
     int red = [dict[kEncodedColorDictionaryRedComponent] doubleValue] * 255;
     int green = [dict[kEncodedColorDictionaryGreenComponent] doubleValue] * 255;
     int blue = [dict[kEncodedColorDictionaryBlueComponent] doubleValue] * 255;
     return [NSString stringWithFormat:@"#%02x%02x%02x", red, green, blue];
 }
 
-+ (instancetype)colorFromHexString:(NSString *)hexString {
-    int red, green, blue;
+- (NSString *)srgbHexString {
+    NSDictionary *dict = [self srgbDictionaryValue];
+    int red = [dict[kEncodedColorDictionaryRedComponent] doubleValue] * 255;
+    int green = [dict[kEncodedColorDictionaryGreenComponent] doubleValue] * 255;
+    int blue = [dict[kEncodedColorDictionaryBlueComponent] doubleValue] * 255;
+    return [NSString stringWithFormat:@"#%02x%02x%02x", red, green, blue];
+}
+
+- (NSString *)hexStringPreservingColorSpace {
+    NSDictionary *dict = [self dictionaryValuePreservingColorSpace];
+    return [NSColor hexStringForDictionary:dict];
+}
+
+// Also update +colorWithString: when adding colorspaces here.
++ (instancetype)colorFromHexString:(NSString *)fullString {
+    NSString *hexString = fullString;
+    BOOL p3 = NO;
+    if ([hexString hasPrefix:@"p3#"]){
+        p3 = YES;
+        hexString = [fullString substringFromIndex:2];
+    }
+    unsigned int red, green, blue;
     if (![hexString getHashColorRed:&red green:&green blue:&blue]) {
         return nil;
     }
-    return [NSColor colorWithSRGBRed:red / 255.0 green:green / 255.0 blue:blue / 255.0 alpha:1];
+    if (p3) {
+        return [[NSColor colorWithDisplayP3Red:red / 65535.0
+                                         green:green / 65535.0
+                                          blue:blue / 65535.0
+                                         alpha:1] it_colorInDefaultColorSpace];
+    } else {
+        return [[NSColor colorWithSRGBRed:red / 65535.0
+                                    green:green / 65535.0
+                                     blue:blue / 65535.0
+                                    alpha:1] it_colorInDefaultColorSpace];
+    }
 }
 
 - (NSColor *)it_colorByDimmingByAmount:(double)dimmingAmount {
-    NSColor *color = [self colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+    NSColor *color = self;
     double r = [color redComponent];
     double g = [color greenComponent];
     double b = [color blueComponent];
@@ -479,63 +570,45 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
     r = alpha * r + (1 - alpha) * basis;
     g = alpha * g + (1 - alpha) * basis;
     b = alpha * b + (1 - alpha) * basis;
-    
-    return [NSColor colorWithSRGBRed:r green:g blue:b alpha:1];
+
+    const CGFloat components[] = { r, g, b, 1 };
+    return [NSColor colorWithColorSpace:self.colorSpace components:components count:4];
 }
 
 - (NSColor *)it_colorWithAppearance:(NSAppearance *)appearance {
-    if (@available(macOS 10.14, *)) {
-        if (self.type != NSColorTypeCatalog) {
-            return self;
-        }
+    if (self.type != NSColorTypeCatalog) {
+        return self;
+    }
 
-        static NSMutableDictionary *darkDict, *lightDict;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            darkDict = [[NSMutableDictionary alloc] init];
-            lightDict = [[NSMutableDictionary alloc] init];
-        });
+    static NSMutableDictionary *darkDict, *lightDict;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        darkDict = [[NSMutableDictionary alloc] init];
+        lightDict = [[NSMutableDictionary alloc] init];
+    });
 
-        NSMutableDictionary *dict;
-        NSString *closest = [appearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameDarkAqua, NSAppearanceNameAqua ]];
-        if ([closest isEqualToString:NSAppearanceNameDarkAqua]) {
-            dict = darkDict;
-        } else {
-            dict = lightDict;
-        }
+    NSMutableDictionary *dict;
+    NSString *closest = [appearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameDarkAqua, NSAppearanceNameAqua ]];
+    if ([closest isEqualToString:NSAppearanceNameDarkAqua]) {
+        dict = darkDict;
+    } else {
+        dict = lightDict;
+    }
 
-        NSColor *result = dict[self];
-        if (result) {
-            return result;
-        }
-
-        NSView *view = [[[SolidColorView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1) color:self] autorelease];
-        view.appearance = appearance;
-        NSImage *image = [view snapshot];
-
-        NSBitmapImageRep *imageRep = [[[NSBitmapImageRep alloc] initWithData:[image TIFFRepresentation]] autorelease];
-        result = [imageRep colorAtX:0 y:0];
-
-        dict[self] = result;
+    NSColor *result = dict[self];
+    if (result) {
         return result;
     }
 
-    if ([self isEqual:[NSColor labelColor]]) {
-        switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
-            case TAB_STYLE_DARK:
-            case TAB_STYLE_DARK_HIGH_CONTRAST:
-                return [NSColor whiteColor];
+    NSView *view = [[[SolidColorView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1) color:self] autorelease];
+    view.appearance = appearance;
+    NSImage *image = [view snapshot];
 
-            case TAB_STYLE_LIGHT:
-            case TAB_STYLE_LIGHT_HIGH_CONTRAST:
-            case TAB_STYLE_MINIMAL:
-            case TAB_STYLE_AUTOMATIC:
-            case TAB_STYLE_COMPACT:;
-                return self;
-        }
-    }
+    NSBitmapImageRep *imageRep = [[[NSBitmapImageRep alloc] initWithData:[image TIFFRepresentation]] autorelease];
+    result = [imageRep colorAtX:0 y:0];
 
-    return self;
+    dict[self] = result;
+    return result;
 }
 
 - (NSColorSpace * _Nullable)it_colorSpace {
@@ -547,4 +620,92 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs) {
     }
 }
 
+- (NSColor *)it_colorWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha {
+    CGFloat components[] = { red, green, blue, alpha };
+    return [NSColor colorWithColorSpace:self.colorSpace components:components count:4];
+}
+
++ (NSColor *)it_colorInDefaultColorSpaceWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha {
+    if ([iTermAdvancedSettingsModel p3]) {
+        return [NSColor colorWithDisplayP3Red:red green:green blue:blue alpha:alpha];
+    }
+    return [NSColor colorWithSRGBRed:red green:green blue:blue alpha:alpha];
+}
+
+- (NSColor *)it_colorInDefaultColorSpace {
+    return [self colorUsingColorSpace:[NSColorSpace it_defaultColorSpace]];
+}
+
+- (BOOL)isApproximatelyEqualToColor:(NSColor *)other epsilon:(double)e {
+    NSColor *color = [other colorUsingColorSpace:self.colorSpace];
+    if (fabs(self.redComponent - color.redComponent) > e ||
+        fabs(self.greenComponent - color.greenComponent) > e ||
+        fabs(self.blueComponent - color.blueComponent) > e ||
+        fabs(self.alphaComponent - color.alphaComponent) > e) {
+        return NO;
+    }
+    return YES;
+}
+
+- (NSColor *)blendedWithColor:(NSColor *)color weight:(CGFloat)weight {
+    // Convert colors to LAB color space for perceptual blending
+    CGFloat whitePoint[3] = {0.95047, 1.0, 1.08883}; // D50 white point
+    CGFloat blackPoint[3] = {0.0, 0.0, 0.0};
+    CGFloat range[4] = {-128.0, 127.0, -128.0, 127.0};
+    CGColorSpaceRef labColorSpace = CGColorSpaceCreateLab(whitePoint, blackPoint, range);
+
+    if (!labColorSpace) {
+        return self;
+    }
+
+    NSColorSpace *nslab = [[[NSColorSpace alloc] initWithCGColorSpace:labColorSpace] autorelease];
+    CIColor *ciColor1 = [[[CIColor alloc] initWithColor:[self colorUsingColorSpace:nslab]] autorelease];
+    CIColor *ciColor2 = [[[CIColor alloc] initWithColor:[color colorUsingColorSpace:nslab]] autorelease];
+    CIColor *ciBlendedColor;
+
+    // Get LAB components of each color
+    const CGFloat l1 = ciColor1.components[0];
+    const CGFloat a1 = ciColor1.components[1];
+    const CGFloat b1 = ciColor1.components[2];
+
+    const CGFloat l2 = ciColor2.components[0];
+    const CGFloat a2 = ciColor2.components[1];
+    const CGFloat b2 = ciColor2.components[2];
+
+    // Blend the colors by weighting their LAB components
+    CGFloat blendedL = (1 - weight) * l1 + weight * l2;
+    CGFloat blendedA = (1 - weight) * a1 + weight * a2;
+    CGFloat blendedB = (1 - weight) * b1 + weight * b2;
+
+    // Create a new CIColor object in LAB color space
+    CGFloat components[4] = {blendedL, blendedA, blendedB, 1.0};
+    CGColorRef cgColor = CGColorCreate(labColorSpace, components);
+    if (!cgColor) {
+        CGColorSpaceRelease(labColorSpace);
+        return self;
+    }
+    ciBlendedColor = [[[CIColor alloc] initWithColor:[NSColor colorWithCGColor:cgColor]] autorelease];
+
+    CGColorSpaceRelease(labColorSpace);
+
+    // Convert the blended LAB color to NSColor object for display
+    return [[NSColor colorWithCIColor:ciBlendedColor] colorUsingColorSpace:self.colorSpace];
+}
+
+- (vector_float4)vector {
+    return simd_make_float4(self.redComponent,
+                            self.greenComponent,
+                            self.blueComponent,
+                            self.alphaComponent);
+}
+
+@end
+
+@implementation NSColorSpace(iTerm)
++ (instancetype)it_defaultColorSpace {
+    if ([iTermAdvancedSettingsModel p3]) {
+        return [NSColorSpace displayP3ColorSpace];
+    }
+    return [NSColorSpace sRGBColorSpace];
+}
 @end

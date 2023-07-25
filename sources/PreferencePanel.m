@@ -72,6 +72,7 @@
 #import "AppearancePreferencesViewController.h"
 #import "GeneralPreferencesViewController.h"
 #import "ITAddressBookMgr.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermAdvancedSettingsViewController.h"
 #import "iTermApplication.h"
@@ -89,12 +90,14 @@
 #import "iTermWarning.h"
 #import "KeysPreferencesViewController.h"
 #import "NSArray+iTerm.h"
+#import "NSAppearance+iTerm.h"
 #import "NSDictionary+iTerm.h"
 #import "NSFileManager+iTerm.h"
 #import "NSImage+iTerm.h"
 #import "NSPopUpButton+iTerm.h"
 #import "NSStringITerm.h"
 #import "NSView+iTerm.h"
+#import "NSWindow+iTerm.h"
 #import "PasteboardHistory.h"
 #import "PointerPrefsController.h"
 #import "ProfileModel.h"
@@ -146,9 +149,6 @@ static PreferencePanel *gSessionsPreferencePanel;
 - (instancetype)init {
     self = [super init];
     if (self) {
-        if (@available(macOS 10.14, *)) {} else {
-            self.wantsLayer = YES;
-        }
         _recognizer = [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(click:)];
         [self addGestureRecognizer:_recognizer];
     }
@@ -188,23 +188,8 @@ static PreferencePanel *gSessionsPreferencePanel;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    if (@available(macOS 10.14, *)) {
-        [self mojaveDrawRect:dirtyRect];
-        return;
-    }
-    [[NSColor clearColor] set];
-    NSRectFill(dirtyRect);
-
-    NSRect rect = [self convertRect:_cutoutView.bounds fromView:_cutoutView];
-    rect = NSInsetRect(rect, -4, -4);
-    [[NSColor redColor] set];
-    NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
-    [path setLineWidth:4];
-    [path stroke];
-}
-
-- (void)mojaveDrawRect:(NSRect)dirtyRect {
-    const CGFloat baselineAlpha = 0.7;
+    const BOOL darkMode = [self.window.effectiveAppearance it_isDark];
+    const CGFloat baselineAlpha = darkMode ? 0.8 : 0.7;
     [[[NSColor blackColor] colorWithAlphaComponent:baselineAlpha] set];
     NSRectFill(dirtyRect);
 
@@ -213,9 +198,9 @@ static PreferencePanel *gSessionsPreferencePanel;
     }
     NSRect rect = [self convertRect:_cutoutView.bounds fromView:_cutoutView];
 
-    const NSInteger steps = 30;
+    const NSInteger steps = darkMode ? 15 : 30;
     const CGFloat stepSize = 0.5;
-    const CGFloat highlightAlpha = 0.2;
+    const CGFloat highlightAlpha = darkMode ? 0.0 : 0.2;
     const CGFloat alphaStride = (baselineAlpha - highlightAlpha) / steps;
     CGFloat a = baselineAlpha - alphaStride;
     [[[NSColor blackColor] colorWithAlphaComponent:a] set];
@@ -305,7 +290,9 @@ static PreferencePanel *gSessionsPreferencePanel;
 }
 
 - (BOOL)makeFirstResponder:(NSResponder *)responder {
-    BOOL result = [super makeFirstResponder:responder];
+    BOOL result = [self it_makeFirstResponderIfNotDeclined:responder callSuper:^BOOL(NSResponder *newResponse) {
+        return [super makeFirstResponder:newResponse];
+    }];
     if (result) {
         [self.prefsPanelDelegate responderWillBecomeFirstResponder:responder];
     }
@@ -453,6 +440,8 @@ static iTermPreferencesSearchEngine *gSearchEngine;
                                              selector:@selector(scrimMouseUp:)
                                                  name:iTermPrefsScrimMouseUpNotification
                                                object:nil];
+    iTermDonateViewController *vc = [[iTermDonateViewController alloc] init];
+    [self.window addTitlebarAccessoryViewController:vc];
 }
 
 - (void)layoutSubviewsForEditCurrentSessionMode {
@@ -736,7 +725,7 @@ andEditComponentWithIdentifier:(NSString *)identifier
 - (NSSearchToolbarItem *)bigSurSearchFieldToolbarItem NS_AVAILABLE_MAC(10_16){
     if (!_bigSurSearchFieldToolbarItem) {
         _bigSurSearchFieldToolbarItem = [[NSSearchToolbarItem alloc] initWithItemIdentifier:iTermPreferencePanelSearchFieldToolbarItemIdentifier];
-        _bigSurSearchFieldToolbarItem.label = @"Search";
+        _bigSurSearchFieldToolbarItem.label = @"";
         _bigSurSearchFieldToolbarItem.searchField.delegate = self;
     }
     return _bigSurSearchFieldToolbarItem;
@@ -828,7 +817,7 @@ andEditComponentWithIdentifier:(NSString *)identifier
 
 // This is used by iTermHotKeyController to not activate the hotkey while the field for typing
 // the hotkey into is the first responder.
-- (NSTextField*)hotkeyField {
+- (iTermShortcutInputView *)hotkeyField {
     return _keysViewController.hotkeyField;
 }
 
@@ -943,6 +932,10 @@ andEditComponentWithIdentifier:(NSString *)identifier
 
     [self resizeWindowForTabViewItem:tabViewItem animated:YES];
     [_profilesViewController invalidateSavedSize];
+}
+
+- (void)tabView:(NSTabView *)tabView willSelectTabViewItem:(NSTabViewItem *)tabViewItem {
+    [[self viewControllerForTabViewItem:[tabView selectedTabViewItem]] willDeselectTab];
 }
 
 - (void)resizeWindowForTabViewItem:(NSTabViewItem *)tabViewItem animated:(BOOL)animated {

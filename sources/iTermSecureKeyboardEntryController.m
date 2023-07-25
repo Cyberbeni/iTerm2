@@ -9,6 +9,7 @@
 
 #import "DebugLogging.h"
 #import "iTermUserDefaults.h"
+#import "iTermWarning.h"
 
 #import <Carbon/Carbon.h>
 
@@ -17,7 +18,9 @@ NSString *const iTermDidToggleSecureInputNotification = @"iTermDidToggleSecureIn
 @implementation iTermSecureKeyboardEntryController {
     int _count;
     BOOL _focusStolen;
-    BOOL _enabledByUserDefault;
+    BOOL _temporarilyDisabled;
+    NSTimer *_backstop;
+    BOOL _warningShown;
 }
 
 + (instancetype)sharedInstance {
@@ -82,12 +85,39 @@ NSString *const iTermDidToggleSecureInputNotification = @"iTermDidToggleSecureIn
 }
 
 - (BOOL)isDesired {
+    if (_temporarilyDisabled) {
+        return NO;
+    }
     return _enabledByUserDefault || [self currentSessionAtPasswordPrompt];
+}
+
+- (void)disableUntilDeactivated {
+    DLog(@"disableUntilDeactivated");
+    if (_backstop) {
+        DLog(@"Already have a backstop");
+        return;
+    }
+    DLog(@"Set flag");
+    _temporarilyDisabled = YES;
+    _backstop = [NSTimer scheduledTimerWithTimeInterval:1 repeats:NO block:^(NSTimer * _Nonnull timer) {
+        [[iTermSecureKeyboardEntryController sharedInstance] temporaryDisablementDidExpire];
+    }];
+    [self update];
+}
+
+- (void)temporaryDisablementDidExpire {
+    DLog(@"temporaryDisablementDidExpire _temporarilyDisabled=%@", @(_temporarilyDisabled));
+    _backstop = nil;
+    _temporarilyDisabled = NO;
+    [self update];
 }
 
 #pragma mark - Notifications
 
 - (void)applicationDidResignActive:(NSNotification *)notification {
+    _temporarilyDisabled = NO;
+    [_backstop invalidate];
+    _backstop = nil;
     if (_count > 0) {
         DLog(@"Application resigning active.");
         [self update];
@@ -138,11 +168,15 @@ NSString *const iTermDidToggleSecureInputNotification = @"iTermDidToggleSecureIn
 
     DLog(@"Before: IsSecureEventInputEnabled returns %d", (int)self.isEnabled);
     if (secure) {
+        if (![self currentSessionAtPasswordPrompt]) {
+            [self warnIfNeeded];
+        }
         OSErr err = EnableSecureEventInput();
         DLog(@"EnableSecureEventInput err=%d", (int)err);
         if (err) {
             XLog(@"EnableSecureEventInput failed with error %d", (int)err);
         } else {
+            DLog(@"Secure keyboard entry enabled");
             _count += 1;
         }
     } else {
@@ -151,11 +185,47 @@ NSString *const iTermDidToggleSecureInputNotification = @"iTermDidToggleSecureIn
         if (err) {
             XLog(@"DisableSecureEventInput failed with error %d", (int)err);
         } else {
+            DLog(@"Secure keyboard entry disabled");
             _count -= 1;
         }
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:iTermDidToggleSecureInputNotification object:nil];
     DLog(@"After: IsSecureEventInputEnabled returns %d", (int)self.isEnabled);
+}
+
+- (void)warnIfNeeded {
+    if (@available(macOS 12.0, *)) {
+        // This prevents reentrancy. If called during -windowDidBecomeKey showing the warning
+        // causes the window to resign key in the same stack which crashes.
+        [self performSelector:@selector(showMontereyWarning) withObject:nil afterDelay:0];
+    }
+}
+
+- (void)showMontereyWarning NS_AVAILABLE_MAC(12_0) {
+    if (!_enabledByUserDefault) {
+        return;
+    }
+    if (![self isEnabled]) {
+        return;
+    }
+    if (_warningShown) {
+        return;
+    }
+    _warningShown = YES;
+    const iTermWarningSelection selection =
+    [iTermWarning showWarningWithTitle:@"Secure keyboard entry is enabled.\n\nIn macOS 12 and later, enabling Secure Keyboard Entry prevents other programs from being activated. This affects the `open` command as well as the panel shown when using Touch ID for sudo."
+                               actions:@[ @"OK", @"Cancel" ]
+                             accessory:nil
+                            identifier:@"NoSyncMontereySecureKeyboardEntryWarning"
+                           silenceable:kiTermWarningTypePermanentlySilenceable
+                               heading:@"Secure Keyboard Entry Enabled"
+                                window:[NSApp keyWindow]];
+    if (selection == kiTermWarningSelection0) {
+        return;
+    }
+    if (selection == kiTermWarningSelection1) {
+        [self toggle];
+    }
 }
 
 @end

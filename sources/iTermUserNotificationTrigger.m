@@ -30,13 +30,11 @@
     return [NSSet setWithObject:@"GrowlTrigger"];
 }
 
-+ (NSString *)title
-{
++ (NSString *)title {
     return @"Post Notification…";
 }
 
-- (BOOL)takesParameter
-{
+- (BOOL)takesParameter {
     return YES;
 }
 
@@ -44,21 +42,24 @@
     return @"Enter Message";
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *notificationText) {
-                                             [self postNotificationWithText:notificationText inSession:aSession];
-                                         }];
+    // Need to stop the world to get scope, provided it is needed. Notifs are so slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull notificationText) {
+        [scheduler scheduleTriggerCallback:^{
+            [self postNotificationWithText:notificationText inSession:aSession];
+        }];
+    }];
     return YES;
 }
 
@@ -72,27 +73,11 @@
 }
 
 - (void)postNotificationWithText:(NSString *)notificationText
-                       inSession:(PTYSession *)aSession {
+                       inSession:(id<iTermTriggerSession>)aSession {
     if (!notificationText) {
         return;
     }
-    [[self rateLimit] performRateLimitedBlock:^{
-        [self reallyPostNotificationWithText:notificationText
-                                   inSession:aSession];
-    }];
-}
-
-- (void)reallyPostNotificationWithText:(NSString *)notificationText
-                             inSession:(PTYSession *)aSession {
-    iTermNotificationController *notificationController = [iTermNotificationController sharedInstance];
-    [notificationController notify:notificationText
-                   withDescription:[NSString stringWithFormat:@"A trigger fired in session \"%@\" in tab #%d.",
-                                    [[aSession name] removingHTMLFromTabTitleIfNeeded]
-                                    ,
-                                    aSession.delegate.tabNumber]
-                       windowIndex:[aSession screenWindowIndex]
-                          tabIndex:[aSession screenTabIndex]
-                         viewIndex:[aSession screenViewIndex]];
+    [aSession triggerSession:self postUserNotificationWithMessage:notificationText rateLimit:[self rateLimit]];
 }
 
 @end

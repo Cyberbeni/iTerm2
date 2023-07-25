@@ -71,5 +71,8 @@ backgroundColor:(NSColor *)backgroundColor;
 - (BOOL)tabPasswordManagerWindowIsOpen;
 - (BOOL)tabCanDragByPaneTitleBar;
 - (void)tabEndSyntheticSession:(PTYSession *)syntheticSession;
-
+- (void)tab:(PTYTab *)tab sessionDidRestart:(PTYSession *)session;
+- (void)tab:(PTYTab *)tab closeSession:(PTYSession *)session;
+- (void)tabProcessInfoProviderDidChange:(PTYTab *)tab;
+- (BOOL)tabBelongsToHotkeyWindow:(PTYTab *)tab;
 @end

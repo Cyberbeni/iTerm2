@@ -11,25 +11,30 @@
 
 static NSString *const kWorkingDirectoryStateWorkingDirectoryKey = @"Working Directory";
 
-@implementation VT100WorkingDirectory
+@implementation VT100WorkingDirectory {
+    VT100WorkingDirectory *_doppelganger;
+    __weak VT100WorkingDirectory *_progenitor;
+    BOOL _isDoppelganger;
+}
+
 @synthesize entry;
 
 - (instancetype)initWithDictionary:(NSDictionary *)dict {
+    return [self initWithDirectory:dict[kWorkingDirectoryStateWorkingDirectoryKey]];
+}
+
+- (instancetype)initWithDirectory:(NSString *)directory {
     self = [super init];
     if (self) {
-        self.workingDirectory = dict[kWorkingDirectoryStateWorkingDirectoryKey];
+        _workingDirectory = [directory copy];
     }
     return self;
 }
 
-- (void)dealloc {
-    [_workingDirectory release];
-    [super dealloc];
-}
-
 - (NSString *)description {
-    return [NSString stringWithFormat:@"<%@: %p workingDirectory=%@ interval=%@>",
-            self.class, self, self.workingDirectory, self.entry.interval];
+    return [NSString stringWithFormat:@"<%@: %p workingDirectory=%@ interval=%@ %@>",
+            self.class, self, self.workingDirectory, self.entry.interval,
+            _isDoppelganger ? @"IsDop" : @"NotDop"];
 }
 
 #pragma mark - IntervalTreeObject
@@ -40,6 +45,32 @@ static NSString *const kWorkingDirectoryStateWorkingDirectoryKey = @"Working Dir
     } else {
         return @{};
     }
+}
+
+- (NSString *)shortDebugDescription {
+    return [NSString stringWithFormat:@"[Dir %@]", self.workingDirectory];
+}
+
+- (nonnull id<IntervalTreeObject>)doppelganger {
+    @synchronized ([VT100WorkingDirectory class]) {
+        assert(!_isDoppelganger);
+        if (!_doppelganger) {
+            _doppelganger = [self copyOfIntervalTreeObject];
+            _doppelganger->_progenitor = self;
+            _doppelganger->_isDoppelganger = YES;
+        }
+        return _doppelganger;
+    }
+}
+
+- (id<IntervalTreeObject>)progenitor {
+    @synchronized ([VT100WorkingDirectory class]) {
+        return _progenitor;
+    }
+}
+
+- (instancetype)copyOfIntervalTreeObject {
+    return [[VT100WorkingDirectory alloc] initWithDirectory:self.workingDirectory];
 }
 
 @end

@@ -10,6 +10,7 @@
 
 #import "AdvancedWorkingDirectoryWindowController.h"
 #import "DebugLogging.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "ITAddressBookMgr.h"
 #import "iTermAPIHelper.h"
 #import "iTermAdvancedSettingsModel.h"
@@ -39,7 +40,8 @@
 typedef NS_ENUM(NSInteger, iTermGeneralProfilePreferenceCustomCommandTag) {
     iTermGeneralProfilePreferenceCustomCommandTagCustom = 0,
     iTermGeneralProfilePreferenceCustomCommandTagLoginShell = 1,
-    iTermGeneralProfilePreferenceCustomCommandTagCustomShell = 2
+    iTermGeneralProfilePreferenceCustomCommandTagCustomShell = 2,
+    iTermGeneralProfilePreferenceCustomCommandTagSSH = 3
 };
 
 // Tags for _initialDirectoryType
@@ -85,6 +87,9 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
     IBOutlet NSButton *_editBadgeButton;
     IBOutlet NSTextField *_subtitleLabel;
     IBOutlet NSTextField *_subtitleText;
+    IBOutlet NSButton *_configureSSHButton;
+    IBOutlet NSButton *_loadShellIntegrationAutomatically;
+    IBOutlet NSTextField *_reasonShellIntegrationDisabledLabel;
 
     iTermFunctionCallTextFieldDelegate *_commandDelegate;
     iTermFunctionCallTextFieldDelegate *_sendTextAtStartDelegate;
@@ -126,6 +131,8 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
     iTermRateLimitedUpdate *_rateLimit;
     IBOutlet NSTabView *_tabView;
     NSRect _desiredFrame;
+    NSString *_shell;  // cached open directory userShell for performance
+    iTermSSHConfigurationWindowController *_sshConfigurationWindowController;
 }
 
 - (void)dealloc {
@@ -133,6 +140,7 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
 }
 
 - (void)awakeFromNib {
+    _sessionHotkeyInputView.leaderAllowed = NO;
     _rateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"General prefs" minimumInterval:0.75];
     
     PreferenceInfo *info;
@@ -198,11 +206,6 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
                                                      functionsOnly:NO];
     _profileNameFieldForEditCurrentSession.delegate = _profileNameFieldForEditCurrentSessionDelegate;
 
-    if (@available(macOS 10.13, *)) { } else {
-        // 10.12 code path — I can't get NSTextAttachment to behave itself. For some reason it doesn't
-        // draw the tab graphic at all. I'm ragequitting.
-        _iconContainer.hidden = YES;
-    }
     info = [self defineControl:_icon
                            key:KEY_ICON
                    displayName:@"Profile icon"
@@ -370,6 +373,11 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
     _subtitleText.delegate = _subtitleTextDelegate;
 
     [self updateSubtitlesAllowed];
+
+    [self defineControl:_loadShellIntegrationAutomatically
+                    key:KEY_LOAD_SHELL_INTEGRATION_AUTOMATICALLY
+            relatedView:nil
+                   type:kPreferenceInfoTypeCheckbox];
 
     [self addViewToSearchIndex:_urlSchemes
                    displayName:@"URL schemes handled by profile"
@@ -635,17 +643,117 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
     }
 }
 
+- (NSString *)loginShell {
+    if (!_shell) {
+        _shell = [iTermOpenDirectory userShell] ?: @"/bin/zsh";
+    }
+    return _shell;
+}
+
+// The return value decides if the checkbox should be enabled and *reasonOut will be displayed as long as it's not nil.
+- (BOOL)shouldEnableLoadShellIntegration:(NSString **)reasonOut {
+    NSInteger tag = _commandType.selectedTag;
+    NSString *param = [self stringForKey:KEY_COMMAND_LINE];
+    NSArray<NSString *> *shells = @[ @"bash", @"zsh", @"fish" ];
+    switch (tag) {
+        case iTermGeneralProfilePreferenceCustomCommandTagCustomShell:
+        case iTermGeneralProfilePreferenceCustomCommandTagCustom: {
+            NSArray<NSString *> *parts = [param componentsInShellCommand];
+            if ([parts.firstObject isEqual:@"/bin/bash"]) {
+                // Apple's bash disables sourcing ENV when --posix is set 🤬
+                *reasonOut = @"Shell integration injection requires a more modern version of bash.";
+                return NO;
+            }
+            NSString *shell = [parts.firstObject lastPathComponent];
+            const BOOL enable = [shells containsObject:[shell lowercaseString]];
+            if (enable) {
+                *reasonOut = nil;
+                return YES;
+            } else if (shell) {
+                *reasonOut = [NSString stringWithFormat:@"Automatic loading doesn’t work with %@", shell];
+                return NO;
+            } else {
+                *reasonOut = nil;
+                return NO;
+            }
+        }
+        case iTermGeneralProfilePreferenceCustomCommandTagLoginShell: {
+            if ([self.loginShell isEqual:@"/bin/bash"]) {
+                // Apple's bash disables sourcing ENV when --posix is set 🤬
+                *reasonOut = @"Shell integration injection requires a more modern version of bash.";
+                return NO;
+            }
+            NSString *shell = [self.loginShell lastPathComponent];
+            const BOOL enable = [shells containsObject:[shell lowercaseString]];
+            if (enable) {
+                *reasonOut = nil;
+                return YES;
+            } else if (shell) {
+                *reasonOut = [NSString stringWithFormat:@"Automatic loading doesn’t work with %@", shell];
+                return NO;
+            } else {
+                *reasonOut = nil;
+                return NO;
+            }
+        }
+        case iTermGeneralProfilePreferenceCustomCommandTagSSH:
+            *reasonOut = @"This will only work if the remote shell is compatible.";
+            return YES;
+    }
+    return NO;
+}
+
 - (void)updateEnabledState {
     [super updateEnabledState];
     if ([[self stringForKey:KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomValue] ||
-        [[self stringForKey:KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomShellValue]) {
+        [[self stringForKey:KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomShellValue] ||
+        [[self stringForKey:KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeSSHValue]) {
         _customCommand.hidden = NO;
         _customCommand.enabled = YES;
     } else {
-        _customCommand.hidden = YES;
+        _customCommand.hidden = NO;
         _customCommand.enabled = NO;
+        _customCommand.stringValue = self.loginShell ?: @"";
+    }
+    if ([[self stringForKey:KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeSSHValue]) {
+        NSRect frame = _customCommand.frame;
+        frame.size.width = NSMinX(_configureSSHButton.frame) - NSMinX(frame);
+        _customCommand.frame = frame;
+        _configureSSHButton.hidden = NO;
+    } else {
+        NSRect frame = _customCommand.frame;
+        frame.size.width = NSMaxX(_configureSSHButton.frame) - NSMinX(frame) - 7;
+        _customCommand.frame = frame;
+        _configureSSHButton.hidden = YES;
     }
     _customDirectory.enabled = ([[self stringForKey:KEY_CUSTOM_DIRECTORY] isEqualToString:kProfilePreferenceInitialDirectoryCustomValue]);
+    NSString *reason;
+    _loadShellIntegrationAutomatically.enabled = [self shouldEnableLoadShellIntegration:&reason];
+    if (reason) {
+        _reasonShellIntegrationDisabledLabel.stringValue = reason;
+        [_reasonShellIntegrationDisabledLabel setLabelEnabled:NO];
+        _reasonShellIntegrationDisabledLabel.hidden = NO;
+    } else {
+        _reasonShellIntegrationDisabledLabel.hidden = YES;
+    }
+}
+
+#pragma mark - SSH
+
+- (IBAction)configureSSH:(id)sender {
+    _sshConfigurationWindowController = [[iTermSSHConfigurationWindowController alloc] initWithWindowNibName:@"SSHConfigurationWindow"];
+    __weak typeof(self) weakSelf = self;
+    [_sshConfigurationWindowController load:[NSDictionary castFrom:[self objectForKey:KEY_SSH_CONFIG]]];
+    [self.view.window beginSheet:_sshConfigurationWindowController.window completionHandler:^(NSModalResponse returnCode) {
+        __strong __typeof(weakSelf) strongSelf = self;
+        if (!strongSelf) {
+            return;
+        }
+        if (returnCode == NSModalResponseOK) {
+            [strongSelf setObject:strongSelf->_sshConfigurationWindowController.dictionaryValue
+                           forKey:KEY_SSH_CONFIG];
+        }
+    }];
 }
 
 #pragma mark - Tall Tab Bar
@@ -738,6 +846,11 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
 - (void)populateBookmarkUrlSchemesFromProfile:(Profile*)profile {
     if ([[[_urlSchemes menu] itemArray] count] == 0) {
         NSArray* urlArray = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleURLTypes"];
+        urlArray = [urlArray sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *lhs = obj1[@"CFBundleURLSchemes"][0];
+            NSString *rhs = obj2[@"CFBundleURLSchemes"][0];
+            return [lhs compare:rhs];
+        }];
         [_urlSchemes addItemWithTitle:@"Select URL Schemes…"];
         for (NSDictionary *dict in urlArray) {
             NSString *scheme = dict[@"CFBundleURLSchemes"][0];
@@ -838,6 +951,12 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
             value = kProfilePreferenceCommandTypeCustomShellValue;
             _customCommand.delegate = _commandDelegate.passthrough;
             break;
+        case iTermGeneralProfilePreferenceCustomCommandTagSSH:
+            value = kProfilePreferenceCommandTypeSSHValue;
+            _customCommand.delegate = _commandDelegate;
+            [self setString:@"" forKey:KEY_COMMAND_LINE];
+            _customCommand.stringValue = @"";
+            break;
     }
     [self setString:value forKey:KEY_CUSTOM_COMMAND];
     [self updateEnabledState];
@@ -852,8 +971,9 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
         [_commandType selectItemWithTag:iTermGeneralProfilePreferenceCustomCommandTagCustomShell];
         _customCommand.placeholderString = @"Enter full path to shell";
         [self removeWhitespaceFromCustomCommand];
-        [[NSUserDefaults standardUserDefaults] setObject:_customCommand.stringValue
-                                                  forKey:KEY_COMMAND_LINE];
+    } else if ([value isEqualToString:kProfilePreferenceCommandTypeSSHValue]) {
+        [_commandType selectItemWithTag:iTermGeneralProfilePreferenceCustomCommandTagSSH];
+        _customCommand.placeholderString = @"Arguments to ssh";
     } else {
         [_commandType selectItemWithTag:iTermGeneralProfilePreferenceCustomCommandTagLoginShell];
     }
@@ -1061,6 +1181,7 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
                                                                                           tty:@"TTY"
                                                                                          user:@"User"
                                                                                          host:@"Host"
+                                                                                homeDirectory:nil
                                                                                      tmuxPane:nil
                                                                                      iconName:@"“Shell”"
                                                                                    windowName:@""
@@ -1154,6 +1275,7 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
         }
     }
     [super controlTextDidChange:aNotification];
+    [self updateEnabledState];
 }
 
 - (void)removeWhitespaceFromCustomCommand {
@@ -1179,7 +1301,7 @@ static NSString *const iTermProfilePreferencesUpdateSessionName = @"iTermProfile
     iTermCallMethodByIdentifier(self.scope.tab.tabID,
                                 @"iterm2.set_title",
                                 @{ @"title": value },
-                                nil);
+                                ^(id obj, NSError *error) { });
 }
 
 - (void)windowTitleDidChange {

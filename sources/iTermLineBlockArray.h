@@ -18,8 +18,16 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSArray<LineBlock *> *blocks;
 @property (nonatomic, readonly) NSUInteger count;
 @property (nonatomic, readonly) LineBlock *lastBlock;
+@property (nonatomic, readonly) LineBlock *firstBlock;
 @property (nonatomic) BOOL resizing;
 @property (nonatomic, readonly) NSString *dumpForCrashlog;
+@property (nullable, nonatomic) NSNumber *lastUncompressedHeadBlock;
+@property (nullable, nonatomic) NSNumber *firstUncompressedTailBlock;
+
+// Automatically gets set to YES when any line block gets decompressed.
+@property (nonatomic) BOOL needsPurge;
+
+- (NSString *)dumpWidths:(NSSet<NSNumber *> *)widths;
 
 // NOTE: Update -copyWithZone: if you add properties.
 
@@ -28,7 +36,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)removeFirstBlock;
 - (void)removeFirstBlocks:(NSInteger)count;
 - (void)removeLastBlock;
-- (void)replaceLastBlockWithCopy;
 - (void)setAllBlocksMayHaveDoubleWidthCharacters;
 - (NSInteger)indexOfBlockContainingLineNumber:(int)lineNumber width:(int)width remainder:(out nonnull int *)remainderPtr;
 - (nullable LineBlock *)blockContainingLineNumber:(int)lineNumber
@@ -37,11 +44,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (int)numberOfWrappedLinesForWidth:(int)width;
 - (void)enumerateLinesInRange:(NSRange)range
                         width:(int)width
-                        block:(void (^)(screen_char_t *chars,
+                        block:(void (^)(const screen_char_t *chars,
                                         int length,
                                         int eol,
                                         screen_char_t continuation,
-                                        iTermMetadata metadata,
+                                        iTermImmutableMetadata metadata,
                                         BOOL *stop))block;
 - (NSInteger)numberOfRawLines;
 - (NSInteger)rawSpaceUsed;
@@ -49,12 +56,17 @@ NS_ASSUME_NONNULL_BEGIN
 
 // If you don't need a yoffset pass -1 for width and NULL for blockOffset to avoid building a cache.
 - (LineBlock *)blockContainingPosition:(long long)p
+                               yOffset:(int)yOffset
                                  width:(int)width
                              remainder:(nullable int *)remainder
                            blockOffset:(nullable int *)yoffset
                                  index:(nullable int *)indexPtr;
 - (void)sanityCheck;
 - (void)oopsWithWidth:(int)width block:(void (^)(void))block;
+- (NSSet<NSNumber *> *)cachedWidths;
+- (NSInteger)numberOfWrappedLinesForWidth:(int)width
+                          upToBlockAtIndex:(NSInteger)limit;
+- (void)findUncompressedBlocks;
 
 @end
 

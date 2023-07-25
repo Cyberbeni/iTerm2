@@ -2,16 +2,20 @@
 
 #import "iTermPreferences.h"
 
+@class iTermEventTap;
+
 // A simple interface to modifier remapping-related stuff.
 @interface iTermModifierRemapper : NSObject
 
 // These are convenience methods for looking up the preferences setting for
 // what each modifier ought to do.
-@property(nonatomic, readonly) iTermPreferencesModifierTag controlRemapping;
+@property(nonatomic, readonly) iTermPreferencesModifierTag leftControlRemapping;
+@property(nonatomic, readonly) iTermPreferencesModifierTag rightControlRemapping;
 @property(nonatomic, readonly) iTermPreferencesModifierTag leftOptionRemapping;
 @property(nonatomic, readonly) iTermPreferencesModifierTag rightOptionRemapping;
 @property(nonatomic, readonly) iTermPreferencesModifierTag leftCommandRemapping;
 @property(nonatomic, readonly) iTermPreferencesModifierTag rightCommandRemapping;
+@property(nonatomic, readonly) iTermPreferencesModifierTag functionRemapping;
 
 // Is any modifier set in prefs to do something other than its un-remapped behavior?
 @property(nonatomic, readonly) BOOL isAnyModifierRemapped;
@@ -25,6 +29,7 @@
 + (instancetype)sharedInstance;
 - (instancetype)init NS_UNAVAILABLE;
 
-- (CGEventRef)eventByRemappingEvent:(CGEventRef)event;
+- (CGEventRef)eventByRemappingEvent:(CGEventRef)event
+                           eventTap:(iTermEventTap *)eventTap;
 
 @end

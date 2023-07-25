@@ -129,8 +129,6 @@
     } else {
         _divider.color = [NSColor colorWithCalibratedRed:0.66 green:0.66 blue:0.66 alpha:1];
     }
-
-    [self updateTextColorForAllRows];
 }
 
 - (void)presentWindow {
@@ -168,8 +166,6 @@
     // Select the first item.
     if (self.model.items.count) {
         [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
-        [self tableViewSelectionDidChange:[NSNotification notificationWithName:NSTableViewSelectionDidChangeNotification
-                                                                        object:nil]];
     }
 
     [self performSelector:@selector(resizeWindowAnimatedToFrame:)
@@ -258,6 +254,15 @@
                 // Create the hotkey window for this profile
                 [[iTermHotKeyController sharedInstance] showWindowForProfileHotKey:profileHotkey url:nil];
             }
+        } else if ([object isKindOfClass:[PseudoTerminal class]]) {
+            PseudoTerminal *term = object;
+            if (term.isHotKeyWindow) {
+                iTermProfileHotKey *profileHotkey = [[iTermHotKeyController sharedInstance] profileHotKeyForWindowController:term];
+                [[iTermHotKeyController sharedInstance] showWindowForProfileHotKey:profileHotkey url:nil];
+            } else {
+                NSWindow *window = [object window];
+                [window makeKeyAndOrderFront:nil];
+            }
         } else if ([object isKindOfClass:[iTermOpenQuicklyArrangementItem class]]) {
             // Load window arrangement
             iTermOpenQuicklyArrangementItem *item = (iTermOpenQuicklyArrangementItem *)object;
@@ -335,17 +340,8 @@
     }
     NSColor *color;
     NSColor *detailColor;
-    if (@available(macOS 10.14, *)) {
-        color = [NSColor labelColor];
-        detailColor = [NSColor secondaryLabelColor];
-    } else {
-        if (row == tableView.selectedRow) {
-            color = [NSColor whiteColor];
-        } else {
-            color = [self blackColor];
-        }
-        detailColor = color;
-    }
+    color = [NSColor labelColor];
+    detailColor = [NSColor secondaryLabelColor];
     result.textField.font = [NSFont systemFontOfSize:13];
     result.textField.textColor = color;
     result.detailTextField.textColor = detailColor;
@@ -358,41 +354,6 @@
     } else {
         return [[iTermOpenQuicklyTableRowView alloc] init];
     }
-}
-
-- (void)updateTextColorForAllRows {
-    if (@available(macOS 10.14, *)) {
-        return;
-    }
-    NSInteger row = [_table selectedRow];
-    // Fix up text color for all items
-    for (int i = 0; i < _model.items.count; i++) {
-        iTermOpenQuicklyItem *item = _model.items[i];
-        NSColor *color;
-        if (@available(macOS 10.14, *)) {
-            if (i == _table.selectedRow) {
-                [[_table viewAtColumn:0 row:i makeIfNecessary:NO] setBackgroundStyle:NSBackgroundStyleEmphasized];
-            } else {
-                [[_table viewAtColumn:0 row:i makeIfNecessary:NO] setBackgroundStyle:NSBackgroundStyleNormal];
-            }
-        } else {
-            if (i == row) {
-                color = [NSColor whiteColor];
-            } else {
-                color = [self blackColor];
-            }
-            item.view.textField.textColor = color;
-            item.view.detailTextField.textColor = color;
-        }
-    }
-}
-
-- (void)tableViewSelectionIsChanging:(NSNotification *)notification {
-    [self updateTextColorForAllRows];
-}
-
-- (void)tableViewSelectionDidChange:(NSNotification *)notification {
-    [self updateTextColorForAllRows];
 }
 
 - (void)doubleClick:(id)sender {
@@ -502,8 +463,15 @@
     return theString;
 }
 
-- (NSAttributedString *)openQuicklyModelAttributedStringForDetail:(NSString *)detail {
-    return [self attributedStringFromString:detail
+- (NSAttributedString *)openQuicklyModelAttributedStringForDetail:(NSString *)detail
+                                                      featureName:(NSString *)featureName {
+    NSString *composite;
+    if (featureName) {
+        composite = [NSString stringWithFormat:@"%@: %@", featureName, detail];
+    } else {
+        composite = detail;
+    }
+    return [self attributedStringFromString:composite
                       byHighlightingIndices:nil];
 }
 

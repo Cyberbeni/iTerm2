@@ -39,6 +39,7 @@
 @class iTermFindDriver;
 @class iTermImageWrapper;
 @class iTermIncrementalMinimapView;
+@class iTermLegacyView;
 @class iTermMetalDriver;
 @protocol iTermSearchResultsMinimapViewDelegate;
 @class iTermSearchResultsMinimapView;
@@ -147,6 +148,9 @@ extern NSString *const SessionViewWasSelectedForInspectionNotification;
 - (void)sessionViewDidChangeEffectiveAppearance;
 - (BOOL)sessionViewCaresAboutMouseMovement;
 
+- (NSRect)sessionViewOffscreenCommandLineFrameForView:(NSView *)view;
+- (void)sessionViewUpdateComposerFrame;
+
 @end
 
 typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
@@ -182,6 +186,10 @@ typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
 @property(nonatomic, strong) iTermImageWrapper *image;
 @property(nonatomic) iTermBackgroundImageMode imageMode;
 @property(nonatomic, readonly) BOOL statusBarIsInPaneTitleBar;
+@property(nonatomic, readonly) double adjustedDimmingAmount;
+@property(nonatomic, readonly) iTermLegacyView *legacyView;
+
+@property(nonatomic) CGFloat composerHeight;
 
 // For macOS 10.14+ when subpixel AA is OFF, this draws the default background color. When there's
 // a background image it will be translucent to effect blending. When subpixel AA is ON or the OS
@@ -258,7 +266,7 @@ typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
 - (void)createSplitSelectionView;
 - (SplitSessionHalf)removeSplitSelectionView;
 
-- (BOOL)setHoverURL:(NSString *)url;
+- (BOOL)setHoverURL:(NSString *)url anchorFrame:(NSRect)anchorFrame;
 - (BOOL)hasHoverURL;
 - (void)reallyUpdateMetalViewFrame;
 - (void)invalidateStatusBar;
@@ -273,7 +281,12 @@ typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
 - (void)tabColorDidChange;
 - (void)didBecomeVisible;
 - (void)showUnobtrusiveMessage:(NSString *)message;
+- (void)showUnobtrusiveMessage:(NSString *)message duration:(NSTimeInterval)duration;
 - (void)setSuppressLegacyDrawing:(BOOL)suppressLegacyDrawing;
 - (void)takeFindDriverFrom:(SessionView *)donorView delegate:(id<iTermFindDriverDelegate>)delegate;
+
+// Sets the next responder for the dropdown find view controller so you can still use menu items
+// vended by PTYTextView when it is focused.
+- (void)setMainResponder:(NSResponder *)responder;
 
 @end

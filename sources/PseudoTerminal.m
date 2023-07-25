@@ -75,6 +75,7 @@
 #import "iTermVariableReference.h"
 #import "iTermVariableScope.h"
 #import "iTermVariableScope+Global.h"
+#import "iTermVariableScope+Session.h"
 #import "iTermVariableScope+Tab.h"
 #import "iTermVariableScope+Window.h"
 #import "iTermWarning.h"
@@ -115,6 +116,7 @@
 #import "PTYTabView.h"
 #import "PTYTask.h"
 #import "PTYTextView.h"
+#import "PTYTextView+ARC.h"
 #import "PTYWindow.h"
 #import "SessionView.h"
 #import "SplitPanel.h"
@@ -125,9 +127,10 @@
 #import "ToolCapturedOutputView.h"
 #import "ToolCommandHistoryView.h"
 #import "ToolDirectoriesView.h"
+#import "ToolJobs.h"
 #import "VT100RemoteHost.h"
 #import "VT100Screen.h"
-#import "VT100Screen.h"
+#import "VT100ScreenMutableState.h"
 #import "VT100Terminal.h"
 #include "iTermFileDescriptorClient.h"
 #import <QuartzCore/QuartzCore.h>
@@ -178,6 +181,9 @@ static NSString *const TERMINAL_ARRANGEMENT_USE_TRANSPARENCY = @"Use Transparenc
 static NSString *const TERMINAL_ARRANGEMENT_TOOLBELT_PROPORTIONS = @"Toolbelt Proportions";
 static NSString *const TERMINAL_ARRANGEMENT_TITLE_OVERRIDE = @"Title Override";
 static NSString *const TERMINAL_ARRANGEMENT_TOOLBELT = @"Toolbelt";
+
+// This is used to adjust the window's size to preserve rows x cols when the scroller style changes.
+// If the window was maximized to the screen's visible frame, it will be unset to disable this behavior.
 static NSString *const TERMINAL_ARRANGEMENT_SCROLLER_WIDTH = @"Scroller Width";
 
 // Only present in arrangements created by the window restoration system, not (for example) saved arrangements in the UI.
@@ -427,6 +433,11 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
 
     NSSize _previousScreenSize;
     CGFloat _previousScreenScaleFactor;
+
+    NSTimeInterval _creationTime;
+
+    // Issue 10551
+    iTermTextView *_fieldEditor;
 }
 
 @synthesize scope = _scope;
@@ -536,6 +547,7 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
                                      screen:(int)screenNumber
                            hotkeyWindowType:(iTermHotkeyWindowType)hotkeyWindowType
                                     profile:(Profile *)profile {
+    _creationTime = [NSDate it_timeSinceBoot];
     const iTermWindowType windowType = iTermThemedWindowType(unsafeWindowType);
     iTermWindowType savedWindowType = iTermThemedWindowType(unsafeSavedWindowType);
     DLog(@"-[%p finishInitializationWithSmartLayout:%@ windowType:%d screen:%d hotkeyWindowType:%@ ",
@@ -807,11 +819,16 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
                                                            selector:@selector(activeSpaceDidChange:)
                                                                name:NSWorkspaceActiveSpaceDidChangeNotification
                                                              object:nil];
+    [iTermNamedMarksDidChangeNotification subscribeWithOwner:self block:^(iTermNamedMarksDidChangeNotification * _Nonnull notif) {
+        if ([notif.sessionGuid isEqualToString:weakSelf.currentSession.guid]) {
+            [weakSelf refreshNamedMarks];
+        }
+    }];
     PtyLog(@"set window inited");
     self.windowInitialized = YES;
     useTransparency_ = [iTermProfilePreferences boolForKey:KEY_INITIAL_USE_TRANSPARENCY inProfile:profile];
     number_ = [[iTermController sharedInstance] allocateWindowNumber];
-    [_scope setValue:@(number_ + 1) forVariableNamed:@"number"];
+    [_scope setValue:@(number_ + 1) forVariableNamed:iTermVariableKeyWindowNumber];
 
     // Update the collection behavior.
     self.hotkeyWindowType = hotkeyWindowType;
@@ -821,16 +838,14 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
     [[self window] setRestorationClass:[PseudoTerminalRestorer class]];
     self.terminalGuid = [NSString stringWithFormat:@"pty-%@", [NSString uuid]];
 
-    if (@available(macOS 10.14, *)) {
-        if ([self.window respondsToSelector:@selector(addTitlebarAccessoryViewController:)] &&
-            [iTermAdvancedSettingsModel useShortcutAccessoryViewController]) {
-            _shortcutAccessoryViewController =
-                [[iTermWindowShortcutLabelTitlebarAccessoryViewController alloc] initWithNibName:@"iTermWindowShortcutAccessoryView"
-                                                                                          bundle:[NSBundle bundleForClass:self.class]];
-        }
-        [self addShortcutAccessorViewControllerToTitleBarIfNeeded];
-        _shortcutAccessoryViewController.ordinal = number_ + 1;
+    if ([self.window respondsToSelector:@selector(addTitlebarAccessoryViewController:)] &&
+        [iTermAdvancedSettingsModel useShortcutAccessoryViewController]) {
+        _shortcutAccessoryViewController =
+            [[iTermWindowShortcutLabelTitlebarAccessoryViewController alloc] initWithNibName:@"iTermWindowShortcutAccessoryView"
+                                                                                      bundle:[NSBundle bundleForClass:self.class]];
     }
+    [self addShortcutAccessorViewControllerToTitleBarIfNeeded];
+    _shortcutAccessoryViewController.ordinal = number_ + 1;
 
     DLog(@"Creating window with profile:%@", profile);
     DLog(@"%@\n%@", self, [NSThread callStackSymbols]);
@@ -978,6 +993,8 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
 - (void)setHotkeyWindowType:(iTermHotkeyWindowType)hotkeyWindowType {
     _hotkeyWindowType = hotkeyWindowType;
     self.window.collectionBehavior = self.desiredWindowCollectionBehavior;
+    [_scope setValue:@(hotkeyWindowType != iTermHotkeyWindowTypeNone)
+    forVariableNamed:iTermVariableKeyWindowIsHotkeyWindow];
 }
 
 - (void)finishToolbeltInitialization {
@@ -999,7 +1016,7 @@ typedef NS_ENUM(int, iTermShouldHaveTitleSeparator) {
 
 ITERM_WEAKLY_REFERENCEABLE
 
-- (void)iterm_dealloc {
+- (void)dealloc {
     _deallocing = YES;
     [_contentView shutdown];
 
@@ -1040,10 +1057,8 @@ ITERM_WEAKLY_REFERENCEABLE
     [autocompleteView release];
     [lastArrangement_ release];
     [_autoCommandHistorySessionGuid release];
-    if (@available(macOS 10.14, *)) {
-        [_shortcutAccessoryViewController release];
-        [_titleBarAccessoryTabBarViewController release];
-    }
+    [_shortcutAccessoryViewController release];
+    [_titleBarAccessoryTabBarViewController release];
     [_didEnterLionFullscreen release];
     [_desiredTitle release];
     [_tabsTouchBarItem release];
@@ -1064,6 +1079,8 @@ ITERM_WEAKLY_REFERENCEABLE
     [_screenConfigurationAtTimeOfForceFrame release];
     [_proxyIconOrderEnforcer release];
     [_swipeIdentifier release];
+    [_fieldEditor release];
+
     [super dealloc];
 }
 
@@ -1256,6 +1273,8 @@ ITERM_WEAKLY_REFERENCEABLE
         }]) {
             [self fitWindowToIdealizedTabsPreservingHeight:NO];
         }
+        TmuxController *first = self.uniqueTmuxControllers.firstObject;
+        [first restoreWindowFrame:self];
     }
 }
 
@@ -1372,6 +1391,19 @@ ITERM_WEAKLY_REFERENCEABLE
 
 - (int)number {
     return number_;
+}
+
+- (void)ensureSaneFrame {
+    NSPoint recommendedOrigin = self.window.frame.origin;
+    const double fractionOnScreen = [NSScreen fractionOfFrameOnAnyScreen:self.window.frame
+                                                       recommendedOrigin:&recommendedOrigin];
+    if (fractionOnScreen < 0.05) {
+        DLog(@"Frame %@ is %@ percent onscreen. Move to %@",
+             NSStringFromRect(self.window.frame),
+             @(fractionOnScreen),
+             NSStringFromPoint(recommendedOrigin));
+        [self.window setFrameOrigin:recommendedOrigin];
+    }
 }
 
 - (void)setFrameValue:(NSValue *)value
@@ -1546,7 +1578,7 @@ ITERM_WEAKLY_REFERENCEABLE
 - (NSColor *)terminalWindowDecorationBackgroundColor {
     iTermPreferencesTabStyle preferredStyle = [iTermPreferences intForKey:kPreferenceKeyTabStyle];
     if (self.shouldUseMinimalStyle) {
-        return [self.currentSession.colorMap colorForKey:kColorMapBackground];
+        return [self.currentSession.screen.colorMap colorForKey:kColorMapBackground];
     } else {
         CGFloat whiteLevel = 0;
         switch ([self.window.effectiveAppearance it_tabStyle:preferredStyle]) {
@@ -1762,7 +1794,7 @@ ITERM_WEAKLY_REFERENCEABLE
                 if ([tuple.firstObject isEqualToString:@"login"]) {
                     return nil;
                 }
-                return tuple.secondObject;
+                return tuple.secondObject.lastPathComponent;
             }];
         }
     }
@@ -1873,6 +1905,18 @@ ITERM_WEAKLY_REFERENCEABLE
     [self removeTab:aTab];
 }
 
+- (void)tab:(PTYTab *)tab closeSession:(PTYSession *)session {
+    [self closeSessionWithoutConfirmation:session];
+}
+
+- (void)tabProcessInfoProviderDidChange:(PTYTab *)tab {
+    [self refreshTools];
+}
+
+- (BOOL)tabBelongsToHotkeyWindow:(PTYTab *)tab {
+    return [self isHotKeyWindow];
+}
+
 - (NSUInteger)numberOfTabsWithTmuxController:(TmuxController *)tmuxController {
     return [[self.tabs filteredArrayUsingBlock:^BOOL(PTYTab *tab) {
         return tab.tmuxController == tmuxController;
@@ -1916,6 +1960,7 @@ ITERM_WEAKLY_REFERENCEABLE
     restorableSession.terminalGuid = self.terminalGuid;
     restorableSession.arrangement = [self arrangement];
     restorableSession.group = kiTermRestorableSessionGroupWindow;
+    restorableSession.windowTitle = [self.scope windowTitleOverrideFormat];
     [self storeWindowStateInRestorableSession:restorableSession];
     DLog(@"Create restorable session with terminal guid %@", restorableSession.terminalGuid);
     return restorableSession;
@@ -1925,6 +1970,7 @@ ITERM_WEAKLY_REFERENCEABLE
     restorableSession.windowType = self.lionFullScreen ? WINDOW_TYPE_LION_FULL_SCREEN : self.windowType;
     restorableSession.savedWindowType = self.savedWindowType;
     restorableSession.screen = _screenNumberFromFirstProfile;
+    restorableSession.windowTitle = [self.scope windowTitleOverrideFormat];
 }
 
 - (iTermRestorableSession *)restorableSessionForTab:(PTYTab *)aTab {
@@ -1946,6 +1992,7 @@ ITERM_WEAKLY_REFERENCEABLE
     restorableSession.predecessors = predecessors;
     restorableSession.arrangement = [aTab arrangement];
     restorableSession.group = kiTermRestorableSessionGroupTab;
+    restorableSession.windowTitle = [self.scope windowTitleOverrideFormat];
     [self storeWindowStateInRestorableSession:restorableSession];
     return restorableSession;
 }
@@ -1959,6 +2006,7 @@ ITERM_WEAKLY_REFERENCEABLE
         restorableSession.sessions = [aTab sessions];
         restorableSession.terminalGuid = self.terminalGuid;
         restorableSession.tabUniqueId = aTab.uniqueId;
+        restorableSession.windowTitle = [self.scope windowTitleOverrideFormat];
         [self storeWindowStateInRestorableSession:restorableSession];
         NSArray *tabs = [self tabs];
         NSUInteger index = [tabs indexOfObject:aTab];
@@ -2032,6 +2080,15 @@ ITERM_WEAKLY_REFERENCEABLE
     [[self currentSession] screenSaveScrollPosition];
 }
 
+- (IBAction)addNamedMark:(id)sender
+{
+    __weak PTYSession *session = self.currentSession;
+    [iTermBookmarkDialogViewController showInWindow:self.window
+                                     withCompletion:^(NSString * _Nonnull name) {
+        [session saveScrollPositionWithName:name];
+    }];
+}
+
 // Jump to the saved scroll position
 - (IBAction)jumpToSavedScrollPosition:(id)sender
 {
@@ -2047,9 +2104,7 @@ ITERM_WEAKLY_REFERENCEABLE
 - (void)updateFullScreenTabBar:(NSNotification *)notification {
     DLog(@"%@", self);
     if ([self anyFullScreen]) {
-        if (@available(macOS 10.14, *)) {
-            [self updateTabBarControlIsTitlebarAccessory];
-        }
+        [self updateTabBarControlIsTitlebarAccessory];
         [_contentView.tabBarControl updateFlashing];
         [self repositionWidgets];
         [self fitTabsToWindow];
@@ -2136,6 +2191,59 @@ ITERM_WEAKLY_REFERENCEABLE
 - (IBAction)restartSession:(id)sender {
     DLog(@"restartSession");
     [self restartSessionWithConfirmation:self.currentSession];
+}
+
+- (IBAction)duplicateSession:(id)sender {
+    DLog(@"duplicateSession");
+    PTYSession *session = self.currentSession;
+    MutableProfile *profile = [[session.profile mutableCopy] autorelease];
+    NSArray<iTermSSHReconnectionInfo *> *pendingJumps = nil;
+    if (session.sshIdentity) {
+        NSArray<iTermSSHReconnectionInfo *> *sequence = session.sshCommandLineSequence;
+        if ([profile[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeSSHValue]) {
+            // SSH command type
+            if (sequence[0].initialDirectory) {
+                profile[KEY_CUSTOM_DIRECTORY] = @"Yes";
+                profile[KEY_WORKING_DIRECTORY] = sequence[0].initialDirectory;
+            }
+        } else {
+            // Local session in which the user ran it2ssh. Change to ssh profile to first host.
+            assert(sequence.count > 0);
+            profile[KEY_CUSTOM_COMMAND] = kProfilePreferenceCommandTypeSSHValue;
+            profile[KEY_COMMAND_LINE] = sequence[0].sshargs;
+            if (sequence[0].initialDirectory) {
+                profile[KEY_CUSTOM_DIRECTORY] = @"Yes";
+                profile[KEY_WORKING_DIRECTORY] = sequence[0].initialDirectory;
+            }
+        }
+        pendingJumps = sequence;
+        // TOOD: Should specify a pwd for each host along the way. This will do the wrong thing if
+        // there are jump hosts.
+        NSString *pwd = session.variablesScope.path;
+        if (pwd) {
+            profile[KEY_CUSTOM_DIRECTORY] = kProfilePreferenceInitialDirectoryCustomValue;
+            profile[KEY_WORKING_DIRECTORY] = pwd;
+        }
+    } else if (session.currentLocalWorkingDirectory) {
+        profile[KEY_CUSTOM_DIRECTORY] = @"Yes";
+        profile[KEY_WORKING_DIRECTORY] = session.currentLocalWorkingDirectory;
+    }
+    DLog(@"Will use profile:\n%@", profile);
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    iTermMutableDictionaryEncoderAdapter *encoder =
+        [[iTermMutableDictionaryEncoderAdapter alloc] initWithMutableDictionary:dict];
+    [session encodeArrangementWithContents:YES encoder:encoder];
+
+    NSDictionary *tabArrangement = [self.currentTab arrangementWithOnlySession:session
+                                                                       profile:profile
+                                                                   saveProgram:NO
+                                                                  pendingJumps:pendingJumps];
+    [self openTabWithArrangement:tabArrangement
+                           named:@"Unnamed arrangement"
+                 hasFlexibleView:NO
+                         viewMap:nil
+                      sessionMap:nil
+              partialAttachments:nil];
 }
 
 - (void)restartSessionWithConfirmation:(PTYSession *)aSession {
@@ -2337,7 +2445,8 @@ ITERM_WEAKLY_REFERENCEABLE
 
     if ([iTermPreferences boolForKey:kPreferenceKeyShowWindowNumber]) {
         NSString *tmuxId = @"";
-        if ([[self currentSession] isTmuxClient]) {
+        if ([[self currentSession] isTmuxClient] &&
+            [iTermAdvancedSettingsModel tmuxIncludeClientNameInWindowTitle]) {
             NSString *clientName = [[[self currentSession] tmuxController] clientName];
             if (clientName) {
                 tmuxId = [NSString stringWithFormat:@" [%@]", clientName];
@@ -2345,15 +2454,9 @@ ITERM_WEAKLY_REFERENCEABLE
         }
         NSString *windowNumber = @"";
 
-        if (@available(macOS 10.14, *)) {
-            if (!_shortcutAccessoryViewController ||
-                !(self.window.styleMask & NSWindowStyleMaskTitled)) {
-                windowNumber = [NSString stringWithFormat:@"%d. ", number_ + 1];
-            }
-        } else {
-            if (self.window.styleMask & NSWindowStyleMaskTitled) {
-                windowNumber = [NSString stringWithFormat:@"%d. ", number_ + 1];
-            }
+        if (!_shortcutAccessoryViewController ||
+            !(self.window.styleMask & NSWindowStyleMaskTitled)) {
+            windowNumber = [NSString stringWithFormat:@"%d. ", number_ + 1];
         }
         title = [NSString stringWithFormat:@"%@%@%@", windowNumber, title, tmuxId];
         titleExWindowNumber = [NSString stringWithFormat:@"%@%@", titleExWindowNumber, tmuxId];
@@ -2401,7 +2504,7 @@ ITERM_WEAKLY_REFERENCEABLE
             self.window.title = self.desiredTitle;
             [self updateWindowMenu];
         }
-        PseudoTerminal<iTermWeakReference> *weakSelf = self.weakSelf;
+        __weak __typeof(self) weakSelf = self;
         DLog(@"schedule timer to set window title");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(iTermWindowTitleChangeMinimumInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!(weakSelf.window.title == weakSelf.desiredTitle || [weakSelf.window.title isEqualToString:weakSelf.desiredTitle])) {
@@ -2430,7 +2533,7 @@ ITERM_WEAKLY_REFERENCEABLE
                  forceEncoding:(BOOL)forceEncoding {
     for (PTYSession *aSession in [self broadcastSessions]) {
         if (![aSession isTmuxGateway]) {
-            [aSession writeTaskNoBroadcast:string encoding:optionalEncoding forceEncoding:forceEncoding];
+            [aSession writeTaskNoBroadcast:string encoding:optionalEncoding forceEncoding:forceEncoding reporting:NO];
         }
     }
 }
@@ -2896,12 +2999,14 @@ ITERM_WEAKLY_REFERENCEABLE
 - (IBAction)editWindowTitle:(id)sender {
     NSAlert *alert = [[[NSAlert alloc] init] autorelease];
     alert.messageText = @"Set Window Title";
-    alert.informativeText = @"If this is empty, the window takes the active session’s title. Variables and function calls enclosed in \\(…) will be replaced with their evaluation.";
+    alert.informativeText = @"If this is empty, the window takes the active session’s title. Variables and function calls enclosed in \\(…) will be replaced with their evaluation. This interpolated string is evaluated in the window’s context.";
     NSTextField *titleTextField = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24 * 3)] autorelease];
     iTermFunctionCallTextFieldDelegate *delegate;
     delegate = [[[iTermFunctionCallTextFieldDelegate alloc] initWithPathSource:[iTermVariableHistory pathSourceForContext:iTermVariablesSuggestionContextWindow]
                                                                    passthrough:nil
                                                                  functionsOnly:NO] autorelease];
+    delegate.canWarnAboutContextMistake = YES;
+    delegate.contextMistakeText = @"This interpolated string is evaluated in the window’s context, not the session’s context. To access variables in the current session, use currentTab.currentSession.sessionVariableNameHere";
     titleTextField.delegate = delegate;
     titleTextField.editable = YES;
     titleTextField.selectable = YES;
@@ -2923,14 +3028,28 @@ ITERM_WEAKLY_REFERENCEABLE
     DLog(@"begin");
     [self.currentSession showFilter];
 }
-
 - (IBAction)findUrls:(id)sender {
     DLog(@"begin");
     iTermFindDriver *findDriver = self.currentSession.view.findDriver;
     NSString *regex = [iTermAdvancedSettingsModel findUrlsRegex];
     DLog(@"findDriver=%@ regex=%@", findDriver, regex);
+    __weak PTYSession *session = self.currentSession;
+    __block BOOL done = NO;
     [findDriver closeViewAndDoTemporarySearchForString:regex
-                                                  mode:iTermFindModeCaseSensitiveRegex];
+                                                  mode:iTermFindModeCaseSensitiveRegex
+                                              progress:^(NSRange linesSearched) {
+        if (!session.textview || done) {
+            return;
+        }
+        const VT100GridRange visibleLines = [session.textview rangeOfVisibleLines];
+        const NSRange visibleAbsLines = NSMakeRange(visibleLines.location + session.screen.totalScrollbackOverflow,
+                                                    visibleLines.length);
+        if (NSEqualRanges(visibleAbsLines, NSIntersectionRange(visibleAbsLines, linesSearched))) {
+            [session.textview convertVisibleSearchResultsToContentNavigationShortcuts];
+            done = YES;
+            return;
+        }
+    }];
 }
 
 - (IBAction)detachTmux:(id)sender {
@@ -2999,12 +3118,14 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (void)loadTmuxLayout:(NSMutableDictionary *)parseTree
+         visibleLayout:(NSMutableDictionary *)visibleParseTree
                 window:(int)window
         tmuxController:(TmuxController *)tmuxController
                   name:(NSString *)name {
     DLog(@"begin loadTmuxLayout");
     [self beginTmuxOriginatedResize];
     PTYTab *tab = [PTYTab openTabWithTmuxLayout:parseTree
+                                  visibleLayout:visibleParseTree
                                      inTerminal:self
                                      tmuxWindow:window
                                  tmuxController:tmuxController];
@@ -3177,6 +3298,8 @@ ITERM_WEAKLY_REFERENCEABLE
             case WINDOW_TYPE_COMPACT:
                 DLog(@"Needs width adjustment and sanitization.");
                 frame = [PseudoTerminal sanitizedWindowFrame:[self rectByAdjustingWidth:rect]];
+                DLog(@"Set width adjustment to 0 for %@", self);
+                _widthAdjustment = 0;
                 break;
 
             case WINDOW_TYPE_LEFT:
@@ -3233,7 +3356,9 @@ ITERM_WEAKLY_REFERENCEABLE
     // comment where preferredCursorPosition is set for more details.
     for (PTYSession *session in self.allSessions) {
         DLog(@"restore preferred cursor position for %@", session);
-        [session.screen.currentGrid restorePreferredCursorPositionIfPossible];
+        [session.screen performBlockWithJoinedThreads:^(VT100Terminal *terminal, VT100ScreenMutableState *mutableState, id<VT100ScreenDelegate> delegate) {
+            [mutableState.currentGrid restorePreferredCursorPositionIfPossible];
+        }];
     }
     [_contentView updateToolbeltForWindow:self.window];
     [self updateTouchBarFunctionKeyLabels];
@@ -3313,13 +3438,6 @@ ITERM_WEAKLY_REFERENCEABLE
                   includingContents:(BOOL)includeContents
                             encoder:(id<iTermEncoderAdapter>)result {
     NSRect rect = [[self window] frame];
-    int screenNumber = 0;
-    for (NSScreen* screen in [NSScreen screens]) {
-        if (screen == [[self window] screen]) {
-            break;
-        }
-        ++screenNumber;
-    }
 
     [result setObject:self.terminalGuid forKey:TERMINAL_GUID];
 
@@ -3390,10 +3508,23 @@ ITERM_WEAKLY_REFERENCEABLE
     }
 
     const CGFloat scrollerWidth = iTermScrollbarWidth();
-    result[TERMINAL_ARRANGEMENT_SCROLLER_WIDTH] = @(scrollerWidth);
-    DLog(@"Save scroller width of %@", @(scrollerWidth));
+    if (![self isMaximized]) {
+        result[TERMINAL_ARRANGEMENT_SCROLLER_WIDTH] = @(scrollerWidth);
+        DLog(@"Save scroller width of %@", @(scrollerWidth));
+    } else {
+        DLog(@"Window is maximized so don't save scroller width.");
+    }
 
     return YES;
+}
+
+- (BOOL)isMaximized {
+    if (self.window.screen == nil) {
+        return NO;
+    }
+    return iTermApproximatelyEqualRects(self.window.frame,
+                                        self.window.screen.visibleFrame,
+                                        0.5);
 }
 
 - (NSDictionary*)arrangement {
@@ -3438,6 +3569,12 @@ ITERM_WEAKLY_REFERENCEABLE
     [[_contentView.toolbelt commandHistoryView] updateCommands];
     [[_contentView.toolbelt capturedOutputView] updateCapturedOutput];
     [[_contentView.toolbelt directoriesView] updateDirectories];
+    [[_contentView.toolbelt jobsView] updateJobs];
+    [self refreshNamedMarks];
+}
+
+- (void)refreshNamedMarks {
+    [[_contentView.toolbelt namedMarksView] setNamedMarks:self.currentSession.screen.namedMarks];
 }
 
 - (int)numRunningSessions
@@ -3546,6 +3683,14 @@ ITERM_WEAKLY_REFERENCEABLE
     _instantReplayWindowController = nil;
 }
 
+- (id)windowWillReturnFieldEditor:(NSWindow *)sender toObject:(id)client {
+    if (!_fieldEditor) {
+        _fieldEditor = [[iTermTextView alloc] init];
+        _fieldEditor.fieldEditor = YES;
+    }
+    return _fieldEditor;
+}
+
 - (void)windowWillClose:(NSNotification *)aNotification {
    DLog(@"windowWillClose %@", self);
     _closing = YES;
@@ -3610,6 +3755,7 @@ ITERM_WEAKLY_REFERENCEABLE
         restorableSession.terminalGuid = self.terminalGuid;
         restorableSession.arrangement = [self arrangement];
         restorableSession.group = kiTermRestorableSessionGroupWindow;
+        restorableSession.windowTitle = [self.scope windowTitleOverrideFormat];
         [self storeWindowStateInRestorableSession:restorableSession];
         if (restorableSession.arrangement) {
             [[iTermController sharedInstance] pushCurrentRestorableSession:restorableSession];
@@ -3651,9 +3797,7 @@ ITERM_WEAKLY_REFERENCEABLE
     }
 
     [iTermQuickLookController dismissSharedPanel];
-    if (@available(macOS 10.14, *)) {
-        _shortcutAccessoryViewController.isMain = YES;
-    }
+    _shortcutAccessoryViewController.isMain = YES;
     if (!self.isHotKeyWindow) {
         [[iTermHotKeyController sharedInstance] nonHotKeyWindowDidBecomeKey];
     }
@@ -3696,6 +3840,7 @@ ITERM_WEAKLY_REFERENCEABLE
         [[aSession view] setBackgroundDimmed:NO];
         [aSession setFocused:aSession == [self currentSession]];
         [aSession.view setNeedsDisplay:YES];
+        [aSession useTransparencyDidChange];
     }
     // Some users report that the first responder isn't always set properly. Let's try to fix that.
     // This attempt (4/20/13) is to fix bug 2431.
@@ -3716,9 +3861,7 @@ ITERM_WEAKLY_REFERENCEABLE
     [self updateUseMetalInAllTabs];
     [_contentView updateDivisionViewAndWindowNumberLabel];
     [self.currentSession.view.findDriver owningViewDidBecomeFirstResponder];
-    if (@available(macOS 10.14, *)) {
-        [_contentView updateTitleAndBorderViews];
-    }
+    [_contentView updateTitleAndBorderViews];
     [[iTermSecureKeyboardEntryController sharedInstance] update];
 }
 
@@ -3849,15 +3992,22 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (NSRect)screenFrameForEdgeSpanningWindows:(NSScreen *)screen {
+    DLog(@"Begin");
     if ([[[iTermHotKeyController sharedInstance] profileHotKeyForWindowController:self] floats]) {
+        DLog(@"It floats");
         const BOOL menuBarIsHidden = ![[iTermMenuBarObserver sharedInstance] menuBarVisibleOnScreen:screen];
+        DLog(@"menuBarIsHidden=%@", @(menuBarIsHidden));
         if (menuBarIsHidden && ![screen it_hasAnotherAppsFullScreenWindow]) {
+            DLog(@"Using screen frame %@", NSStringFromRect(screen.frame));
             // When the menu bar is hidden because it hides automatically, we should go all the way to the top of the screen (issue 7149).
             // But if we are on another app's full-screen space, the system won't allow us to do that (issue 9978).
             return screen.frame;
         }
+        DLog(@"Using screen frame excluding menu bar %@", NSStringFromRect(screen.frameExceptMenuBar));
         return screen.frameExceptMenuBar;
     } else {
+        DLog(@"non-floating hotkey window uses visible frame ignoring hidden dock %@",
+             NSStringFromRect([screen visibleFrameIgnoringHiddenDock]));
         return [screen visibleFrameIgnoringHiddenDock];
     }
 }
@@ -3881,7 +4031,11 @@ ITERM_WEAKLY_REFERENCEABLE
     for (PseudoTerminal *term in [[iTermController sharedInstance] terminals]) {
         if (term.lionFullScreen && term.window.isOnActiveSpace) {
             if (term.window.screen == screen) {
-                return screen.frame;
+                // There's a Lion fullscreen window on this display. The window can go at the very
+                // top of the screen. If there's a notch, it must be below it. Either way, the
+                // usable frame equals that of my window. Note that screen.visibleFrame includes
+                // a 5-point margin that the top which is actually not visible! ❤️
+                return term.window.frame;
             } else {
                 otherScreenHasLionFullscreenTerminalWindow = YES;
             }
@@ -4099,6 +4253,7 @@ ITERM_WEAKLY_REFERENCEABLE
             [[aSession textview] endFindCursor];
         }
         [[aSession textview] removeUnderline];
+        [aSession useTransparencyDidChange];
         [aSession.view setNeedsDisplay:YES];
     }
 
@@ -4161,23 +4316,17 @@ ITERM_WEAKLY_REFERENCEABLE
 
     [self updateUseMetalInAllTabs];
     [_contentView updateDivisionViewAndWindowNumberLabel];
-    if (@available(macOS 10.14, *)) {
-        [_contentView updateTitleAndBorderViews];
-    }
+    [_contentView updateTitleAndBorderViews];
     [[iTermSecureKeyboardEntryController sharedInstance] update];
 }
 
 - (void)windowDidBecomeMain:(NSNotification *)notification {
-    if (@available(macOS 10.14, *)) {
-        _shortcutAccessoryViewController.isMain = YES;
-    }
+    _shortcutAccessoryViewController.isMain = YES;
     [_contentView updateDivisionViewAndWindowNumberLabel];
 }
 
 - (void)windowDidResignMain:(NSNotification *)aNotification {
-    if (@available(macOS 10.14, *)) {
-        _shortcutAccessoryViewController.isMain = NO;
-    }
+    _shortcutAccessoryViewController.isMain = NO;
     PtyLog(@"%s(%d):-[PseudoTerminal windowDidResignMain:%@]",
           __FILE__, __LINE__, aNotification);
     if (![iTermApplication sharedApplication].it_characterPanelIsOpen) {
@@ -4262,23 +4411,19 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (NSEdgeInsets)tabBarInsets {
-    if (@available(macOS 10.14, *)) {
-        iTermWindowType effectiveWindowType = self.windowType;
-        if (exitingLionFullscreen_) {
-            effectiveWindowType = self.savedWindowType;
-        }
-        if (!iTermWindowTypeIsCompact(effectiveWindowType)) {
+    iTermWindowType effectiveWindowType = self.windowType;
+    if (exitingLionFullscreen_) {
+        effectiveWindowType = self.savedWindowType;
+    }
+    if (!iTermWindowTypeIsCompact(effectiveWindowType)) {
+        return NSEdgeInsetsZero;
+    }
+    if (!exitingLionFullscreen_) {
+        if (self.anyFullScreen || togglingLionFullScreen_) {
             return NSEdgeInsetsZero;
         }
-        if (!exitingLionFullscreen_) {
-            if (self.anyFullScreen || togglingLionFullScreen_) {
-                return NSEdgeInsetsZero;
-            }
-        }
-        return [self tabBarInsetsForCompactWindow];
     }
-    // 10.13 and earlier - no compact mode so this is always 0.
-    return NSEdgeInsetsZero;
+    return [self tabBarInsetsForCompactWindow];
 }
 
 - (NSEdgeInsets)tabBarInsetsForCompactWindow NS_AVAILABLE_MAC(10_14) {
@@ -4320,6 +4465,10 @@ ITERM_WEAKLY_REFERENCEABLE
 
 - (BOOL)lionFullScreen {
     return lionFullScreen_;
+}
+
+- (void)ptyWindowMakeCurrentSessionFirstResponder {
+    [self.window makeFirstResponder:self.currentSession.textview];
 }
 
 - (BOOL)toggleFullScreenShouldUseLionFullScreen {
@@ -4571,7 +4720,14 @@ ITERM_WEAKLY_REFERENCEABLE
     } else {
         DLog(@"tmuxTabLayoutDidChange. Fit window to tabs");
         [self beginTmuxOriginatedResize];
-        [self fitWindowToTabs];
+        // Make the window the right size for the tmux tabs. This prevents the
+        // non-tmux tabs from causing a window resize, which could get us into
+        // a resize loop. See issue 10249.
+        [self fitWindowToTabsExcludingTmuxTabs:NO
+                              preservingHeight:NO
+                              sizeOfLargestTab:[self sizeOfLargestTabWithExclusion:PseudoTerminalTabSizeExclusionRegular]];
+        // Ensure the non-tmux tabs fit ok.
+        [self fitNonTmuxTabsToWindow];
         [self endTmuxOriginatedResize];
     }
 }
@@ -4776,7 +4932,11 @@ ITERM_WEAKLY_REFERENCEABLE
     const NSTimeInterval timeSinceLastResize =
         [NSDate timeIntervalSinceReferenceDate] - self.timeOfLastResize;
     static const NSTimeInterval kTimeToPreserveTemporaryTitle = 0.7;
-    return timeSinceLastResize < kTimeToPreserveTemporaryTitle;
+    return timeSinceLastResize < kTimeToPreserveTemporaryTitle && [self age] > 1;
+}
+
+- (NSTimeInterval)age {
+    return [NSDate it_timeSinceBoot] - _creationTime;
 }
 
 // This takes care of updating the metal state
@@ -4851,27 +5011,25 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (void)addShortcutAccessorViewControllerToTitleBarIfNeeded {
-    if (@available(macOS 10.14, *)) {
-        DLog(@"addShortcutAccessorViewControllerToTitleBarIfNeeded");
-        if (!_shortcutAccessoryViewController) {
-            DLog(@"Don't already have a shortcut accessory view controller");
-            return;
-        }
-        if (self.shouldHaveShortcutAccessory &&
-            [self.window.titlebarAccessoryViewControllers containsObject:_shortcutAccessoryViewController]) {
-            DLog(@"Have one and should have one");
-            return;
-        }
-        if ([self.window respondsToSelector:@selector(addTitlebarAccessoryViewController:)] &&
-            [self shouldHaveShortcutAccessory]) {
-            DLog(@"Need to add one");
-            // Explicitly load the view before adding. Otherwise, for some reason, on WINDOW_TYPE_MAXIMIZED windows,
-            // the NSWindow miscalculates the size, and ends up resizing the iTermRootTerminalView incorrectly.
-            [_shortcutAccessoryViewController view];
+    DLog(@"addShortcutAccessorViewControllerToTitleBarIfNeeded");
+    if (!_shortcutAccessoryViewController) {
+        DLog(@"Don't already have a shortcut accessory view controller");
+        return;
+    }
+    if (self.shouldHaveShortcutAccessory &&
+        [self.window.titlebarAccessoryViewControllers containsObject:_shortcutAccessoryViewController]) {
+        DLog(@"Have one and should have one");
+        return;
+    }
+    if ([self.window respondsToSelector:@selector(addTitlebarAccessoryViewController:)] &&
+        [self shouldHaveShortcutAccessory]) {
+        DLog(@"Need to add one");
+        // Explicitly load the view before adding. Otherwise, for some reason, on WINDOW_TYPE_MAXIMIZED windows,
+        // the NSWindow miscalculates the size, and ends up resizing the iTermRootTerminalView incorrectly.
+        [_shortcutAccessoryViewController view];
 
-            [self.window addTitlebarAccessoryViewController:_shortcutAccessoryViewController];
-            [self updateWindowNumberVisibility:nil];
-        }
+        [self.window addTitlebarAccessoryViewController:_shortcutAccessoryViewController];
+        [self updateWindowNumberVisibility:nil];
     }
 }
 
@@ -5002,7 +5160,7 @@ ITERM_WEAKLY_REFERENCEABLE
         [self repositionWidgets];
     }
     if (@available(macOS 10.16, *)) { }
-    else if (@available(macOS 10.14, *)) {
+    else {
         if ([iTermAdvancedSettingsModel disableWindowShadowWhenTransparencyOnMojave]) {
             [self updateWindowShadowForNonFullScreenWindowDisablingIfAnySessionHasTransparency:window];
             shouldEnableShadow = NO;
@@ -5013,7 +5171,7 @@ ITERM_WEAKLY_REFERENCEABLE
     } else {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        self.contentView.backgroundImage.hidden = NO;
+        self.contentView.backgroundImage.hidden = !iTermTextIsMonochrome() || (self.contentView.backgroundImage.image == nil);
         const CGFloat transparency = 1 - self.currentSession.textview.transparencyAlpha;
         self.contentView.backgroundImage.transparency = transparency;
         self.contentView.backgroundImage.blend = self.currentSession.desiredBlend;
@@ -5036,22 +5194,18 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (BOOL)tabBarShouldBeVisibleEvenWhenOnLoan {
-    if (@available(macOS 10.14, *)) {
-        if (togglingLionFullScreen_ || [self lionFullScreen]) {
-            return YES;
-        }
+    if (togglingLionFullScreen_ || [self lionFullScreen]) {
+        return YES;
     }
     return _contentView.tabBarShouldBeVisibleEvenWhenOnLoan;
 }
 
 - (BOOL)tabBarShouldBeVisible {
-    if (@available(macOS 10.14, *)) {
-        if (togglingLionFullScreen_ || [self lionFullScreen]) {
-            return YES;
-        }
-        if (_contentView.tabBarControlOnLoan) {
-            return NO;
-        }
+    if (togglingLionFullScreen_ || [self lionFullScreen]) {
+        return YES;
+    }
+    if (_contentView.tabBarControlOnLoan) {
+        return NO;
     }
     return _contentView.tabBarShouldBeVisible;
 }
@@ -5131,10 +5285,8 @@ ITERM_WEAKLY_REFERENCEABLE
 
         }
     }
-    if (@available(macOS 10.14, *)) {
-        if (![self windowTitleIsVisible] && !self.anyFullScreen) {
-            [_contentView setShowsWindowSize:YES];
-        }
+    if (![self windowTitleIsVisible] && !self.anyFullScreen) {
+        [_contentView setShowsWindowSize:YES];
     }
     [self updateUseMetalInAllTabs];
 }
@@ -5289,10 +5441,6 @@ ITERM_WEAKLY_REFERENCEABLE
 
 - (BOOL)tabBarShouldBeAccessory {
     DLog(@"%@", self);
-    if (@available(macOS 10.14, *)) { } else {
-        DLog(@"NO - os too old");
-        return NO;
-    }
     if (!(self.window.styleMask & NSWindowStyleMaskTitled)) {
         // You get an assertion if you try to add an accessory to an untitled window.
         DLog(@"NO - window not titled");
@@ -5377,7 +5525,7 @@ ITERM_WEAKLY_REFERENCEABLE
         NSTitlebarAccessoryViewController *viewController = [self titleBarAccessoryTabBarViewController];
         const CGFloat tabBarHeight = self.shouldShowPermanentFullScreenTabBar ? self.desiredTabBarHeight : 0;
         viewController.fullScreenMinHeight = tabBarHeight;
-        NSLog(@"Set tabbar's fullScreenMinHeight to %@", @(tabBarHeight));
+        DLog(@"Set tabbar's fullScreenMinHeight to %@", @(tabBarHeight));
 
         frame.size.height = self.desiredTabBarHeight;
         DLog(@"Set frame of tabbar as accessory to %@", NSStringFromRect(frame));
@@ -5569,22 +5717,35 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (BOOL)sessionInitiatedResize:(PTYSession *)session width:(int)width height:(int)height {
-    PtyLog(@"sessionInitiatedResize");
-    // ignore resize request when we are in full screen mode.
-    if ([self anyFullScreen]) {
-        PtyLog(@"sessionInitiatedResize - in full screen mode");
-        return NO;
-    }
+    __block BOOL result;
+    [session resetMode];
+    [session.screen performBlockWithJoinedThreads:^(VT100Terminal *terminal, VT100ScreenMutableState *mutableState, id<VT100ScreenDelegate> delegate) {
+        PtyLog(@"sessionInitiatedResize");
+        // ignore resize request when we are in full screen mode.
+        if ([self anyFullScreen]) {
+            PtyLog(@"sessionInitiatedResize - in full screen mode");
+            result = NO;
+            return;
+        }
 
-    PTYTab *tab = [self tabForSession:session];
-    [tab setLockedSession:session];
-    [self safelySetSessionSize:session rows:height columns:width];
-    PtyLog(@"sessionInitiatedResize - calling fitWindowToTab");
-    [self fitWindowToTab:tab];
-    PtyLog(@"sessionInitiatedResize - calling fitTabsToWindow");
-    [self fitTabsToWindow];
-    [tab setLockedSession:nil];
-    return YES;
+        // Defer sending TIOCSWINSZ until things have settled. The call to -safelySetSessionSize:rows:columns: may provide a size that's too big for the display.
+        // It's only after fitWindowToTab that the final size is known.
+        NSArray<PTYSession *> *sessions = [self allSessions];
+        [iTermWinSizeController batchDeferChanges:[sessions mapWithBlock:^id _Nullable(PTYSession * _Nonnull session) {
+            return session.shell.winSizeController;
+        }] closure:^{
+            PTYTab *tab = [self tabForSession:session];
+            [tab setLockedSession:session];
+            [self safelySetSessionSize:session rows:height columns:width];
+            PtyLog(@"sessionInitiatedResize - calling fitWindowToTab");
+            [self fitWindowToTab:tab];
+            PtyLog(@"sessionInitiatedResize - calling fitTabsToWindow");
+            [self fitTabsToWindow];
+            [tab setLockedSession:nil];
+        }];
+        result = YES;
+    }];
+    return result;
 }
 
 // Contextual menu
@@ -5684,6 +5845,7 @@ ITERM_WEAKLY_REFERENCEABLE
     NSMenu *aMenu = [[[NSMenu alloc] init] autorelease];
 
     [[iTermController sharedInstance] addBookmarksToMenu:aMenu
+                                               supermenu:theMenu
                                             withSelector:@selector(newSessionInWindowAtIndex:)
                                          openAllSelector:@selector(newSessionsInNewWindow:)
                                               startingAt:0];
@@ -5692,6 +5854,7 @@ ITERM_WEAKLY_REFERENCEABLE
 
     aMenu = [[[NSMenu alloc] init] autorelease];
     [[iTermController sharedInstance] addBookmarksToMenu:aMenu
+                                               supermenu:theMenu
                                             withSelector:@selector(newSessionInTabAtIndex:)
                                          openAllSelector:@selector(newSessionsInWindow:)
                                               startingAt:0];
@@ -5715,6 +5878,7 @@ ITERM_WEAKLY_REFERENCEABLE
     // If the user is currently select-dragging the text view, stop it so it
     // doesn't keep going in the background.
     [[[self currentSession] textview] aboutToHide];
+    [self.currentTab willDeselectTab];
 
     if ([[autocompleteView window] isVisible]) {
         [autocompleteView close];
@@ -5768,6 +5932,7 @@ ITERM_WEAKLY_REFERENCEABLE
         [self setDimmingForSession:aSession];
         [[aSession view] setBackgroundDimmed:![[self window] isKeyWindow]];
         [[aSession view] didBecomeVisible];
+        [aSession.textview updateScrollerForBackgroundColor];
     }
 
     for (PTYSession *session in [self allSessions]) {
@@ -5810,7 +5975,7 @@ ITERM_WEAKLY_REFERENCEABLE
     NSInteger darkCount = 0;
     NSInteger lightCount = 0;
     for (PTYSession *session in tab.sessions) {
-        if ([[session.colorMap colorForKey:kColorMapBackground] perceivedBrightness] < 0.5) {
+        if ([[session.screen.colorMap colorForKey:kColorMapBackground] perceivedBrightness] < 0.5) {
             darkCount++;
         } else {
             lightCount++;
@@ -5834,6 +5999,7 @@ ITERM_WEAKLY_REFERENCEABLE
     [[iTermFindPasteboard sharedInstance] updateObservers:nil];
     [self updateBackgroundImage];
     [_contentView setCurrentSessionAlpha:self.currentSession.textview.transparencyAlpha];
+    [tab didSelectTab];
     [[NSNotificationCenter defaultCenter] postNotificationName:iTermSelectedTabDidChange object:tab];
     DLog(@"Finished");
 }
@@ -6282,10 +6448,8 @@ ITERM_WEAKLY_REFERENCEABLE
                 [self fitTabsToWindow];
             }
         }
-        if (@available(macOS 10.14, *)) {
-            // May need to enter or exit being a titlebar accessory if its visibility changed.
-            [self updateTabBarControlIsTitlebarAccessory];
-        }
+        // May need to enter or exit being a titlebar accessory if its visibility changed.
+        [self updateTabBarControlIsTitlebarAccessory];
 
         [self repositionWidgets];
         if (wasDraggedFromAnotherWindow_) {
@@ -6336,11 +6500,9 @@ ITERM_WEAKLY_REFERENCEABLE
 
     [[NSNotificationCenter defaultCenter] postNotificationName: @"iTermNumberOfSessionsDidChange" object: self userInfo: nil];
     [self invalidateRestorableState];
-    if (@available(macOS 10.14, *)) {
-        if ([iTermPreferences boolForKey:kPreferenceKeyHideTabBar] && (self.lionFullScreen || togglingLionFullScreen_)) {
-            // Hiding tabbar in fullscreen on 10.14 is extra work because it's a titlebar accessory.
-            [self updateTabBarStyle];
-        }
+    if ([iTermPreferences boolForKey:kPreferenceKeyHideTabBar] && (self.lionFullScreen || togglingLionFullScreen_)) {
+        // Hiding tabbar in fullscreen on 10.14 is extra work because it's a titlebar accessory.
+        [self updateTabBarStyle];
     }
 }
 
@@ -6671,12 +6833,14 @@ ITERM_WEAKLY_REFERENCEABLE
 - (void)openEditTabTitleWindow {
     NSAlert *alert = [[[NSAlert alloc] init] autorelease];
     alert.messageText = @"Set Tab Title";
-    alert.informativeText = @"If this is empty, the tab takes the active session’s title. Variables and function calls enclosed in \\(…) will be replaced with their evaluation.";
+    alert.informativeText = @"If this is empty, the tab takes the active session’s title. Variables and function calls enclosed in \\(…) will be replaced with their evaluation. This interpolated string is evaluated in the tab’s context.";
     NSTextField *titleTextField = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24 * 3)] autorelease];
     _currentTabTitleTextFieldDelegate = [[iTermFunctionCallTextFieldDelegate alloc] initWithPathSource:[iTermVariableHistory pathSourceForContext:iTermVariablesSuggestionContextTab]
                                                                                            passthrough:nil
                                                                                          functionsOnly:NO];
     titleTextField.delegate = _currentTabTitleTextFieldDelegate;
+    _currentTabTitleTextFieldDelegate.canWarnAboutContextMistake = YES;
+    _currentTabTitleTextFieldDelegate.contextMistakeText = @"This interpolated string is evaluated in the tab’s context, not the session’s context. To access variables in the current session, use currentSession.sessionVariableNameHere";
     titleTextField.editable = YES;
     titleTextField.selectable = YES;
     titleTextField.stringValue = self.currentTab.variablesScope.tabTitleOverrideFormat ?: @"";
@@ -6741,17 +6905,11 @@ ITERM_WEAKLY_REFERENCEABLE
             }
         }
     }
-    if (@available(macOS 10.14, *)) {
-        [_contentView updateTitleAndBorderViews];
-    }
+    [_contentView updateTitleAndBorderViews];
 }
 
 - (void)setBackgroundColor:(nullable NSColor *)backgroundColor {
-    if (@available(macOS 10.14, *)) {
-        [self setMojaveBackgroundColor:backgroundColor];
-    } else {
-        [self setLegacyBackgroundColor:backgroundColor];
-    }
+    [self setMojaveBackgroundColor:backgroundColor];
     [[NSNotificationCenter defaultCenter] postNotificationName:iTermWindowAppearanceDidChange object:self.window];
 }
 
@@ -6809,10 +6967,6 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 - (BOOL)titleBarShouldAppearTransparent {
-    if (@available(macOS 10.14, *)) { } else {
-        return [PseudoTerminal titleBarShouldAppearTransparentForWindowType:self.windowType];
-    }
-
     switch (self.windowType) {
         case WINDOW_TYPE_LION_FULL_SCREEN:
             return [PseudoTerminal titleBarShouldAppearTransparentForWindowType:self.savedWindowType];
@@ -6838,105 +6992,30 @@ ITERM_WEAKLY_REFERENCEABLE
 }
 
 + (BOOL)titleBarShouldAppearTransparentForWindowType:(iTermWindowType)windowType {
-    if (@available(macOS 10.14, *)) {
-        switch (iTermThemedWindowType(windowType)) {
-            case WINDOW_TYPE_NORMAL:
-            case WINDOW_TYPE_MAXIMIZED:
-            case WINDOW_TYPE_ACCESSORY:
-            case WINDOW_TYPE_LION_FULL_SCREEN:
-            case WINDOW_TYPE_TRADITIONAL_FULL_SCREEN:
-                break;
+    switch (iTermThemedWindowType(windowType)) {
+        case WINDOW_TYPE_NORMAL:
+        case WINDOW_TYPE_MAXIMIZED:
+        case WINDOW_TYPE_ACCESSORY:
+        case WINDOW_TYPE_LION_FULL_SCREEN:
+        case WINDOW_TYPE_TRADITIONAL_FULL_SCREEN:
+            break;
 
-            case WINDOW_TYPE_TOP_PARTIAL:
-            case WINDOW_TYPE_LEFT_PARTIAL:
-            case WINDOW_TYPE_RIGHT_PARTIAL:
-            case WINDOW_TYPE_BOTTOM_PARTIAL:
-            case WINDOW_TYPE_TOP:
-            case WINDOW_TYPE_LEFT:
-            case WINDOW_TYPE_RIGHT:
-            case WINDOW_TYPE_BOTTOM:
-            case WINDOW_TYPE_NO_TITLE_BAR:
-            case WINDOW_TYPE_COMPACT:
-            case WINDOW_TYPE_COMPACT_MAXIMIZED:
-                return YES;
-        }
-        return NO;
-    } else {
-        switch (iTermThemedWindowType(windowType)) {
-            case WINDOW_TYPE_TOP:
-            case WINDOW_TYPE_LEFT:
-            case WINDOW_TYPE_RIGHT:
-            case WINDOW_TYPE_BOTTOM:
-            case WINDOW_TYPE_NORMAL:
-            case WINDOW_TYPE_MAXIMIZED:
-            case WINDOW_TYPE_ACCESSORY:
-            case WINDOW_TYPE_TOP_PARTIAL:
-            case WINDOW_TYPE_LEFT_PARTIAL:
-            case WINDOW_TYPE_RIGHT_PARTIAL:
-            case WINDOW_TYPE_BOTTOM_PARTIAL:
-            case WINDOW_TYPE_LION_FULL_SCREEN:
-            case WINDOW_TYPE_TRADITIONAL_FULL_SCREEN:
-                break;
-
-            case WINDOW_TYPE_NO_TITLE_BAR:
-            case WINDOW_TYPE_COMPACT:
-            case WINDOW_TYPE_COMPACT_MAXIMIZED:
-                return YES;
-        }
-        return NO;
+        case WINDOW_TYPE_TOP_PARTIAL:
+        case WINDOW_TYPE_LEFT_PARTIAL:
+        case WINDOW_TYPE_RIGHT_PARTIAL:
+        case WINDOW_TYPE_BOTTOM_PARTIAL:
+        case WINDOW_TYPE_TOP:
+        case WINDOW_TYPE_LEFT:
+        case WINDOW_TYPE_RIGHT:
+        case WINDOW_TYPE_BOTTOM:
+        case WINDOW_TYPE_NO_TITLE_BAR:
+        case WINDOW_TYPE_COMPACT:
+        case WINDOW_TYPE_COMPACT_MAXIMIZED:
+            return YES;
     }
+    return NO;
 }
 
-- (void)setLegacyBackgroundColor:(nullable NSColor *)backgroundColor {
-    BOOL darkAppearance = NO;
-    if (@available(macOS 10.13, *)) {
-        switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
-            case TAB_STYLE_LIGHT:
-            case TAB_STYLE_LIGHT_HIGH_CONTRAST:  // fall through
-                darkAppearance = NO;
-                break;
-
-            case TAB_STYLE_DARK:
-            case TAB_STYLE_DARK_HIGH_CONTRAST:  // fall through
-                darkAppearance = YES;
-                break;
-
-            case TAB_STYLE_COMPACT:
-            case TAB_STYLE_MINIMAL:
-            case TAB_STYLE_AUTOMATIC:
-                break;
-        }
-    } else {  // 10.12 branch
-        // Preserve 10.12 behavior. It can change the window title bar color so the appearance
-        // is important to keep the title legible. This adds the weird behavior of making the
-        // toolbar look buggy when there's a single tab with no visible tabbar and a dark tab
-        // color. It's likely 10.12 support will be dropped before I have time to fix this, alas.
-        if (backgroundColor == nil && [iTermAdvancedSettingsModel darkThemeHasBlackTitlebar]) {
-            switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
-                case TAB_STYLE_LIGHT:
-                case TAB_STYLE_LIGHT_HIGH_CONTRAST:
-                case TAB_STYLE_COMPACT:
-                case TAB_STYLE_MINIMAL:
-                case TAB_STYLE_AUTOMATIC:
-                    break;
-
-                case TAB_STYLE_DARK:  // fall through
-                case TAB_STYLE_DARK_HIGH_CONTRAST:
-                    // the key/active status is ignored on 10.12
-                    backgroundColor = [PSMDarkTabStyle tabBarColorWhenMainAndActive:NO];
-                    break;
-            }
-        }
-        darkAppearance = (backgroundColor != nil && backgroundColor.perceivedBrightness < 0.5);
-    }
-    [self.window setBackgroundColor:backgroundColor];
-    if (darkAppearance) {
-        self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantDark];
-    } else {
-        self.window.appearance = nil;
-    }
-    [_contentView.toolbelt windowBackgroundColorDidChange];
-}
 
 - (void)tabsDidReorder {
     TmuxController *controller = nil;
@@ -7092,6 +7171,12 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         return @([iTermPreferences boolForKey:kPreferenceKeyHTMLTabTitles]);
     } else if ([option isEqualToString:PSMTabBarControlOptionMinimalNonSelectedColoredTabAlpha]) {
         return @([iTermAdvancedSettingsModel minimalDeslectedColoredTabAlpha]);
+    } else if ([option isEqualToString:PSMTabBarControlOptionTextColor]) {
+        return [self.currentSession.textview.colorMap colorForKey:kColorMapForeground];
+    } else if ([option isEqualToString:PSMTabBarControlOptionLightModeInactiveTabDarkness]) {
+        return @([iTermAdvancedSettingsModel lightModeInactiveTabDarkness]);
+    } else if ([option isEqualToString:PSMTabBarControlOptionDarkModeInactiveTabDarkness]) {
+        return @([iTermAdvancedSettingsModel darkModeInactiveTabDarkness]);
     }
     return nil;
 }
@@ -7130,7 +7215,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
 
     // Consider automatic conversion.
-    if (![self themeSupportsAlternateDragModes]) {
+    if (![self themeSupportsAlternateDragModes] && _windowType != WINDOW_TYPE_NO_TITLE_BAR) {
         // Never convert to window drag in traditional themes.
         return NO;
     }
@@ -7253,6 +7338,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 - (void)tabDidClearScrollbackBufferInSession:(PTYSession *)session {
     [[_contentView.toolbelt capturedOutputView] removeSelection];
     [[_contentView.toolbelt commandHistoryView] removeSelection];
+    [self refreshTools];
+}
+
+- (void)tab:(PTYTab *)tab sessionDidRestart:(PTYSession *)session {
     [self refreshTools];
 }
 
@@ -7429,17 +7518,19 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     // set our preferences
     newSession.profile = profile;
 
-    [[newSession screen] setMaxScrollbackLines:0];
     [self setupSession:newSession withSize:nil];
+    [newSession setSize:oldSession.screen.size];
     [[newSession view] setViewId:[[oldSession view] viewId]];
     [[newSession view] setShowTitle:[[oldSession view] showTitle] adjustScrollView:YES];
     [[newSession view] setShowBottomStatusBar:oldSession.view.showBottomStatusBar adjustScrollView:YES];
     [[newSession view] updateFindDriver];
+    [newSession setSessionSpecificProfileValues:@{ KEY_SCROLLBACK_LINES: @0 }];
 
     // Add this session to our term and make it current
     PTYTab *theTab = [tabViewItem identifier];
     newSession.delegate = theTab;
 
+    DLog(@"Live session: %@, synthetic session: %@", oldSession, newSession);
     return newSession;
 }
 
@@ -7457,14 +7548,33 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
 }
 
-- (IBAction)captureNextMetalFrame:(id)sender {
-    if (@available(macOS 10.11, *)) {
-        self.currentSession.overrideGlobalDisableMetalWhenIdleSetting = YES;
-        [self.currentTab updateUseMetal];
-        self.currentSession.view.driver.captureDebugInfoForNextFrame = YES;
-        self.currentSession.overrideGlobalDisableMetalWhenIdleSetting = NO;
-        [self.currentSession.view setNeedsDisplay:YES];
+- (void)turnOnMetalCaptureInInfoPlist {
+    const iTermWarningSelection selection =
+    [iTermWarning showWarningWithTitle:@"You must restart iTerm2 to turn on this feature."
+                               actions:@[ @"Restart Now", @"Cancel"]
+                            identifier:@"RestartAfterMetalCaptureEnabled"
+                           silenceable:kiTermWarningTypePersistent
+                                window:self.window];
+    if (selection == kiTermWarningSelection0) {
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MetalCaptureEnabled"];
+        [[NSUserDefaults standardUserDefaults] setDouble:[NSDate timeIntervalSinceReferenceDate] + 24 * 60 * 60
+                                                  forKey:@"MetalCaptureEnabledDate"];
+        [NSApp relaunch];
     }
+}
+
+- (IBAction)captureNextMetalFrame:(id)sender {
+    NSDictionary *infoPlist = [[NSBundle mainBundle] infoDictionary];
+    NSNumber *metalCaptureEnabled = infoPlist[@"MetalCaptureEnabled"];
+    if (!metalCaptureEnabled.boolValue && ![[NSUserDefaults standardUserDefaults] boolForKey:@"MetalCaptureEnabled"]) {
+        [self turnOnMetalCaptureInInfoPlist];
+        return;
+    }
+    self.currentSession.overrideGlobalDisableMetalWhenIdleSetting = YES;
+    [self.currentTab updateUseMetal];
+    self.currentSession.view.driver.captureDebugInfoForNextFrame = YES;
+    self.currentSession.overrideGlobalDisableMetalWhenIdleSetting = NO;
+    [self.currentSession.view setNeedsDisplay:YES];
 }
 
 - (IBAction)zoomOut:(id)sender {
@@ -7503,7 +7613,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 - (void)showRangeOfLines:(NSRange)rangeOfLines inSession:(PTYSession *)oldSession {
     PTYSessionZoomState *state = oldSession.stateToSaveForZoom;
     PTYSession *syntheticSession = [self syntheticSessionForSession:oldSession];
-    [syntheticSession.screen terminalSetCursorVisible:NO];
+    [oldSession resetMode];
+    [syntheticSession.screen performBlockWithJoinedThreads:^(VT100Terminal *terminal, VT100ScreenMutableState *mutableState, id<VT100ScreenDelegate> delegate) {
+        mutableState.cursorVisible = NO;
+    }];
     [syntheticSession appendLinesInRange:rangeOfLines fromSession:oldSession];
     [[self tabForSession:oldSession] replaceActiveSessionWithSyntheticSession:syntheticSession];
     syntheticSession.savedStateForZoom = state;
@@ -7675,18 +7788,31 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 - (IBAction)openCommandHistory:(id)sender {
+    if (![[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed]) {
+        [iTermShellHistoryController showInformationalMessage];
+        return;
+    }
+    [self openCommandHistoryWithPrefix:[[self currentSession] currentCommand] sortChronologically:NO];
+}
+
+- (void)openCommandHistoryWithPrefix:(NSString *)prefix sortChronologically:(BOOL)sortChronologically {
     if (!commandHistoryPopup) {
         commandHistoryPopup = [[CommandHistoryPopupWindowController alloc] initForAutoComplete:NO];
     }
-    if ([[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed]) {
-        [self openPopupWindow:commandHistoryPopup];
-        [commandHistoryPopup loadCommands:[commandHistoryPopup commandsForHost:[[self currentSession] currentHost]
-                                                                partialCommand:[[self currentSession] currentCommand]
-                                                                        expand:YES]
-                           partialCommand:[[self currentSession] currentCommand]];
-    } else {
-        [iTermShellHistoryController showInformationalMessage];
-    }
+    [self openPopupWindow:commandHistoryPopup];
+    [commandHistoryPopup loadCommands:[commandHistoryPopup commandsForHost:[[self currentSession] currentHost]
+                                                            partialCommand:prefix
+                                                                    expand:YES]
+                       partialCommand:prefix
+                  sortChronologically:sortChronologically];
+}
+
+- (BOOL)commandHistoryIsOpenForSession:(PTYSession *)session {
+    return self.currentSession == session && [[commandHistoryPopup window] isVisible];
+}
+
+- (void)closeCommandHistory {
+    [commandHistoryPopup close];
 }
 
 - (IBAction)openDirectories:(id)sender {
@@ -7764,7 +7890,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         }
         DLog(@"ACH load commands");
         [commandHistoryPopup loadCommands:commands
-                           partialCommand:prefix];
+                           partialCommand:prefix
+                      sortChronologically:NO];
     }
     if (_autocompleteCandidateListItem && session == self.currentSession) {
         iTermShellHistoryController *history = [iTermShellHistoryController sharedInstance];
@@ -7816,8 +7943,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         autocompleteView = [[AutocompleteView alloc] init];
     }
     if ([[autocompleteView window] isVisible]) {
+        DLog(@"more");
         [autocompleteView more];
     } else {
+        DLog(@"Will open popup");
         [self openPopupWindow:autocompleteView];
         NSString *currentCommand = [[self currentSession] currentCommand];
         [autocompleteView addCommandEntries:[[self currentSession] autocompleteSuggestionsForCurrentCommand]
@@ -7828,6 +7957,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 - (BOOL)canSplitPaneVertically:(BOOL)isVertical withBookmark:(Profile *)theBookmark {
     if ([self inInstantReplay]) {
         // Things get very complicated in this case. Just disallow it.
+        DLog(@"In instant replay");
         return NO;
     }
     NSFont* asciiFont = [ITAddressBookMgr fontWithDesc:[theBookmark objectForKey:KEY_NORMAL_FONT]];
@@ -8011,17 +8141,19 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
           addingSession:(PTYSession *)newSession
           targetSession:(PTYSession *)targetSession
            performSetup:(BOOL)performSetup {
+    DLog(@"splitVertically:%@ before:%@ addingSession:%@ targetSession:%@ performSetup:%@ self=%@",
+         @(isVertical), @(before), newSession, targetSession, @(performSetup), self);
     [self.currentSession.textview refuseFirstResponderAtCurrentMouseLocation];
     NSView *scrollView;
     NSColor *tabColor;
+    PTYTab *tab = [self tabForSession:targetSession] ?: [self currentTab];
     if (newSession.tabColor) {
         // The new session came with a tab color of its own so don't inherit.
         tabColor = newSession.tabColor;
     } else {
         // Inherit from tab.
-        tabColor = [[[_contentView.tabBarControl tabColorForTabViewItem:[[self currentTab] tabViewItem]] retain] autorelease];
+        tabColor = [[[_contentView.tabBarControl tabColorForTabViewItem:[tab tabViewItem]] retain] autorelease];
     }
-    PTYTab *tab = [self tabForSession:targetSession] ?: [self currentTab];
     [tab splitVertically:isVertical
               newSession:newSession
                   before:before
@@ -8051,8 +8183,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
             [[self currentTab] setActiveSession:newSession];
         }
     }
-    [[self currentTab] recheckBlur];
-    [[self currentTab] numberOfSessionsDidChange];
+    [tab recheckBlur];
+    [tab numberOfSessionsDidChange];
     [self setDimmingForSessions];
     for (PTYSession *session in self.currentTab.sessions) {
         [session.view updateDim];
@@ -8141,8 +8273,11 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
     PTYSession *currentSession = [self currentSession];
     if (currentSession) {
-        [currentSession asyncCurrentLocalWorkingDirectoryOrInitialDirectory:^(NSString *oldCWD) {
+        [currentSession asyncInitialDirectoryForNewSessionBasedOnCurrentDirectory:^(NSString *oldCWD) {
             DLog(@"Get local pwd so I can split: %@", oldCWD);
+            if (theBookmark.sshIdentity != nil && ![currentSession.sshIdentity isEqualTo:theBookmark.sshIdentity]) {
+                oldCWD = nil;
+            }
             PTYSession *session = [self splitVertically:isVertical
                                                  before:before
                                                 profile:theBookmark
@@ -8274,6 +8409,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         [self hideAutoCommandHistory];
     }
     [[_contentView.toolbelt commandHistoryView] updateCommands];
+    [[_contentView.toolbelt jobsView] updateJobs];
     [[NSNotificationCenter defaultCenter] postNotificationName:kCurrentSessionDidChange object:nil];
     if ([[PreferencePanel sessionsInstance] isWindowLoaded] && ![iTermAdvancedSettingsModel pinEditSession]) {
         [self editSession:self.currentSession makeKey:NO];
@@ -8306,15 +8442,32 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     [self fitWindowToTabsExcludingTmuxTabs:excludeTmux preservingHeight:NO];
 }
 
-- (NSSize)sizeOfLargestTabExcludingTmux:(BOOL)excludeTmux {
+typedef NS_ENUM(NSUInteger, PseudoTerminalTabSizeExclusion) {
+    PseudoTerminalTabSizeExclusionNone,
+    PseudoTerminalTabSizeExclusionTmux,
+    PseudoTerminalTabSizeExclusionRegular  // exclude non-tmux
+};
+
+- (NSSize)sizeOfLargestTabWithExclusion:(PseudoTerminalTabSizeExclusion)exclusion {
     // Determine the size of the largest tab.
     NSSize maxTabSize = NSZeroSize;
     PtyLog(@"fitWindowToTabs.......");
     DLog(@"Finding the biggest tab:");
     for (NSTabViewItem* item in [_contentView.tabView tabViewItems]) {
         PTYTab* tab = [item identifier];
-        if ([tab isTmuxTab] && excludeTmux) {
-            continue;
+        switch (exclusion) {
+            case PseudoTerminalTabSizeExclusionTmux:
+                if (tab.isTmuxTab) {
+                    continue;
+                }
+                break;
+            case PseudoTerminalTabSizeExclusionNone:
+                break;
+            case PseudoTerminalTabSizeExclusionRegular:
+                if (!tab.isTmuxTab) {
+                    continue;
+                }
+                break;
         }
         NSSize tabSize = [tab currentSize];
         PtyLog(@"The natural size of this tab is %@", NSStringFromSize(tabSize));
@@ -8341,14 +8494,14 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 - (void)fitWindowToTabsExcludingTmuxTabs:(BOOL)excludeTmux preservingHeight:(BOOL)preserveHeight {
     [self fitWindowToTabsExcludingTmuxTabs:excludeTmux
                           preservingHeight:preserveHeight
-                          sizeOfLargestTab:[self sizeOfLargestTabExcludingTmux:excludeTmux]];
+                          sizeOfLargestTab:[self sizeOfLargestTabWithExclusion:excludeTmux ? PseudoTerminalTabSizeExclusionTmux : PseudoTerminalTabSizeExclusionNone]];
 }
 
 - (void)fitWindowToTabsExcludingTmuxTabs:(BOOL)excludeTmux
                         preservingHeight:(BOOL)preserveHeight
                         sizeOfLargestTab:(NSSize)maxTabSize {
-    DLog(@"fitWindowToTabsExcludingTmuxTabs:%@ preservingHeight:%@ sizeOfLargestTab:%@",
-         @(excludeTmux), @(preserveHeight), NSStringFromSize(maxTabSize));
+    DLog(@"fitWindowToTabsExcludingTmuxTabs:%@ preservingHeight:%@ sizeOfLargestTab:%@ from\n%@",
+         @(excludeTmux), @(preserveHeight), NSStringFromSize(maxTabSize), [NSThread callStackSymbols]);
 
     _windowNeedsInitialSize = NO;
     if (togglingFullScreen_) {
@@ -8440,10 +8593,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     // the window to certain heights. It was related to this bugfix view,
     // somehow. Better not to have it and live with screwed up title colors.
     BOOL workAroundBugFix = YES;
-    if (@available(macOS 10.14, *)) {
-        if (_shortcutAccessoryViewController) {
-            workAroundBugFix = NO;
-        }
+    if (_shortcutAccessoryViewController) {
+        workAroundBugFix = NO;
     }
     if (workAroundBugFix) {
         // Ok, so some silly things are happening here. Issue 2096 reported that
@@ -8570,32 +8721,28 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
                                       horizontally:NO];
 }
 
-- (void)swapPaneLeft
-{
+- (void)swapPaneLeft {
     PTYSession* session = [[self currentTab] sessionLeftOf:[[self currentTab] activeSession]];
     if (session) {
         [[self currentTab] swapSession:[[self currentTab] activeSession] withSession:session];
     }
 }
 
-- (void)swapPaneRight
-{
+- (void)swapPaneRight {
     PTYSession* session = [[self currentTab] sessionRightOf:[[self currentTab] activeSession]];
     if (session) {
         [[self currentTab] swapSession:[[self currentTab] activeSession] withSession:session];
     }
 }
 
-- (void)swapPaneUp
-{
+- (void)swapPaneUp {
     PTYSession* session = [[self currentTab] sessionAbove:[[self currentTab] activeSession]];
     if (session) {
         [[self currentTab] swapSession:[[self currentTab] activeSession] withSession:session];
     }
 }
 
-- (void)swapPaneDown
-{
+- (void)swapPaneDown {
     PTYSession* session = [[self currentTab] sessionBelow:[[self currentTab] activeSession]];
     if (session) {
         [[self currentTab] swapSession:[[self currentTab] activeSession] withSession:session];
@@ -8774,27 +8921,44 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 - (IBAction)increaseHeight:(id)sender {
-    [self sessionInitiatedResize:self.currentSession
-                           width:self.currentSession.columns
-                          height:self.currentSession.rows+1];
+    [self increaseHeightOfSession:self.currentSession];
 }
 
 - (IBAction)decreaseHeight:(id)sender {
-    [self sessionInitiatedResize:self.currentSession
-                           width:self.currentSession.columns
-                          height:self.currentSession.rows-1];
+    [self decreaseHeightOfSession:self.currentSession];
 }
 
 - (IBAction)increaseWidth:(id)sender {
-    [self sessionInitiatedResize:self.currentSession
-                           width:self.currentSession.columns+1
-                          height:self.currentSession.rows];
+    [self increaseWidthOfSession:self.currentSession];
 }
 
 - (IBAction)decreaseWidth:(id)sender {
-    [self sessionInitiatedResize:self.currentSession
-                           width:self.currentSession.columns-1
-                          height:self.currentSession.rows];
+    [self decreaseWidthOfSession:self.currentSession];
+}
+
+
+- (IBAction)increaseHeightOfSession:(PTYSession *)session {
+    [self sessionInitiatedResize:session
+                           width:session.columns
+                          height:session.rows+1];
+}
+
+- (IBAction)decreaseHeightOfSession:(PTYSession *)session {
+    [self sessionInitiatedResize:session
+                           width:session.columns
+                          height:session.rows-1];
+}
+
+- (IBAction)increaseWidthOfSession:(PTYSession *)session {
+    [self sessionInitiatedResize:session
+                           width:session.columns+1
+                          height:session.rows];
+}
+
+- (IBAction)decreaseWidthOfSession:(PTYSession *)session {
+    [self sessionInitiatedResize:session
+                           width:session.columns-1
+                          height:session.rows];
 
 }
 
@@ -8860,16 +9024,27 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 
 - (void)updateWindowNumberVisibility:(NSNotification *)aNotification {
     // This is if displaying of window number was toggled in prefs.
-    if (@available(macOS 10.14, *)) {
-        if (_shortcutAccessoryViewController) {
-            _shortcutAccessoryViewController.view.hidden = ![iTermPreferences boolForKey:kPreferenceKeyShowWindowNumber];
-        } else {
-            [self setWindowTitle];
-        }
+    if (_shortcutAccessoryViewController) {
+        _shortcutAccessoryViewController.view.hidden = ![iTermPreferences boolForKey:kPreferenceKeyShowWindowNumber];
     } else {
         [self setWindowTitle];
-        [_contentView layoutSubviews];
     }
+}
+
+static BOOL iTermApproximatelyEqualRects(NSRect lhs, NSRect rhs, double epsilon) {
+    if (fabs(NSMinX(lhs) - NSMinX(rhs)) > epsilon) {
+        return NO;
+    }
+    if (fabs(NSMaxX(lhs) - NSMaxX(rhs)) > epsilon) {
+        return NO;
+    }
+    if (fabs(NSMinY(lhs) - NSMinY(rhs)) > epsilon) {
+        return NO;
+    }
+    if (fabs(NSMaxY(lhs) - NSMaxY(rhs)) > epsilon) {
+        return NO;
+    }
+    return YES;
 }
 
 - (void)scrollerStyleDidChange:(NSNotification *)notification {
@@ -8887,7 +9062,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         DLog(@"screen visibleFrame is %@, window frame is %@",
              NSStringFromRect(self.window.screen.visibleFrame),
              NSStringFromRect(self.window.frame));
-        if (!NSEqualRects(self.window.screen.visibleFrame, self.window.frame)) {
+        if (fabs(NSMaxX(self.window.screen.visibleFrame) - NSMaxX(self.window.frame)) > 0.5) {
             DLog(@"Fit window to idealized tabs preserving height");
             [self fitWindowToIdealizedTabsPreservingHeight:YES];
         } else {
@@ -8916,7 +9091,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     // preserve the tab size when we update the window size below. Modifying the title bar
     // accessories synchronously changes the tabs' sizes, causing the window not to resize when
     // the tab bar shows or hides.
-    const NSSize tabSizeBeforeUpdatingTitleBarAccessories = [self sizeOfLargestTabExcludingTmux:NO];
+    const NSSize tabSizeBeforeUpdatingTitleBarAccessories = [self sizeOfLargestTabWithExclusion:PseudoTerminalTabSizeExclusionNone];
 
     [self updateTabBarStyle];
     [self safelySetStyleMask:self.styleMask];
@@ -8946,6 +9121,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
             [aTab fitSessionToCurrentViewSize:aSession];
             // Theme change affects scrollbar color.
             [aSession.textview updateScrollerForBackgroundColor];
+            // In case separate separate bg images per pane changed.
+            [aSession updateViewBackgroundImage];
         }
         // Theme change could affect tab icons
         [aTab updateIcon];
@@ -8999,9 +9176,6 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 - (BOOL)rootTerminalViewWindowNumberLabelShouldBeVisible {
-    if (@available(macOS 10.14, *)) { } else {
-        return NO;
-    }
     iTermWindowType effectiveWindowType = self.windowType;
     if (exitingLionFullscreen_) {
         effectiveWindowType = self.savedWindowType;
@@ -9238,10 +9412,6 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 // Generally yes, but not when a fake titlebar is shown *and* the window has transparency.
 // Fake titlebars need a background because transparent windows won't give you one for free.
 - (BOOL)rootTerminalViewShouldHideTabBarBackingWhenTabBarIsHidden {
-    if (@available(macOS 10.14, *)) { } else {
-        // Doesn't matter but let's not think about 10.13 and earlier since it won't happen
-        return YES;
-    }
     if (![PseudoTerminal windowTypeHasFullSizeContentView:self.windowType]) {
         // No full size content view? Then there won't be a fake title bar that needs backing.
         return YES;
@@ -9252,14 +9422,6 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
     if ([self anyFullScreen]) {
         // Full screen is special w/r/t the tab bar.
-        return YES;
-    }
-    if (![self useTransparency]) {
-        // Opaque windows have a window background behind the fake title bar.
-        return YES;
-    }
-    if (![self anyPaneIsTransparent]) {
-        // Opaque windows have a window background behind the fake title bar.
         return YES;
     }
     if ([iTermPreferences intForKey:kPreferenceKeyTabStyle] == TAB_STYLE_MINIMAL) {
@@ -9280,11 +9442,9 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
 }
 - (void)forceUpdateTitlebarSeparator NS_AVAILABLE_MAC(10_16) {
-#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101600
     NSTitlebarSeparatorStyle saved = self.window.titlebarSeparatorStyle;
-    self.window.titlebarSeparatorStyle = 1 - saved;
+    self.window.titlebarSeparatorStyle = (saved == NSTitlebarSeparatorStyleAutomatic) ? NSTitlebarSeparatorStyleNone : NSTitlebarSeparatorStyleAutomatic;
     self.window.titlebarSeparatorStyle = saved;
-#endif
 }
 
 - (VT100GridSize)rootTerminalViewCurrentSessionSize {
@@ -9332,12 +9492,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     [[self currentTab] recheckBlur];
     [self updateTabColors];
     [self updateToolbeltAppearance];
-    if (@available(macOS 10.14, *)) {
-        [self updateTabBarControlIsTitlebarAccessory];
-        self.tabBarControl.insets = [self tabBarInsets];
+    [self updateTabBarControlIsTitlebarAccessory];
+    self.tabBarControl.insets = [self tabBarInsets];
 
-        [self addShortcutAccessorViewControllerToTitleBarIfNeeded];
-    }
+    [self addShortcutAccessorViewControllerToTitleBarIfNeeded];
 }
 
 - (void)setFrameSize:(NSSize)newSize
@@ -9387,10 +9545,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     if (![iTermPreferences boolForKey:kPreferenceKeyShowWindowBorder]) {
         return NO;
     }
-    if (@available(macOS 10.14, *)) {
-        if (self.anyPaneIsTransparent) {
-            return YES;
-        }
+    if (self.anyPaneIsTransparent) {
+        return YES;
+    }
+    if ([iTermAdvancedSettingsModel bordersOnlyInLightMode]) {
         return !self.isDark;
     }
     return YES;
@@ -9426,12 +9584,6 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     if (!tabBarVisible) {
         // Invisible bottom tab bar
         return YES;
-    }
-    if (@available(macOS 10.14, *)) {} else {
-        if (self.isDark) {
-            // Dark tab style needs a border on 10.13 and earlier
-            return YES;
-        }
     }
     // Visible bottom tab bar with light style. It's light enough so it doesn't need a border.
     return NO;
@@ -9484,10 +9636,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 - (BOOL)tabBarIsVisibleInTitleBarAccessory {
-    if (@available(macOS 10.14, *)) {
-        return _contentView.tabBarControlOnLoan;
-    }
-    return NO;
+    return _contentView.tabBarControlOnLoan;
 }
 
 // See the note in windowDecorationSize about this hack.
@@ -9765,6 +9914,12 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 
 }
 
+- (IBAction)moveSessionToTab:(id)sender {
+    [[MovePaneController sharedInstance] moveSession:[self currentSession]
+                                       toTabInWindow:self.window];
+
+}
+
 // Max window frame size that fits on screens.
 - (NSRect)maxFrame
 {
@@ -9824,6 +9979,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
             height -= error;
         }
         PtyLog(@"safelySetSessionSize - set to %dx%d", width, height);
+        // Note that this typically gets deferred. See the comment in sessionInitiatedResize:width:height:.
         [aSession setSize:VT100GridSizeMake(width, height)];
         [[aSession.view scrollview] setHasVerticalScroller:hasScrollbar];
         [[aSession.view scrollview] setLineScroll:[[aSession textview] lineHeight]];
@@ -9866,7 +10022,20 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
             }
         }
         if (self.windowInitialized && !_fullScreen && !_restoringWindow) {
-            [[self window] makeKeyAndOrderFront:self];
+            DLog(@"insertTab: window is initialized, not full screen, and we are not restoring windows.");
+            if (self.isHotKeyWindow && self.window.alphaValue == 0) {
+                DLog(@"This appears to be an invisible hotkey window %@", self);
+                iTermProfileHotKey *profileHotkey = [[iTermHotKeyController sharedInstance] profileHotKeyForWindowController:self];
+                if (!profileHotkey.rollingIn && profileHotkey.windowController.weaklyReferencedObject == self) {
+                    DLog(@"not already rolling in. show it");
+                    [profileHotkey showHotKeyWindow];
+                } else {
+                    DLog(@"already rolling in or still being created - no need to do anything");
+                }
+            } else {
+                DLog(@"not a hidden hotkey window. Just order front.");
+                [[self window] makeKeyAndOrderFront:self];
+            }
         } else {
             PtyLog(@"window not initialized, is fullscreen, or is being restored. Stack:\n%@", [NSThread callStackSymbols]);
         }
@@ -9933,29 +10102,48 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 
 // Reset all state associated with the terminal.
 - (void)reset:(id)sender {
-    [[[self currentSession] terminal] resetByUserRequest:YES];
-    [[self currentSession] updateDisplayBecause:@"reset terminal"];
+    for (PTYSession *session in [self sessionsToSendCommand:iTermBroadcastCommandReset]) {
+        [session userInitiatedReset];
+    }
 }
 
-- (IBAction)resetCharset:(id)sender
-{
-    [[[self currentSession] terminal] resetCharset];
+- (IBAction)resetCharset:(id)sender {
+    [self.currentSession.screen performBlockWithJoinedThreads:^(VT100Terminal *terminal, VT100ScreenMutableState *mutableState, id<VT100ScreenDelegate> delegate) {
+        [terminal resetCharset];
+    }];
 }
 
-- (NSArray<PTYSession *> *)sessionsToSendClearTo {
+typedef NS_ENUM(NSUInteger, iTermBroadcastCommand) {
+    iTermBroadcastCommandClear,
+    iTermBroadcastCommandReset
+};
+
+- (NSArray<PTYSession *> *)sessionsToSendCommand:(iTermBroadcastCommand)command {
     NSArray<PTYSession *> *broadcast = [self broadcastSessions];
     if (broadcast.count < 2) {
         return @[ self.currentSession ];
     }
-    NSString *title = [NSString stringWithFormat:@"Clear all sessions to which input is broadcast? This will affect %@ sessions.",
+    NSString *action;
+    switch (command) {
+    case iTermBroadcastCommandClear:
+        action = @"Clear";
+        break;
+    case iTermBroadcastCommandReset:
+            action = @"Reset";
+        break;
+    }
+    NSString *title = [NSString stringWithFormat:@"%@ all sessions to which input is broadcast? This will affect %@ sessions.",
+                       action,
                        @(broadcast.count)];
     const iTermWarningSelection selection =
     [iTermWarning showWarningWithTitle:title
-                               actions:@[ @"Clear All", @"Clear Current Session Only", @"Cancel" ]
+                               actions:@[ [NSString stringWithFormat:@"%@ All", action],
+                                          [NSString stringWithFormat:@"%@ Current Session Only", action],
+                                          @"Cancel" ]
                              accessory:nil
-                            identifier:@"NoSyncClearAllBroadcast"
+                            identifier:[NSString stringWithFormat:@"NoSync%@AllBroadcast", action]
                            silenceable:kiTermWarningTypePermanentlySilenceable
-                               heading:@"Clear in All Broadcasted-to Sessions?"
+                               heading:[NSString stringWithFormat:@"%@ in All Broadcasted-to Sessions?", action]
                                 window:self.window];
     if (selection == kiTermWarningSelection0) {
         return broadcast;
@@ -9968,7 +10156,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 
 // Clear the buffer of the current session (Edit>Clear Buffer).
 - (void)clearBuffer:(id)sender {
-    for (PTYSession *session in [self sessionsToSendClearTo]) {
+    for (PTYSession *session in [self sessionsToSendCommand:iTermBroadcastCommandClear]) {
         [session clearBuffer];
     }
 }
@@ -9979,7 +10167,17 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 - (IBAction)clearToStartOfSelection:(id)sender {
-    [self.currentSession.screen clearFromAbsoluteLineToEnd:self.currentSession.textview.selection.firstAbsRange.coordRange.start.y];
+    const long long line = self.currentSession.textview.selection.firstAbsRange.coordRange.start.y;
+    [self.currentSession resetMode];
+    [self.currentSession.screen performBlockWithJoinedThreads:^(VT100Terminal *terminal,
+                                                                VT100ScreenMutableState *mutableState,
+                                                                id<VT100ScreenDelegate> delegate) {
+        [mutableState clearFromAbsoluteLineToEnd:line];
+    }];
+}
+
+- (IBAction)clearInstantReplay:(id)sender {
+    [self.currentSession clearInstantReplay];
 }
 
 - (IBAction)clearToLastMark:(id)sender {
@@ -10000,23 +10198,35 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     NSString *suggestedFilename = [NSString stringWithFormat:@"iTerm2 Session %@ at %@.txt",
                                    [dateFormatter stringFromDate:now],
                                    [timeFormatter stringFromDate:now]];
-    iTermSavePanel *savePanel = [iTermSavePanel showWithOptions:kSavePanelOptionFileFormatAccessory
-                                                     identifier:@"SaveContents"
-                                               initialDirectory:NSHomeDirectory()
-                                                defaultFilename:suggestedFilename
-                                               allowedFileTypes:@[ @"txt", @"rtf" ]
-                                                         window:self.window];
+
+    __weak __typeof(self) weakSelf = self;
+    [iTermSavePanel asyncShowWithOptions:kSavePanelOptionFileFormatAccessory | kSavePanelOptionIncludeTimestampsAccessory
+                              identifier:@"SaveContents"
+                        initialDirectory:NSHomeDirectory()
+                         defaultFilename:suggestedFilename
+                        allowedFileTypes:@[ @"txt", @"rtf" ]
+                                  window:self.window completion:^(iTermSavePanel *savePanel) {
+        [weakSelf reallySaveContents:savePanel];
+    }];
+}
+
+- (void)reallySaveContents:(iTermSavePanel *)savePanel {
     if (savePanel.path) {
         NSURL *url = [NSURL fileURLWithPath:savePanel.path];
         if (url) {
             if ([[url pathExtension] isEqualToString:@"rtf"]) {
-                NSAttributedString *attributedString = [self.currentSession.textview contentWithAttributes:YES];
+                NSAttributedString *attributedString = [self.currentSession.textview contentWithAttributes:YES
+                                                                                                timestamps:savePanel.timestamps];
                 NSData *data = [attributedString dataFromRange:NSMakeRange(0, attributedString.length)
                                             documentAttributes:@{NSDocumentTypeDocumentAttribute: NSRTFTextDocumentType}
                                                          error:NULL];
                 [data writeToFile:url.path atomically:YES];
             } else {
-                [[self.currentSession.textview content] writeToFile:url.path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+                id content = [self.currentSession.textview contentWithAttributes:NO timestamps:savePanel.timestamps];
+                [content writeToFile:url.path
+                          atomically:NO
+                            encoding:NSUTF8StringEncoding
+                               error:nil];
             }
         }
     }
@@ -10030,8 +10240,10 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     if (self.currentSession.logging) {
         [[self currentSession] logStop];
     } else {
-        [[self retain] autorelease];  // Prevent self from getting dealloc'ed during modal panel.
-        [[self currentSession] logStart];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[self retain] autorelease];  // Prevent self from getting dealloc'ed during modal panel.
+            [[self currentSession] logStart];
+        });
     }
 }
 
@@ -10049,6 +10261,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         [item action] == @selector(newTmuxTab:) ||
         [item action] == @selector(forceDetachTmux:)) {
         return [[iTermController sharedInstance] haveTmuxConnection];
+    } else if (item.action == @selector(closeCurrentTab:)) {
+        return YES;
     } else if (item.action == @selector(toggleTmuxPausePane:)) {
         const BOOL ok = (self.currentSession.isTmuxClient &&
                          self.currentSession.tmuxController.gateway.pauseModeEnabled);
@@ -10063,6 +10277,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         return [[iTermToolbeltView configuredTools] count] > 0;
     } else if ([item action] == @selector(moveSessionToWindow:)) {
         result = ([[self allSessions] count] > 1);
+    } else if ([item action] == @selector(moveSessionToTab:)) {
+        result = [self tabForSession:self.currentSession].sessions.count > 1;
     } else if ([item action] == @selector(openSplitHorizontallySheet:) ||
                [item action] == @selector(openSplitVerticallySheet:)) {
         result = ![[self currentTab] isTmuxTab];
@@ -10114,6 +10330,15 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         } else {
             [item setState:NSControlStateValueOff];
         }
+    } else if ([item action] == @selector(toggleAutoComposer:)) {
+        result = [[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed];
+        if (result) {
+            if ([item respondsToSelector:@selector(setState:)]) {
+                [item setState:[iTermPreferences boolForKey:kPreferenceAutoComposer] ? NSControlStateValueOn : NSControlStateValueOff];
+            }
+        } else {
+            [item setState:NSControlStateValueOff];
+        }
     } else if ([item action] == @selector(toggleAlertOnNextMark:)) {
         PTYSession *currentSession = [self currentSession];
         if ([item respondsToSelector:@selector(setState:)]) {
@@ -10141,13 +10366,15 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         }
     } else if ([item action] == @selector(restartSession:)) {
         return [[self currentSession] isRestartable];
+    } else if ([item action] == @selector(duplicateSession:)) {
+        return [[self currentSession] tmuxMode] == TMUX_NONE;
     } else if ([item action] == @selector(resetCharset:)) {
         result = ![[[self currentSession] screen] allCharacterSetPropertiesHaveDefaultValues];
     } else if ([item action] == @selector(openCommandHistory:)) {
         if (![[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed]) {
             return YES;
         }
-        VT100RemoteHost *host = [[self currentSession] currentHost] ?: [VT100RemoteHost localhost];
+        id<VT100RemoteHostReading> host = [[self currentSession] currentHost] ?: [VT100RemoteHost localhost];
         return [[iTermShellHistoryController sharedInstance] haveCommandsForHost:host];
     } else if ([item action] == @selector(openDirectories:)) {
         if (![[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed]) {
@@ -10172,8 +10399,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         return YES;
     } else if ([item action] == @selector(zoomOnSelection:)) {
         return ![self inInstantReplay] && [[self currentSession] hasSelection];
-    } else if ([item action] == @selector(showFindPanel:) ||
-               [item action] == @selector(findPrevious:) ||
+    } else if ([item action] == @selector(findPrevious:) ||
                [item action] == @selector(findNext:) ||
                [item action] == @selector(jumpToSelection:) ||
                [item action] == @selector(findUrls:)) {
@@ -10210,6 +10436,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         return self.currentSession.screen.lastMark != nil;
     } else if (item.action == @selector(clearToStartOfSelection:)) {
         return self.currentSession.hasSelection;
+    } else if (item.action == @selector(clearInstantReplay:)) {
+        return ![[self currentSession] liveSession] && self.currentSession.screen.dvr.canClear;
     }
 
     return result;
@@ -10241,10 +10469,16 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
                                      resetRowsCols:[sender isAlternate]];
 }
 
-- (IBAction)toggleAutoCommandHistory:(id)sender
-{
+- (IBAction)toggleAutoCommandHistory:(id)sender {
     [iTermPreferences setBool:![iTermPreferences boolForKey:kPreferenceAutoCommandHistory]
                        forKey:kPreferenceAutoCommandHistory];
+}
+
+- (IBAction)toggleAutoComposer:(id)sender {
+    [iTermPreferences setBool:![iTermPreferences boolForKey:kPreferenceAutoComposer]
+                       forKey:kPreferenceAutoComposer];
+    [[NSNotificationCenter defaultCenter] postNotificationName:iTermAutoComposerDidChangeNotification
+                                                        object:nil];
 }
 
 // Turn on/off sending of input to all sessions. This causes a bunch of UI
@@ -10297,6 +10531,17 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         [self fitTabToWindow:[[_contentView.tabView tabViewItemAtIndex:i] identifier]];
     }
     PtyLog(@"fitTabsToWindow returns");
+}
+
+- (void)fitNonTmuxTabsToWindow {
+    DLog(@"fitNonTmuxTabsToWindow starting");
+    for (PTYTab *tab in self.tabs) {
+        if (tab.tmuxTab) {
+            continue;
+        }
+        [self fitTabToWindow:tab];
+    }
+    DLog(@"fitNonTmuxTabsToWindow returning");
 }
 
 // Show a dialog confirming close. Returns YES if the window should be closed.
@@ -10387,9 +10632,9 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
                               didMakeSession:nil
                                   completion:nil];
     } else {
-        [self openTabWithArrangement:self.currentTab.arrangementWithNewGUID
+        [self openTabWithArrangement:theTab.arrangementWithNewGUID
                                named:nil
-                     hasFlexibleView:self.currentTab.isTmuxTab
+                     hasFlexibleView:theTab.isTmuxTab
                              viewMap:nil
                           sessionMap:nil
                   partialAttachments:nil];
@@ -10609,7 +10854,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     [self.window.dockTile setShowsApplicationBadge:YES];
 }
 
-- (void)sessionHostDidChange:(PTYSession *)session to:(VT100RemoteHost *)host {
+- (void)sessionHostDidChange:(PTYSession *)session to:(id<VT100RemoteHostReading>)host {
     if ([self currentSession] == session) {
         [self refreshTools];
     }
@@ -10697,11 +10942,14 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     }
 
     __weak __typeof(self) weakSelf = self;
-    [currentSession asyncCurrentLocalWorkingDirectoryOrInitialDirectory:^(NSString *pwd) {
+    [currentSession asyncInitialDirectoryForNewSessionBasedOnCurrentDirectory:^(NSString *pwd) {
         DLog(@"Got local pwd so I can create a tab: %@", pwd);
         PseudoTerminal *strongSelf = [[weakSelf retain] autorelease];
         if (!strongSelf) {
             return;
+        }
+        if (profile.sshIdentity != nil && ![currentSession.sshIdentity isEqual:profile.sshIdentity]) {
+            pwd = nil;
         }
         PTYSession *newSession = [strongSelf createTabWithProfile:profile
                                                       withCommand:command
@@ -10964,11 +11212,7 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 
 - (NSApplicationPresentationOptions)window:(NSWindow *)window
       willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposedOptions {
-    if (@available(macOS 10.14, *)) {
-        return proposedOptions;
-    } else {
-        return proposedOptions | NSApplicationPresentationAutoHideToolbar;
-    }
+    return proposedOptions;
 }
 
 - (void)addSessionInNewTab:(PTYSession *)session {
@@ -11049,15 +11293,6 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 }
 
 #pragma mark - Find
-
-- (IBAction)showFindPanel:(id)sender {
-    const BOOL findPanelWasOpen = self.currentSession.view.findDriver.viewController.searchIsVisible;
-    [[self currentSession] showFindPanel];
-    if (!findPanelWasOpen) {
-        [self.currentSession.view.findDriver setFilterHidden:YES];
-    }
-    [[iTermFindPasteboard sharedInstance] updateObservers:nil];
-}
 
 // findNext and findPrevious are reversed here because in the search UI next
 // goes backwards and previous goes forwards.
@@ -11313,7 +11548,8 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
         return;
     }
     self.window.documentEdited = [self.currentTab.sessions anyWithBlock:^BOOL(PTYSession *session) {
-        if ([[iTermProfilePreferences stringForKey:KEY_CUSTOM_COMMAND inProfile:session.profile] isEqualToString:kProfilePreferenceCommandTypeCustomValue]) {
+        if ([[iTermProfilePreferences stringForKey:KEY_CUSTOM_COMMAND inProfile:session.profile] isEqualToString:kProfilePreferenceCommandTypeCustomValue] ||
+            [[iTermProfilePreferences stringForKey:KEY_CUSTOM_COMMAND inProfile:session.profile] isEqualToString:kProfilePreferenceCommandTypeSSHValue]) {
             return NO;
         }
         return session.hasNontrivialJob;
@@ -11332,25 +11568,23 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
 #pragma mark - Toolbelt
 
 - (void)updateToolbeltAppearance {
-    if (@available(macOS 10.14, *)) {
-        switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
-            case TAB_STYLE_MINIMAL:
-                if (self.minimalTabStyleBackgroundColor.isDark) {
-                    _contentView.toolbelt.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-                } else {
-                    _contentView.toolbelt.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
-                }
-                break;
+    switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
+        case TAB_STYLE_MINIMAL:
+            if (self.minimalTabStyleBackgroundColor.isDark) {
+                _contentView.toolbelt.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+            } else {
+                _contentView.toolbelt.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+            }
+            break;
 
-            case TAB_STYLE_AUTOMATIC:
-            case TAB_STYLE_LIGHT:
-            case TAB_STYLE_LIGHT_HIGH_CONTRAST:
-            case TAB_STYLE_DARK:
-            case TAB_STYLE_DARK_HIGH_CONTRAST:
-            case TAB_STYLE_COMPACT:
-                _contentView.toolbelt.appearance = nil;
-                break;
-        }
+        case TAB_STYLE_AUTOMATIC:
+        case TAB_STYLE_LIGHT:
+        case TAB_STYLE_LIGHT_HIGH_CONTRAST:
+        case TAB_STYLE_DARK:
+        case TAB_STYLE_DARK_HIGH_CONTRAST:
+        case TAB_STYLE_COMPACT:
+            _contentView.toolbelt.appearance = nil;
+            break;
     }
 }
 
@@ -11363,28 +11597,29 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     [[self currentSession] takeFocus];
 }
 
-- (VT100RemoteHost *)toolbeltCurrentHost {
+- (id<VT100RemoteHostReading>)toolbeltCurrentHost {
     return [[self currentSession] currentHost];
 }
 
 - (pid_t)toolbeltCurrentShellProcessId {
-    return [[[self currentSession] shell] pid];
+    return self.currentSession.variablesScope.effectiveRootPid.intValue;
 }
 
-- (VT100ScreenMark *)toolbeltLastCommandMark {
+- (id<ProcessInfoProvider>)toolbeltCurrentShellProcessInfoProvider {
+    return self.currentSession.processInfoProvider;
+}
+
+- (id<VT100ScreenMarkReading>)toolbeltLastCommandMark {
     return self.currentSession.screen.lastCommandMark;
 }
 
-- (void)toolbeltDidSelectMark:(iTermMark *)mark {
+- (void)toolbeltDidSelectMark:(id<iTermMark>)mark {
     [self.currentSession scrollToMark:mark];
     [self.currentSession takeFocus];
 }
 
 - (void)toolbeltActivateTriggerForCapturedOutputInCurrentSession:(CapturedOutput *)capturedOutput {
-    if (self.currentSession) {
-        CaptureTrigger *trigger = (CaptureTrigger *)capturedOutput.trigger;
-        [trigger activateOnOutput:capturedOutput inSession:self.currentSession];
-    }
+    [self.currentSession performActionForCapturedOutput:capturedOutput];
 }
 
 - (BOOL)toolbeltCurrentSessionHasGuid:(NSString *)guid {
@@ -11399,8 +11634,33 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     [self.currentSession openAdvancedPasteWithText:text escaping:escaping];
 }
 
+- (void)toolbeltOpenComposerWithString:(NSString *)text escaping:(iTermSendTextEscaping)escaping {
+    [self.currentSession openComposerWithString:text escaping:escaping];
+}
+
 - (NSArray<iTermCommandHistoryCommandUseMO *> *)toolbeltCommandUsesForCurrentSession {
     return [self.currentSession commandUses];
+}
+
+- (void)toolbeltAddNamedMark {
+    [self addNamedMark:nil];
+}
+
+- (void)toolbeltRemoveNamedMark:(id<VT100ScreenMarkReading>)mark {
+    [self.currentSession.screen removeNamedMark:mark];
+}
+
+- (void)toolbeltRenameNamedMark:(id<VT100ScreenMarkReading>)mark to:(NSString *)newName {
+    __weak PTYSession *session = self.currentSession;
+    if (!newName) {
+        [iTermBookmarkDialogViewController showInWindow:self.window
+                                        withDefaultName:mark.name ?: @""
+                                             completion:^(NSString * _Nonnull name) {
+            [session renameMark:mark to:name];
+        }];
+    } else {
+        [session renameMark:mark to:newName];
+    }
 }
 
 #pragma mark - Quick Look panel support
@@ -11440,11 +11700,9 @@ static CGFloat iTermDimmingAmount(PSMTabBarControl *tabView) {
     if ([iTermPreferences boolForKey:kPreferenceKeyPerPaneBackgroundImage]) {
         return;
     }
-    if (@available(macOS 10.14, *)) {
-        [self setSharedBackgroundImage:self.currentSession.backgroundImage
-                                  mode:self.currentSession.backgroundImageMode
-                       backgroundColor:self.currentSession.processedBackgroundColor];
-    }
+    [self setSharedBackgroundImage:self.currentSession.backgroundImage
+                              mode:self.currentSession.backgroundImageMode
+                   backgroundColor:self.currentSession.processedBackgroundColor];
 }
 
 - (void)tab:(PTYTab *)tab
@@ -11521,8 +11779,8 @@ backgroundColor:(NSColor *)backgroundColor {
 #pragma mark - PSMMinimalTabStyleDelegate
 
 - (NSColor *)minimalTabStyleBackgroundColor {
-    DLog(@"Getting bg color for session %@, colormap %@", self.currentSession, self.currentSession.colorMap);
-    return [self.currentSession.colorMap colorForKey:kColorMapBackground];
+    DLog(@"Getting bg color for session %@, colormap %@", self.currentSession, self.currentSession.screen.colorMap);
+    return [self.currentSession.screen.colorMap colorForKey:kColorMapBackground];
 }
 
 #pragma mark - iTermBroadcastInputHelperDelegate

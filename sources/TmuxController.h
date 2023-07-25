@@ -12,6 +12,7 @@
 #import "TmuxGateway.h"
 #import "WindowControllerInterface.h"
 
+@class iTermFontTable;
 @class iTermVariableScope;
 @class PTYSession;
 @class PTYTab;
@@ -63,6 +64,7 @@ extern NSString *const kTmuxControllerDidChangeHiddenWindows;
 @property(nonatomic, readonly) BOOL detaching;
 @property(nonatomic, copy) Profile *sharedProfile;
 @property(nonatomic, readonly) NSDictionary *sharedFontOverrides;
+@property(nonatomic, readonly) NSDictionary *sharedKeyMappingOverrides;
 @property(nonatomic, readonly) NSString *sessionGuid;
 @property(nonatomic, readonly) BOOL variableWindowSize;
 @property(nonatomic, readonly) BOOL shouldSetTitles;
@@ -100,6 +102,7 @@ extern NSString *const kTmuxControllerDidChangeHiddenWindows;
 // Returns YES if you should call adjustWindowSizeIfNeededForTabs: after all tabs have been updated.
 - (BOOL)setLayoutInTab:(PTYTab *)tab
               toLayout:(NSString *)layout
+         visibleLayout:(NSString *)visibleLayout
                 zoomed:(NSNumber *)zoomed;
 - (void)adjustWindowSizeIfNeededForTabs:(NSArray<PTYTab *> *)tabs;
 
@@ -230,14 +233,15 @@ extern NSString *const kTmuxControllerDidChangeHiddenWindows;
 - (void)setCurrentWindow:(int)windowId;
 - (void)checkForUTF8;
 - (void)loadDefaultTerminal;
+- (void)loadKeyBindings;
+- (void)exitCopyMode;
 
 - (void)clearHistoryForWindowPane:(int)windowPane;
 
-- (void)setTmuxFont:(NSFont *)font
-       nonAsciiFont:(NSFont *)nonAsciiFont
-           hSpacing:(CGFloat)hs
-           vSpacing:(CGFloat)vs
-             window:(int)window;
+- (void)setTmuxFontTable:(iTermFontTable *)fontTable
+                hSpacing:(CGFloat)hs
+                vSpacing:(CGFloat)vs
+                  window:(int)window;
 - (BOOL)windowIsHidden:(int)windowId;
 - (void)setLayoutInWindowPane:(int)windowPane toLayoutNamed:(NSString *)name;
 - (void)setLayoutInWindow:(int)window toLayout:(NSString *)layout;
@@ -253,5 +257,7 @@ extern NSString *const kTmuxControllerDidChangeHiddenWindows;
 - (void)activeWindowPaneDidChangeInWindow:(int)windowID toWindowPane:(int)paneID;
 - (void)activeWindowDidChangeTo:(int)windowID;
 - (void)setCurrentLatency:(NSTimeInterval)latency forPane:(int)wp;
+- (void)copyBufferToLocalPasteboard:(NSString *)bufferName;
+- (void)restoreWindowFrame:(PseudoTerminal *)term;
 
 @end

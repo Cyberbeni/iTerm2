@@ -409,10 +409,6 @@ static const NSTimeInterval iTermStatusBarGitComponentDefaultCadence = 2;
     [_session reveal];
 }
 
-- (void)statusBarComponentDidClickWithView:(NSView *)view {
-    [self openMenuWithView:view];
-}
-
 - (void)statusBarComponentMouseDownWithView:(NSView *)view {
     [self openMenuWithView:view];
 }
@@ -551,11 +547,7 @@ static const NSTimeInterval iTermStatusBarGitComponentDefaultCadence = 2;
     _popoverVC.popover.behavior = NSPopoverBehaviorTransient;
     [_popoverVC view];
     if ([self.delegate statusBarComponentTerminalBackgroundColorIsDark:self]) {
-        if (@available(macOS 10.14, *)) {
-            _popoverVC.view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-        } else {
-            _popoverVC.view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantDark];
-        }
+        _popoverVC.view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     } else {
         _popoverVC.view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
     }

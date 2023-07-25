@@ -12,12 +12,14 @@
 
 @class CapturedOutput;
 @class iTermAction;
-@class iTermMark;
-@class VT100RemoteHost;
+@protocol iTermMark;
+@protocol ProcessInfoProvider;
 @class ToolCommandHistoryView;
+@protocol VT100ScreenMarkReading;
+@protocol VT100RemoteHostReading;
 @class iTermCommandHistoryCommandUseMO;
+@class ToolNamedMarks;
 @class iTermToolWrapper;
-@class VT100ScreenMark;
 
 @protocol iTermToolbeltViewDelegate<NSObject>
 
@@ -26,15 +28,20 @@
 - (void)toolbeltDidFinishGrowing;
 - (void)toolbeltUpdateMouseCursor;
 - (void)toolbeltInsertText:(NSString *)text;
-- (VT100RemoteHost *)toolbeltCurrentHost;
+- (id<VT100RemoteHostReading>)toolbeltCurrentHost;
 - (pid_t)toolbeltCurrentShellProcessId;
-- (VT100ScreenMark *)toolbeltLastCommandMark;
-- (void)toolbeltDidSelectMark:(iTermMark *)mark;
+- (id<ProcessInfoProvider>)toolbeltCurrentShellProcessInfoProvider;
+- (id<VT100ScreenMarkReading>)toolbeltLastCommandMark;
+- (void)toolbeltDidSelectMark:(id<iTermMark>)mark;
 - (void)toolbeltActivateTriggerForCapturedOutputInCurrentSession:(CapturedOutput *)capturedOutput;
 - (BOOL)toolbeltCurrentSessionHasGuid:(NSString *)guid;
 - (NSArray<iTermCommandHistoryCommandUseMO *> *)toolbeltCommandUsesForCurrentSession;
 - (void)toolbeltApplyActionToCurrentSession:(iTermAction *)action;
 - (void)toolbeltOpenAdvancedPasteWithString:(NSString *)text escaping:(iTermSendTextEscaping)escaping;
+- (void)toolbeltOpenComposerWithString:(NSString *)text escaping:(iTermSendTextEscaping)escaping;
+- (void)toolbeltAddNamedMark;
+- (void)toolbeltRemoveNamedMark:(id<VT100ScreenMarkReading>)mark;
+- (void)toolbeltRenameNamedMark:(id<VT100ScreenMarkReading>)mark to:(NSString *)newName;
 
 @end
 
@@ -43,6 +50,7 @@
 @property(nonatomic, assign) id<iTermToolbeltViewDelegate> delegate;
 @property(nonatomic, readonly) BOOL haveOnlyOneTool;
 @property(nonatomic, readonly) ToolCommandHistoryView *commandHistoryView;
+@property(nonatomic, readonly) ToolNamedMarks *namedMarksView;
 
 - (void)hideToolbelt;
 - (void)toggleShowToolWithName:(NSString *)theName;
@@ -53,6 +61,7 @@
 - (CGFloat)minimumHeight;
 
 @optional
++ (BOOL)isDynamic;
 - (NSDictionary *)restorableState;
 - (void)restoreFromState:(NSDictionary *)state;
 - (instancetype)initWithFrame:(NSRect)frame URL:(NSURL *)url identifier:(NSString *)identifier;

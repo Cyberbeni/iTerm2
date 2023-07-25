@@ -15,8 +15,6 @@
 #import <Foundation/Foundation.h>
 extern BOOL gDebugLogging;
 #include "iTermCLogging.h"
-// Posted when debug logging begins
-extern NSString *iTermDebugLoggingDidBeginNotification;
 
 #define USE_STOPWATCH 0
 
@@ -220,3 +218,6 @@ void AppendPinnedDebugLogMessage(NSString *key, NSString *value, ...);
 @end
 
 #endif  // __OBJC__
+
+#define VLog(args...)
+//#define VLog(args...) NSLog(args)

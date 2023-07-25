@@ -7,44 +7,45 @@
 //
 
 #import "SetHostnameTrigger.h"
-#import "PTYSession.h"
-#import "VT100Screen.h"
 
 @implementation SetHostnameTrigger
 
 + (NSString *)title {
-  return @"Report User & Host";
+    return @"Report User & Host";
 }
 
 - (BOOL)takesParameter{
-  return YES;
+    return YES;
 }
 
 - (NSString *)triggerOptionalParameterPlaceholderWithInterpolation:(BOOL)interpolation {
-  return @"username@hostname";
+    return @"username@hostname";
 }
 
 - (BOOL)isIdempotent {
     return YES;
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *remoteHost) {
-                                             if (remoteHost.length) {
-                                                 [aSession.screen terminalSetRemoteHost:remoteHost];
-                                             }
-                                         }];
+    // Need to stop the world to get scope, provided it is needed. Hostname changes are slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull remoteHost) {
+        if (remoteHost.length) {
+            [scheduler scheduleTriggerCallback:^{
+                [aSession triggerSession:self setRemoteHostName:remoteHost];
+            }];
+        }
+    }];
     return YES;
 }
 

@@ -7,6 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -18,7 +19,7 @@ NS_INLINE NSUInteger iTermMikeAshHash(NSUInteger hash1, NSUInteger hash2) {
 }
 
 // http://www.cse.yorku.ca/~oz/hash.html
-NS_INLINE NSUInteger iTermDJB2Hash(unsigned char *bytes, size_t length) {
+NS_INLINE NSUInteger iTermDJB2Hash(const unsigned char *bytes, size_t length) {
     NSUInteger hash = 5381;
 
     for (NSUInteger i = 0; i < length; i++) {
@@ -54,10 +55,12 @@ NS_INLINE NSUInteger iTermCombineHash(NSUInteger hash1, NSUInteger hash2) {
 // Supports NSArray, NSDictionary, and NSNumber.
 + (BOOL)object:(__kindof NSObject * _Nullable)a isApproximatelyEqualToObject:(__kindof NSObject * _Nullable)b epsilon:(double)epsilon;
 
-+ (instancetype)castFrom:(id)object;
++ (instancetype _Nullable)castFrom:(id _Nullable)object;
 + (instancetype)forceCastFrom:(id)object;
 
 - (void)performSelectorOnMainThread:(SEL)selector withObjects:(NSArray * _Nullable)objects;
+
++ (void)it_enumerateDynamicProperties:(void (^)(NSString *name))block;
 
 // Retains self for |delay| time, whether canceled or not.
 // Set canceled=YES on the result to keep the block from running. Its completed flag will be set to
@@ -85,7 +88,7 @@ NS_INLINE NSUInteger iTermCombineHash(NSUInteger hash1, NSUInteger hash2) {
 - (iTermDelayedPerform *)performBlock:(void (^)(void))block afterDelay:(NSTimeInterval)delay;
 
 // Returns nil if this object is an instance of NSNull, otherwise returns self.
-- (instancetype)nilIfNull;
+- (instancetype _Nullable)nilIfNull;
 
 - (void)it_setAssociatedObject:(id _Nullable)associatedObject forKey:(const void *)key;
 - (void)it_setWeakAssociatedObject:(id _Nullable)associatedObject forKey:(const void *)key;
@@ -103,6 +106,12 @@ NS_INLINE NSUInteger iTermCombineHash(NSUInteger hash1, NSUInteger hash2) {
 - (instancetype)it_weakProxy;
 - (NSString *)tastefulDescription;
 - (id)it_jsonSafeValue;
+
+- (NSData *)it_keyValueCodedData;
++ (instancetype)it_fromKeyValueCodedData:(NSData *)data;
+- (NSString *)jsonEncoded;
++ (instancetype)fromJsonEncodedString:(NSString *)string;
+
 
 @end
 

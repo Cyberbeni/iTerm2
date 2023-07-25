@@ -14,6 +14,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@protocol ProcessInfoProvider;
 @protocol iTermTriggersDataSource;
 
 typedef NSString *iTermStatusBarComponentConfigurationKey NS_EXTENSIBLE_STRING_ENUM;
@@ -38,6 +39,7 @@ static NSString *const iTermStatusBarSharedFontKey = @"shared font";
 - (BOOL)statusBarComponentIsVisible:(id<iTermStatusBarComponent>)component;
 - (NSFont *)statusBarComponentTerminalFont:(id<iTermStatusBarComponent>)component;
 - (BOOL)statusBarComponentTerminalBackgroundColorIsDark:(id<iTermStatusBarComponent>)component;
+- (NSColor *)statusBarComponentEffectiveBackgroundColor:(id<iTermStatusBarComponent>)component;
 - (void)statusBarComponent:(id<iTermStatusBarComponent>)component writeString:(NSString *)string;
 - (void)statusBarComponentOpenStatusBarPreferences:(id<iTermStatusBarComponent>)component;
 - (void)statusBarComponentPerformAction:(iTermAction *)action;
@@ -53,6 +55,7 @@ forInvocation:(NSString *)invocation
 - (id<iTermTriggersDataSource>)statusBarComponentTriggersDataSource:(id<iTermStatusBarComponent>)component;
 - (void)statusBarRemoveTemporaryComponent:(id<iTermStatusBarComponent>)component;
 - (void)statusBarSetFilter:(NSString * _Nullable)query;
+- (id<ProcessInfoProvider>)statusBarComponentProcessInfoProvider;
 @end
 
 @protocol iTermStatusBarComponentFactory<NSSecureCoding, NSCopying, NSObject>

@@ -22,6 +22,10 @@
 - (void)clearStream;
 - (void)forceUnhookDCS:(NSString *)uniqueID;
 - (void)startTmuxRecoveryModeWithID:(NSString *)dcsID;
+- (void)cancelTmuxRecoveryMode;
+
+- (NSInteger)startConductorRecoveryModeWithID:(NSString *)dcsID tree:(NSDictionary *)tree;
+- (void)cancelConductorRecoveryMode;
 
 // CVector was created for this method. Because so many VT100Token*s are created and destroyed,
 // too much time is spent adjusting their retain counts. Since an iTermObjectPool is used to avoid

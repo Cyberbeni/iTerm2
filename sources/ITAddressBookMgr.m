@@ -28,6 +28,7 @@
 #import "ITAddressBookMgr.h"
 
 #import "DebugLogging.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermDynamicProfileManager.h"
 #import "iTermExpressionEvaluator.h"
 #import "iTermHotKeyController.h"
@@ -50,11 +51,16 @@ NSString *const iTermUnicodeVersionDidChangeNotification = @"iTermUnicodeVersion
 NSString *const kProfilePreferenceCommandTypeCustomValue = @"Yes";
 NSString *const kProfilePreferenceCommandTypeLoginShellValue = @"No";
 NSString *const kProfilePreferenceCommandTypeCustomShellValue = @"Custom Shell";
+NSString *const kProfilePreferenceCommandTypeSSHValue = @"SSH";
 
 const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
 const NSInteger iTermMaxInitialSessionSize = 1250;
 
 static NSMutableArray<NSNotification *> *sDelayedNotifications;
+
+NSString *iTermPathToSSH(void) {
+    return [[NSBundle bundleForClass:[ITAddressBookMgr class]] pathForResource:@"utilities/it2ssh" ofType:nil];
+}
 
 iTermWindowType iTermWindowDefaultType(void) {
     return iTermThemedWindowType(WINDOW_TYPE_NORMAL);
@@ -64,10 +70,6 @@ iTermWindowType iTermThemedWindowType(iTermWindowType windowType) {
     switch (windowType) {
         case WINDOW_TYPE_COMPACT:
         case WINDOW_TYPE_NORMAL:
-            if (@available(macOS 10.14, *)) {} else {
-                // 10.13 and earlier do not support compact
-                return WINDOW_TYPE_NORMAL;
-            }
             switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
                 case TAB_STYLE_COMPACT:
                 case TAB_STYLE_MINIMAL:
@@ -85,10 +87,6 @@ iTermWindowType iTermThemedWindowType(iTermWindowType windowType) {
 
         case WINDOW_TYPE_COMPACT_MAXIMIZED:
         case WINDOW_TYPE_MAXIMIZED:
-            if (@available(macOS 10.14, *)) {} else {
-                // 10.13 and earlier do not support compact
-                return WINDOW_TYPE_MAXIMIZED;
-            }
             switch ((iTermPreferencesTabStyle)[iTermPreferences intForKey:kPreferenceKeyTabStyle]) {
                 case TAB_STYLE_COMPACT:
                 case TAB_STYLE_MINIMAL:
@@ -285,8 +283,12 @@ iTermWindowType iTermThemedWindowType(iTermWindowType windowType) {
     return [plist colorValue];
 }
 
++ (NSFont *)defaultFont {
+    return [NSFont userFixedPitchFontOfSize:0.0] ?: [NSFont systemFontOfSize:[NSFont systemFontSize]];
+}
+
 + (NSFont *)fontWithDesc:(NSString *)fontDesc {
-    return [fontDesc fontValue];
+    return [fontDesc fontValue] ?: [self defaultFont];
 }
 
 - (void)setBookmarks:(NSArray *)newBookmarksArray defaultGuid:(NSString *)guid {
@@ -658,12 +660,13 @@ iTermWindowType iTermThemedWindowType(iTermWindowType windowType) {
 + (void)computeCommandForProfile:(Profile *)profile
                       objectType:(iTermObjectType)objectType
                            scope:(iTermVariableScope *)scope
-                      completion:(void (^)(NSString *command))completion {
-    BOOL custom = [profile[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomValue];
+                      completion:(void (^)(NSString *, BOOL))completion {
+    const BOOL ssh = [profile[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeSSHValue];
+    const BOOL custom = [profile[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomValue];
     NSString *swifty = [self bookmarkCommandSwiftyString:profile forObjectType:objectType];
-    if (!custom) {
-        DLog(@"Don't have a custom command. COmputed command is %@", swifty);
-        completion(swifty);
+    if (!custom && !ssh) {
+        DLog(@"Don't have a custom command. Computed command is %@", swifty);
+        completion(swifty, ssh);
         return;
     }
 
@@ -680,16 +683,32 @@ iTermWindowType iTermThemedWindowType(iTermWindowType windowType) {
                                                       forObjectType:objectType];
         }
         DLog(@"Finish with %@", string);
-        completion(string);
+        completion(string, ssh);
     }];
 }
 
 + (NSString *)bookmarkCommandSwiftyString:(Profile *)bookmark
                             forObjectType:(iTermObjectType)objectType {
-    BOOL custom = [bookmark[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomValue];
-    if (custom) {
+    const BOOL custom = [bookmark[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeCustomValue];
+    const BOOL ssh = [bookmark[KEY_CUSTOM_COMMAND] isEqualToString:kProfilePreferenceCommandTypeSSHValue];
+    if (custom || ssh) {
         NSString *command = bookmark[KEY_COMMAND_LINE];
         if ([[command stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet] ] length] > 0) {
+            if (ssh) {
+                NSDictionary *dict = bookmark[KEY_SSH_CONFIG];
+                iTermSSHConfiguration *config = [[iTermSSHConfiguration alloc] initWithDictionary:dict];
+                if (!config.sshIntegration) {
+                    return [NSString stringWithFormat:@"ssh %@", command];
+                }
+                NSString *wrappedCommand = [NSString stringWithFormat:@"'%@' %@",
+                                            iTermPathToSSH(),
+                                            command];
+                command = [NSString stringWithFormat:@"/usr/bin/login -fpq %@ %@ -c %@",
+                           [NSUserName() stringWithBackslashEscapedShellCharactersIncludingNewlines:YES],
+                           [iTermOpenDirectory userShell] ?: @"/bin/zsh",
+                           [wrappedCommand stringWithBackslashEscapedShellCharactersIncludingNewlines:YES]];
+                DLog(@"wrappedCommand=%@, command=%@", wrappedCommand, command);
+            }
             return command;
         }
     }

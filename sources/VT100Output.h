@@ -2,13 +2,20 @@
 #import "VT100GridTypes.h"
 
 typedef enum {
+    MOUSE_BUTTON_UNKNOWN = -1,   // unknown button
     // X11 button number
     MOUSE_BUTTON_LEFT = 0,       // left button
     MOUSE_BUTTON_MIDDLE = 1,     // middle button
     MOUSE_BUTTON_RIGHT = 2,      // right button
     MOUSE_BUTTON_NONE = 3,       // no button pressed - for 1000/1005/1015 mode
     MOUSE_BUTTON_SCROLLDOWN = 4, // scroll down
-    MOUSE_BUTTON_SCROLLUP = 5    // scroll up
+    MOUSE_BUTTON_SCROLLUP = 5,   // scroll up
+    MOUSE_BUTTON_SCROLLLEFT = 6, // scroll left
+    MOUSE_BUTTON_SCROLLRIGHT = 7,// scroll right
+    MOUSE_BUTTON_BACKWARD = 8,   // backward (4th button)
+    MOUSE_BUTTON_FORWARD = 9,    // forward (5th button)
+    MOUSE_BUTTON_10 = 10,        // extra button 1
+    MOUSE_BUTTON_11 = 11,        // extra button 2
 } MouseButtonNumber;
 
 typedef NS_ENUM(NSInteger, MouseFormat) {
@@ -61,7 +68,7 @@ BOOL VT100OutputCursorInformationGetLineDrawingMode(VT100OutputCursorInformation
 // This class produces data to send for special keys (arrow keys, function keys, etc.)
 // It has a small amount of state that is copied from VT100Terminal. This object is 1:1 with
 // VT100Terminal.
-@interface VT100Output : NSObject
+@interface VT100Output : NSObject<NSCopying>
 
 @property(nonatomic, copy) NSString *termType;
 @property(nonatomic, assign) BOOL keypadMode;
@@ -69,6 +76,8 @@ BOOL VT100OutputCursorInformationGetLineDrawingMode(VT100OutputCursorInformation
 @property(nonatomic, assign) BOOL cursorMode;
 @property(nonatomic, assign) BOOL optionIsMetaForSpecialKeys;
 @property(nonatomic, assign) VT100EmulationLevel vtLevel;
+
+- (NSDictionary *)configDictionary;
 
 - (NSData *)keyArrowUp:(unsigned int)modflag;
 - (NSData *)keyArrowDown:(unsigned int)modflag;
@@ -119,5 +128,53 @@ BOOL VT100OutputCursorInformationGetLineDrawingMode(VT100OutputCursorInformation
 - (NSData *)reportDECDSR:(int)code :(int)subcode;
 - (NSData *)reportMacroSpace:(int)space;
 - (NSData *)reportMemoryChecksum:(int)checksum id:(int)reqid;
+- (NSData *)reportVariableNamed:(NSString *)name value:(NSString *)variableValue;
+- (NSData *)reportPasteboard:(NSString *)pasteboard contents:(NSString *)string;
+
+typedef struct {
+    uint32_t twentyFourBit;  // "T"
+    BOOL clipboardWritable;  // "Cw"
+    BOOL DECSLRM;            // "Lr"
+    BOOL mouse;              // "M"
+    uint32_t DECSCUSR;       // "Sc"
+    BOOL unicodeBasic;       // "U"
+    BOOL ambiguousWide;      // "Aw"
+    uint32_t unicodeWidths;  // "Uw"
+    uint32_t titles;         // "Ts"
+    BOOL bracketedPaste;     // "B"
+    BOOL focusReporting;     // "F"
+    BOOL strikethrough;      // "Gs"
+    BOOL overline;           // "Go"
+    BOOL sync;               // "Sy"
+    BOOL hyperlinks;         // "H"
+    BOOL notifications;      // "No"
+    BOOL sixel;              // "Sx"
+    BOOL file;               // "F"
+} VT100Capabilities;
+
+VT100Capabilities VT100OutputMakeCapabilities(BOOL compatibility24Bit,
+                                              BOOL full24Bit,
+                                              BOOL clipboardWritable,
+                                              BOOL decslrm,
+                                              BOOL mouse,
+                                              BOOL DECSCUSR14,
+                                              BOOL DECSCUSR56,
+                                              BOOL DECSCUSR0,
+                                              BOOL unicode,
+                                              BOOL ambiguousWide,
+                                              uint32_t unicodeVersion,
+                                              BOOL titleStacks,
+                                              BOOL titleSetting,
+                                              BOOL bracketedPaste,
+                                              BOOL focusReporting,
+                                              BOOL strikethrough,
+                                              BOOL overline,
+                                              BOOL sync,
+                                              BOOL hyperlinks,
+                                              BOOL notifications,
+                                              BOOL sixel,
+                                              BOOL file);
+
+- (NSData *)reportCapabilities:(VT100Capabilities)capabilities;
 
 @end

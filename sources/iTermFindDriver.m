@@ -23,7 +23,7 @@ static NSString *gSearchString;
 
 @property(nonatomic, assign) iTermFindMode mode;
 @property(nonatomic, copy) NSString *string;
-
+@property(nonatomic, copy) void (^progress)(NSRange);
 @end
 
 @implementation FindState
@@ -81,7 +81,7 @@ static NSString *gSearchString;
 }
 
 - (instancetype)initWithViewController:(NSViewController<iTermFindViewController> *)viewController
-                  filterViewController:(NSViewController<iTermFindViewController> *)filterViewController {
+                  filterViewController:(NSViewController<iTermFilterViewController> *)filterViewController {
     self = [super init];
     if (self) {
         _viewController = viewController;
@@ -183,7 +183,9 @@ static NSString *gSearchString;
     [self.viewController makeVisible];
 }
 
-- (void)closeViewAndDoTemporarySearchForString:(NSString *)string mode:(iTermFindMode)mode {
+- (void)closeViewAndDoTemporarySearchForString:(NSString *)string
+                                          mode:(iTermFindMode)mode
+                                      progress:(void (^)(NSRange linesSearched))progress {
     DLog(@"begin %@", self);
     [_viewController close];
     if (!_savedState) {
@@ -191,6 +193,7 @@ static NSString *gSearchString;
     }
     _state.mode = mode;
     _state.string = string;
+    _state.progress = progress;
     _viewController.findString = string;
     DLog(@"delegate=%@ state=%@ state.mode=%@ state.string=%@", self.delegate, _state, @(_state.mode), _state.string);
     [self.delegate findViewControllerClearSearch];
@@ -205,6 +208,24 @@ static NSString *gSearchString;
 - (void)setFilterWithoutSideEffects:(NSString *)filter {
     [self.viewController setFilter:filter];
     [_delegate findDriverSetFilter:filter withSideEffects:NO];
+}
+
+- (void)highlightWithoutSelectingSearchResultsForQuery:(NSString *)string {
+    self.findString = string;
+    if (string.length == 0) {
+        return;
+    }
+    [[iTermSearchHistory sharedInstance] addQuery:string];
+    [self setSearchDefaults];
+    [self findSubString:string
+       forwardDirection:![iTermAdvancedSettingsModel swapFindNextPrevious]
+                   mode:_state.mode
+             withOffset:-1
+    scrollToFirstResult:NO];
+}
+
+- (BOOL)shouldSearchAutomatically {
+    return [_viewController shouldSearchAutomatically];
 }
 
 - (void)userDidEditSearchQuery:(NSString *)updatedQuery
@@ -324,7 +345,7 @@ static NSString *gSearchString;
     if (!self.needsUpdateOnFocus) {
         return;
     }
-    if (!self.isVisible) {
+    if (!self.isVisible || ![self shouldSearchAutomatically]) {
         self.needsUpdateOnFocus = NO;
         return;
     }
@@ -364,7 +385,7 @@ static NSString *gSearchString;
     if (![value isEqualToString:_viewController.findString]) {
         DLog(@"%@ setFindString:%@", self, value);
         _viewController.findString = value;
-        self.needsUpdateOnFocus = YES;
+        self.needsUpdateOnFocus = self.needsUpdateOnFocus || _viewController.shouldSearchAutomatically;
     }
 }
 
@@ -438,6 +459,7 @@ static NSString *gSearchString;
 - (void)didLoseFocus {
     if (_timer == nil) {
         [_viewController setProgress:0];
+        _state.progress = nil;
     }
     _lastEditTime = 0;
 }
@@ -450,7 +472,11 @@ static NSString *gSearchString;
     if ([self.delegate findInProgress]) {
         DLog(@"Find is in progress");
         double progress;
-        more = [self.delegate continueFind:&progress];
+        NSRange range;
+        more = [self.delegate continueFind:&progress range:&range];
+        if (_state.progress) {
+            _state.progress(range);
+        }
         [_viewController setProgress:progress];
     }
     if (!more) {
@@ -530,6 +556,9 @@ static NSString *gSearchString;
         [_timer invalidate];
         _timer = nil;
         [_viewController setProgress:1];
+        if (_state.progress) {
+            _state.progress(NSMakeRange(0, NSUIntegerMax));
+        }
     }
 }
 
@@ -604,8 +633,18 @@ static NSString *gSearchString;
 
 - (NSArray<NSString *> *)completionsForText:(NSString *)text
                                       range:(NSRange)range {
-    return [[[iTermSearchHistory sharedInstance] queries] filteredArrayUsingBlock:^BOOL(NSString *historyEntry) {
-        return [[historyEntry localizedLowercaseString] it_hasPrefix:[text localizedLowercaseString]];
+    NSArray<NSString *> *history = [[iTermSearchHistory sharedInstance] queries];
+    if (text.length == 0) {
+        return history;
+    }
+    if (range.location == NSNotFound) {
+        return history;
+    }
+    NSString *prefix = [[text substringWithRange:range] localizedLowercaseString];
+    return [[history flatMapWithBlock:^NSArray *(NSString *line) {
+        return [line componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    }] filteredArrayUsingBlock:^BOOL(NSString *word) {
+        return [[word localizedLowercaseString] it_hasPrefix:prefix];
     }];
 }
 

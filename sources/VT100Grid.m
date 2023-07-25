@@ -37,7 +37,7 @@ static NSString *const kGridSizeKey = @"Size";
     int screenTop_;  // Index into lines_ and dirty_ of first line visible in the grid.
     NSMutableArray<NSMutableData *> *lines_;  // Array of NSMutableData. Each data has size_.width+1 screen_char_t's.
     NSMutableArray<VT100LineInfo *> *lineInfos_;  // Array of VT100LineInfo.
-    id<VT100GridDelegate> delegate_;
+    __weak id<VT100GridDelegate> delegate_;
     VT100GridCoord cursor_;
     VT100GridRange scrollRegionRows_;
     VT100GridRange scrollRegionCols_;
@@ -46,6 +46,7 @@ static NSString *const kGridSizeKey = @"Size";
     NSMutableData *cachedDefaultLine_;
     NSMutableData *resultLine_;
     screen_char_t savedDefaultChar_;
+    NSTimeInterval _allDirtyTimestamp;
 }
 
 @synthesize size = size_;
@@ -62,7 +63,7 @@ static NSString *const kGridSizeKey = @"Size";
     self = [super init];
     if (self) {
         delegate_ = delegate;
-        [self setSize:size];
+        [self setSize:size withSideEffects:NO];
         scrollRegionRows_ = VT100GridRangeMake(0, size_.height);
         scrollRegionCols_ = VT100GridRangeMake(0, size_.width);
         _preferredCursorPosition = VT100GridCoordMake(-1, -1);
@@ -78,7 +79,6 @@ static NSString *const kGridSizeKey = @"Size";
         NSArray<NSString *> *requiredKeys = @[ @"size", @"cursor" ];
         for (NSString *requiredKey in requiredKeys) {
             if (!dictionary[requiredKey]) {
-                [self release];
                 return nil;
             }
         }
@@ -86,28 +86,31 @@ static NSString *const kGridSizeKey = @"Size";
         assert(size_.width > 0 && size_.height > 0);
         
         NSMutableDictionary<NSNumber *, iTermExternalAttributeIndex *> *migrationIndexes = nil;
-        if (dictionary[@"lines v2"]) {
+        if (dictionary[@"lines v3"]) {
+            // 3.5.0beta6+ path
+            lines_ = [[NSArray castFrom:dictionary[@"lines v3"]] mutableCopy];
+        } else if (dictionary[@"lines v2"]) {
             // 3.5.0beta3+ path
-            lines_ = [[NSArray castFrom:dictionary[@"lines v2"]] mutableCopy];
+            lines_ = [[[NSArray castFrom:dictionary[@"lines v2"]] mapWithBlock:^id _Nonnull(NSData *data) {
+                return [data migrateV2ToV3];
+            }] mutableCopy];
         } else if (dictionary[@"lines"]) {
-            // Migration code path - upgrade legacy_screen_char_t.
+            // Migration code path for v1 -> v3 - upgrade legacy_screen_char_t.
             NSArray<NSData *> *legacyLines = [NSArray castFrom:dictionary[@"lines"]];
             if (!legacyLines) {
-                [self release];
                 return nil;
             }
             lines_ = [[NSMutableArray alloc] init];
             migrationIndexes = [NSMutableDictionary dictionary];
             [legacyLines enumerateObjectsUsingBlock:^(NSData * _Nonnull legacyData, NSUInteger idx, BOOL * _Nonnull stop) {
                 iTermExternalAttributeIndex *migrationIndex = nil;
-                [lines_ addObject:[[[legacyData modernizedScreenCharArray:&migrationIndex] mutableCopy] autorelease]];
+                [lines_ addObject:[[legacyData migrateV1ToV3:&migrationIndex] mutableCopy]];
                 if (migrationIndex) {
                     migrationIndexes[@(idx)] = migrationIndex;
                 }
             }];
         }
         if (!lines_) {
-            [self release];
             return nil;
         }
 
@@ -144,16 +147,9 @@ static NSString *const kGridSizeKey = @"Size";
             memmove(&savedDefaultChar_, data.bytes, sizeof(savedDefaultChar_));
         }
         _preferredCursorPosition = cursor_;
+        [self markAllCharsDirty:YES updateTimestamps:NO];
     }
     return self;
-}
-
-- (void)dealloc {
-    [lines_ release];
-    [lineInfos_ release];
-    [cachedDefaultLine_ release];
-    [resultLine_ release];
-    [super dealloc];
 }
 
 - (NSMutableData *)lineDataAtLineNumber:(int)lineNumber {
@@ -162,6 +158,10 @@ static NSString *const kGridSizeKey = @"Size";
     } else {
         return nil;
     }
+}
+
+- (iTermImmutableMetadata)immutableMetadataAtLineNumber:(int)lineNumber {
+    return iTermMetadataMakeImmutable([self metadataAtLineNumber:lineNumber]);
 }
 
 - (iTermMetadata)metadataAtLineNumber:(int)lineNumber {
@@ -183,12 +183,32 @@ static NSString *const kGridSizeKey = @"Size";
     return [[lines_ objectAtIndex:(screenTop_ + lineNumber) % size_.height] mutableBytes];
 }
 
-- (VT100LineInfo *)lineInfoAtLineNumber:(int)lineNumber {
-    if (lineNumber >= 0 && lineNumber < size_.height) {
-        return [lineInfos_ objectAtIndex:(screenTop_ + lineNumber) % size_.height];
+- (NSInteger)numberOfCellsUsedInRange:(VT100GridRange)range {
+    __block NSInteger sum = 0;
+
+    [self enumerateCellsInRect:VT100GridRectMake(0, range.location, self.size.width, range.length) block:^(VT100GridCoord coord, screen_char_t c, iTermExternalAttribute *ea, BOOL *stop) {
+        if (c.complexChar || c.code || c.image) {
+            sum += 1;
+        }
+    }];
+
+    return sum;
+}
+
+static int VT100GridIndex(int screenTop, int lineNumber, int height) {
+    if (lineNumber >= 0 && lineNumber < height) {
+        return (screenTop + lineNumber) % height;
     } else {
+        return -1;
+    }
+}
+
+- (VT100LineInfo *)lineInfoAtLineNumber:(int)lineNumber {
+    const int index = VT100GridIndex(screenTop_, lineNumber, size_.height);
+    if (index < 0) {
         return nil;
     }
+    return lineInfos_[index];
 }
 
 - (NSArray<VT100LineInfo *> *)metadataArray {
@@ -208,7 +228,7 @@ static NSString *const kGridSizeKey = @"Size";
     VT100LineInfo *lineInfo = [self lineInfoAtLineNumber:coord.y];
     [lineInfo setDirty:dirty
                inRange:VT100GridRangeMake(coord.x, 1)
-       updateTimestamp:updateTimestamp];
+     updateTimestampTo:updateTimestamp ? self.currentDate : 0];
 }
 
 - (void)markCharsDirty:(BOOL)dirty inRectFrom:(VT100GridCoord)from to:(VT100GridCoord)to {
@@ -217,17 +237,39 @@ static NSString *const kGridSizeKey = @"Size";
     if (!dirty) {
         allDirty_ = NO;
     }
+    const VT100GridRange xrange = VT100GridRangeMake(from.x, to.x - from.x + 1);
+    const NSTimeInterval timestamp = self.currentDate;
     for (int y = from.y; y <= to.y; y++) {
-        VT100LineInfo *lineInfo = [self lineInfoAtLineNumber:y];
-        [lineInfo setDirty:dirty
-                   inRange:VT100GridRangeMake(from.x, to.x - from.x + 1)
-           updateTimestamp:YES];
+        const int index = VT100GridIndex(screenTop_, y, size_.height);
+        if (index < 0) {
+            continue;
+        }
+        [lineInfos_[index] setDirty:dirty
+                            inRange:xrange
+                  updateTimestampTo:dirty ? timestamp : 0];
     }
 }
 
-- (void)markAllCharsDirty:(BOOL)dirty {
+- (void)markAllCharsDirty:(BOOL)dirty updateTimestamps:(BOOL)updateTimestamps {
     DLog(@"Mark all chars dirty=%@ delegate=%@", @(dirty), delegate_);
 
+    if (dirty) {
+        // Fast path
+        const VT100GridRange horizontalRange = VT100GridRangeMake(0, size_.width);
+        const NSTimeInterval timestamp = self.currentDate;
+        if (allDirty_ && (!updateTimestamps || _allDirtyTimestamp == timestamp)) {
+            // Nothing changed.
+            return;
+        }
+        allDirty_ = YES;
+        if (updateTimestamps) {
+            _allDirtyTimestamp = timestamp;
+        }
+        [lineInfos_ enumerateObjectsUsingBlock:^(VT100LineInfo * _Nonnull lineInfo, NSUInteger idx, BOOL * _Nonnull stop) {
+            [lineInfo setDirty:YES inRange:horizontalRange updateTimestampTo:updateTimestamps ? timestamp : 0];
+        }];
+        return;
+    }
     allDirty_ = dirty;
     [self markCharsDirty:dirty
               inRectFrom:VT100GridCoordMake(0, 0)
@@ -276,6 +318,9 @@ static NSString *const kGridSizeKey = @"Size";
 }
 
 - (VT100GridRange)dirtyRangeForLine:(int)y {
+    if (allDirty_) {
+        return VT100GridRangeMake(0, self.size.width);
+    }
     VT100LineInfo *lineInfo = [self lineInfoAtLineNumber:y];
     return [lineInfo dirtyRange];
 }
@@ -291,6 +336,7 @@ static NSString *const kGridSizeKey = @"Size";
 - (void)setCursorX:(int)cursorX {
     int newX = MIN(size_.width, MAX(0, cursorX));
     if (newX != cursor_.x) {
+        DLog(@"Move cursor x to %d (requested %d)", newX, cursorX);
         cursor_.x = newX;
         [delegate_ gridCursorDidMove];
     }
@@ -300,6 +346,7 @@ static NSString *const kGridSizeKey = @"Size";
     int prev = cursor_.y;
     cursor_.y = MIN(size_.height - 1, MAX(0, cursorY));
     if (cursorY != prev) {
+        DLog(@"Move cursor y to %d (requested %d)", cursor_.y, cursorY);
         [delegate_ gridCursorDidChangeLine];
         [delegate_ gridCursorDidMove];
     }
@@ -312,7 +359,7 @@ static NSString *const kGridSizeKey = @"Size";
 
 - (int)numberOfNonEmptyLinesIncludingWhitespaceAsEmpty:(BOOL)includeWhitespace {
     int numberOfLinesUsed = size_.height;
-    NSMutableCharacterSet *allowedCharacters = [[[NSMutableCharacterSet alloc] init] autorelease];
+    NSMutableCharacterSet *allowedCharacters = [[NSMutableCharacterSet alloc] init];
     [allowedCharacters addCharactersInRange:NSMakeRange(0, 1)];
     if (includeWhitespace) {
         [allowedCharacters addCharactersInString:@" \t"];
@@ -324,7 +371,9 @@ static NSString *const kGridSizeKey = @"Size";
         screen_char_t *line = [self screenCharsAtLineNumber:numberOfLinesUsed - 1];
         int i;
         for (i = 0; i < size_.width; i++) {
-            if (line[i].complexChar || ![allowedCharacters characterIsMember:line[i].code]) {
+            if (line[i].complexChar ||
+                line[i].image ||
+                ![allowedCharacters characterIsMember:line[i].code]) {
                 break;
             }
         }
@@ -336,12 +385,30 @@ static NSString *const kGridSizeKey = @"Size";
     return numberOfLinesUsed;
 }
 
+- (BOOL)lineIsEmpty:(int)n {
+    const screen_char_t *line = [self screenCharsAtLineNumber:n];
+    for (int i = 0; i < size_.width; i++) {
+        if (line[i].complexChar ||
+            line[i].image ||
+            line[i].code) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
 - (int)numberOfLinesUsed {
     return MAX(MIN(size_.height, cursor_.y + 1), [self numberOfNonEmptyLinesIncludingWhitespaceAsEmpty:NO]);
 }
 
 - (int)appendLines:(int)numLines
       toLineBuffer:(LineBuffer *)lineBuffer {
+    return [self appendLines:numLines toLineBuffer:lineBuffer makeCursorLineSoft:NO];
+}
+
+- (int)appendLines:(int)numLines
+      toLineBuffer:(LineBuffer *)lineBuffer
+makeCursorLineSoft:(BOOL)makeCursorLineSoft {
     assert(numLines <= size_.height);
 
     // Set numLines to the number of lines on the screen that are in use.
@@ -355,7 +422,7 @@ static NSString *const kGridSizeKey = @"Size";
         lengthOfNextLine = [self lengthOfLineNumber:0];
     }
     for (i = 0; i < numLines; ++i) {
-        screen_char_t* line = [self screenCharsAtLineNumber:i];
+        const screen_char_t *line = [self screenCharsAtLineNumber:i];
         int currentLineLength = lengthOfNextLine;
         if (i + 1 < size_.height) {
             lengthOfNextLine = [self lengthOfLine:[self screenCharsAtLineNumber:i+1]];
@@ -380,15 +447,17 @@ static NSString *const kGridSizeKey = @"Size";
         // an '|| (i == size.height)' conjunction. It caused issue 3788 so I
         // removed it. Unfortunately, I can't recall why it was added in the
         // first place.
-        const BOOL isPartial = ((continuation != EOL_HARD) ||
-                                (i + 1 == numLines &&
-                                 self.cursor.y == i &&
-                                 self.cursor.x == [self lengthOfLineNumber:i]));
+        BOOL isPartial = (continuation != EOL_HARD);
+        if (makeCursorLineSoft && !isPartial) {
+            isPartial = (i + 1 == numLines &&
+                         self.cursor.y == i &&
+                         self.cursor.x == [self lengthOfLineNumber:i]);
+        }
         [lineBuffer appendLine:line
                         length:currentLineLength
                        partial:isPartial
                          width:size_.width
-                      metadata:[[self lineInfoAtLineNumber:i] metadata]
+                      metadata:[[self lineInfoAtLineNumber:i] immutableMetadata]
                   continuation:line[size_.width]];
 #ifdef DEBUG_RESIZEDWIDTH
         NSLog(@"Appended a line. now have %d lines for width %d\n",
@@ -401,10 +470,6 @@ static NSString *const kGridSizeKey = @"Size";
 
 - (NSTimeInterval)timestampForLine:(int)y {
     return [[self lineInfoAtLineNumber:y] metadata].timestamp;
-}
-
-- (NSInteger)generationForLine:(int)y {
-    return [[self lineInfoAtLineNumber:y] generation];
 }
 
 - (int)lengthOfLineNumber:(int)lineNumber {
@@ -421,7 +486,7 @@ static NSString *const kGridSizeKey = @"Size";
         lineLength = size_.width - 1;
     } else {
         for (lineLength = size_.width - 1; lineLength >= 0; --lineLength) {
-            if (line[lineLength].code && line[lineLength].code != DWC_SKIP) {
+            if (line[lineLength].code && !ScreenCharIsDWC_SKIP(line[lineLength])) {
                 break;
             }
         }
@@ -465,17 +530,13 @@ static NSString *const kGridSizeKey = @"Size";
         [[self lineInfoAtLineNumber:(size_.height - 1)] resetMetadata];
     }
 
-    if (lineBuffer) {
-        // Mark new line at bottom of screen dirty.
-        [self markCharsDirty:YES
-                  inRectFrom:VT100GridCoordMake(0, size_.height - 1)
-                          to:VT100GridCoordMake(size_.width - 1, size_.height - 1)];
-    } else {
+    // Mark new line at bottom of screen dirty and update its timestamp.
+    [self markCharsDirty:YES
+              inRectFrom:VT100GridCoordMake(0, size_.height - 1)
+                      to:VT100GridCoordMake(size_.width - 1, size_.height - 1)];
+    if (!lineBuffer) {
         // Mark everything dirty if we're not using the scrollback buffer.
-        // TODO: Test what happens when the alt screen scrolls while it has a selection.
-        [self markCharsDirty:YES
-                  inRectFrom:VT100GridCoordMake(0, 0)
-                          to:VT100GridCoordMake(size_.width - 1, size_.height - 1)];
+        [self markAllCharsDirty:YES updateTimestamps:NO];
     }
 
     DLog(@"scrolled screen up by 1 line");
@@ -677,9 +738,9 @@ static NSString *const kGridSizeKey = @"Size";
                                           iTermExternalAttribute **eaOut,
                                           VT100GridCoord coord,
                                           BOOL *stop))block {
-    int left = range.start.x;
+    int left = MAX(0, range.start.x);
     for (int y = MAX(0, range.start.y); y <= MIN(range.end.y, size_.height - 1); y++) {
-        const int right = y == range.end.y ? range.end.x : size_.width;
+        const int right = MAX(left, y == range.end.y ? range.end.x : size_.width);
         screen_char_t *line = [self lineDataAtLineNumber:y].mutableBytes;
         iTermExternalAttributeIndex *eaIndex = [self externalAttributesOnLine:y createIfNeeded:NO];
         [self markCharsDirty:YES inRun:VT100GridRunMake(left, y, right - left)];
@@ -706,11 +767,11 @@ static NSString *const kGridSizeKey = @"Size";
                   to:(VT100GridCoord)unsafeTo
               toChar:(screen_char_t)c
   externalAttributes:(iTermExternalAttribute *)attrs {
-    const VT100GridCoord from = [self clamp:unsafeFrom];
-    const VT100GridCoord to = [self clamp:unsafeTo];
-    if (from.x > to.x || from.y > to.y) {
+    if (unsafeFrom.x > unsafeTo.x || unsafeFrom.y > unsafeTo.y) {
         return;
     }
+    const VT100GridCoord from = [self clamp:unsafeFrom];
+    const VT100GridCoord to = [self clamp:unsafeTo];
     for (int y = MAX(0, from.y); y <= MIN(to.y, size_.height - 1); y++) {
         screen_char_t *line = [self screenCharsAtLineNumber:y];
         [self erasePossibleDoubleWidthCharInLineNumber:y startingAtOffset:from.x - 1 withChar:c];
@@ -820,20 +881,30 @@ static NSString *const kGridSizeKey = @"Size";
     }
 }
 
-- (void)copyCharsFromGrid:(VT100Grid *)otherGrid {
+- (void)copyDirtyFromGrid:(VT100Grid *)otherGrid  didScroll:(BOOL)didScroll {
     if (otherGrid == self) {
         return;
     }
+    const BOOL sizeChanged = !VT100GridSizeEquals(self.size, otherGrid.size);
     [self setSize:otherGrid.size];
     for (int i = 0; i < size_.height; i++) {
+        const VT100GridRange dirtyRange = [otherGrid dirtyRangeForLine:i];
+        if (!didScroll && !sizeChanged && dirtyRange.length <= 0) {
+            continue;
+        }
         screen_char_t *dest = [self screenCharsAtLineNumber:i];
         screen_char_t *source = [otherGrid screenCharsAtLineNumber:i];
         memmove(dest,
                 source,
                 sizeof(screen_char_t) * (size_.width + 1));
-        [self setMetadata:[otherGrid metadataAtLineNumber:i] forLineNumber:i];
+        iTermMetadata metadata = iTermMetadataCopy([otherGrid metadataAtLineNumber:i]);
+        [self setMetadata:metadata forLineNumber:i];
+        iTermMetadataRelease(metadata);
+        if (dirtyRange.length > 0) {
+            [[self lineInfoAtLineNumber:i] setDirty:YES inRange:dirtyRange updateTimestampTo:0];
+        }
     }
-    [self markAllCharsDirty:YES];
+    [otherGrid copyMiscellaneousStateTo:self];
 }
 
 - (int)scrollLeft {
@@ -844,7 +915,7 @@ static NSString *const kGridSizeKey = @"Size";
     return VT100GridRangeMax(scrollRegionCols_);
 }
 
-- (int)appendCharsAtCursor:(screen_char_t *)buffer
+- (int)appendCharsAtCursor:(const screen_char_t *)buffer
                     length:(int)len
    scrollingIntoLineBuffer:(LineBuffer *)lineBuffer
        unlimitedScrollback:(BOOL)unlimitedScrollback
@@ -852,7 +923,7 @@ static NSString *const kGridSizeKey = @"Size";
                 wraparound:(BOOL)wraparound
                       ansi:(BOOL)ansi
                     insert:(BOOL)insert
-    externalAttributeIndex:(iTermExternalAttributeIndex *)attributes {
+    externalAttributeIndex:(id<iTermExternalAttributeIndexReading>)attributes {
     int numDropped = 0;
     assert(buffer);
     int idx;  // Index into buffer
@@ -872,14 +943,8 @@ static NSString *const kGridSizeKey = @"Size";
         NSLog(@"Begin inserting line. cursor_.x=%d, WIDTH=%d", cursor_.x, WIDTH);
 #endif
 
-        if (buffer[idx].code == DWC_SKIP) {
-            // I'm pretty sure this can never happen and that this code is just a historical leftover.
-            // This is an invalid unicode character that iTerm2 has appropriated
-            // for internal use. Change it to something invalid but safe.
-            buffer[idx].code = BOGUS_CHAR;
-        }
         int widthOffset;
-        if (idx + 1 < len && buffer[idx + 1].code == DWC_RIGHT) {
+        if (idx + 1 < len && ScreenCharIsDWC_RIGHT(buffer[idx + 1])) {
             // If we're about to insert a double width character then reduce the
             // line width for the purposes of testing if the cursor is in the
             // rightmost position.
@@ -919,7 +984,7 @@ static NSString *const kGridSizeKey = @"Size";
                     prevLine[size_.width] = [self defaultChar];
                     prevLine[size_.width].code = (splitDwc ? EOL_DWC : EOL_SOFT);
                     if (splitDwc) {
-                        prevLine[size_.width - 1].code = DWC_SKIP;
+                        ScreenCharSetDWC_SKIP(&prevLine[size_.width - 1]);
                     }
                 }
                 self.cursorX = leftMargin;
@@ -942,7 +1007,7 @@ static NSString *const kGridSizeKey = @"Size";
                 int newCursorX = rightMargin - 1;
 
                 idx = len - 1;
-                if (buffer[idx].code == DWC_RIGHT && idx > startIdx) {
+                if (ScreenCharIsDWC_RIGHT(buffer[idx]) && idx > startIdx) {
                     // The last character to insert is double width. Back up one
                     // byte in buffer and move the cursor left one position.
                     idx--;
@@ -959,7 +1024,7 @@ static NSString *const kGridSizeKey = @"Size";
                     newCursorX = 0;
                 }
                 self.cursorX = newCursorX;
-                if (line[cursor_.x].code == DWC_RIGHT) {
+                if (ScreenCharIsDWC_RIGHT(line[cursor_.x])) {
                     // This would cause us to overwrite the second part of a
                     // double-width character. Convert it to a space.
                     line[cursor_.x - 1].code = 0;
@@ -996,7 +1061,7 @@ static NSString *const kGridSizeKey = @"Size";
             // at the end of the line.
             int potentialCharsToInsert = spaceRemainingInLine;
             if (idx + potentialCharsToInsert < len &&
-                buffer[idx + potentialCharsToInsert].code == DWC_RIGHT) {
+                ScreenCharIsDWC_RIGHT(buffer[idx + potentialCharsToInsert])) {
                 // If we filled the line all the way out to WIDTH a DWC would be
                 // split. Wrap the DWC around to the next line.
 #ifdef VERBOSE_STRING
@@ -1042,7 +1107,7 @@ static NSString *const kGridSizeKey = @"Size";
             // there which may be affected.
             mayStompSplitDwc = (!useScrollRegionCols_ &&
                                 aLine[size_.width].code == EOL_DWC &&
-                                aLine[size_.width - 1].code == DWC_SKIP);
+                                ScreenCharIsDWC_SKIP(aLine[size_.width - 1]));
         } else if (!wraparound &&
                    rightMargin < size_.width &&
                    useScrollRegionCols_ &&
@@ -1064,7 +1129,7 @@ static NSString *const kGridSizeKey = @"Size";
 
         // Overwriting the second-half of a double-width character so turn the
         // DWC into a space.
-        if (aLine[cursor_.x].code == DWC_RIGHT) {
+        if (ScreenCharIsDWC_RIGHT(aLine[cursor_.x])) {
             [self eraseDWCRightOnLine:lineNumber x:cursor_.x externalAttributeIndex:eaIndex];
         }
 
@@ -1085,7 +1150,7 @@ static NSString *const kGridSizeKey = @"Size";
         if (wrapDwc) {
             [eaIndex eraseAt:cursor_.x + charsToInsert];
             if (cursor_.x + charsToInsert == size_.width - 1) {
-                aLine[cursor_.x + charsToInsert].code = DWC_SKIP;
+                ScreenCharSetDWC_SKIP(&aLine[cursor_.x + charsToInsert]);
             } else {
                 aLine[cursor_.x + charsToInsert].code = 0;
             }
@@ -1096,14 +1161,14 @@ static NSString *const kGridSizeKey = @"Size";
 
         // Overwrote some stuff that was already on the screen leaving behind the
         // second half of a DWC
-        if (cursor_.x < size_.width - 1 && aLine[cursor_.x].code == DWC_RIGHT) {
+        if (cursor_.x < size_.width - 1 && ScreenCharIsDWC_RIGHT(aLine[cursor_.x])) {
             [eaIndex eraseAt:cursor_.x];
             aLine[cursor_.x].code = 0;
             aLine[cursor_.x].complexChar = NO;
         }
 
         if (mayStompSplitDwc &&
-            aLine[size_.width - 1].code != DWC_SKIP &&
+            !ScreenCharIsDWC_SKIP(aLine[size_.width - 1]) &&
             aLine[size_.width].code == EOL_DWC) {
             // The line no longer ends in a DWC_SKIP, but the continuation mark is still EOL_DWC.
             // Change the continuation mark to EOL_SOFT since there's presumably still a DWC at the
@@ -1113,7 +1178,7 @@ static NSString *const kGridSizeKey = @"Size";
 
         // The next char in the buffer shouldn't be DWC_RIGHT because we
         // wouldn't have inserted its first half due to a check at the top.
-        assert(!(idx < len && buffer[idx].code == DWC_RIGHT));
+        assert(!(idx < len && ScreenCharIsDWC_RIGHT(buffer[idx]) ));
 
         // ANSI terminals will go to a new line after displaying a character at
         // the rightmost column.
@@ -1141,6 +1206,7 @@ static NSString *const kGridSizeKey = @"Size";
         }
     }
 
+    assert(numDropped >= 0);
     return numDropped;
 }
 
@@ -1158,18 +1224,18 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     screen_char_t *src = aLine + cursorX;
     screen_char_t *dst = aLine + cursorX + amount;
     const int elements = rightMargin - cursorX - amount;
-    if (cursorX > 0 && src[0].code == DWC_RIGHT) {
+    if (cursorX > 0 && ScreenCharIsDWC_RIGHT(src[0])) {
         // The insert occurred in the middle of a DWC.
         src[-1].code = 0;
         src[-1].complexChar = NO;
         src[0].code = 0;
         src[0].complexChar = NO;
     }
-    if (src[elements].code == DWC_RIGHT) {
+    if (ScreenCharIsDWC_RIGHT(src[elements])) {
         // Moving a DWC on top of its right half. Erase the DWC.
         src[elements - 1].code = 0;
         src[elements - 1].complexChar = NO;
-    } else if (src[elements].code == DWC_SKIP &&
+    } else if (ScreenCharIsDWC_SKIP(src[elements]) &&
                aLine[size_.width].code == EOL_DWC) {
         // Stomping on a DWC_SKIP. Join the lines normally.
         aLine[size_.width] = [self defaultChar];
@@ -1207,12 +1273,13 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     }
 }
 
-- (void)deleteChars:(int)n
+- (void)deleteChars:(int)numberOfCharactersToDelete
          startingAt:(VT100GridCoord)startCoord {
-    DLog(@"deleteChars:%d startingAt:%d,%d", n, startCoord.x, startCoord.y);
+    DLog(@"deleteChars:%d startingAt:%d,%d", numberOfCharactersToDelete, startCoord.x, startCoord.y);
 
     screen_char_t *aLine;
     const int leftMargin = [self leftMargin];
+    // rightMargin is the index of last column within the margins.
     const int rightMargin = [self rightMargin];
     screen_char_t defaultChar = [self defaultChar];
 
@@ -1223,6 +1290,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
         startCoord.y >= 0 &&
         startCoord.y < size_.height) {
         int lineNumber = startCoord.y;
+        int n = numberOfCharactersToDelete;
         if (n + startCoord.x > rightMargin) {
             n = rightMargin - startCoord.x + 1;
         }
@@ -1252,7 +1320,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
             // Try to clean up DWC_SKIP+EOL_DWC pair, if needed.
             if (rightMargin == size_.width - 1 &&
-                aLine[rightMargin].code == DWC_SKIP) {
+                ScreenCharIsDWC_SKIP(aLine[rightMargin])) {
                 // Moving DWC_SKIP left will break it.
                 aLine[rightMargin] = aLine[rightMargin + 1];
                 aLine[rightMargin].complexChar = NO;
@@ -1271,8 +1339,8 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
                       inRectFrom:VT100GridCoordMake(startCoord.x, lineNumber)
                               to:VT100GridCoordMake(startCoord.x + numCharsToMove - 1, lineNumber)];
             [eaIndex copyFrom:eaIndex source:startCoord.x + n destination:startCoord.x count:numCharsToMove];
-            // Erase chars on right side of line.
         }
+        // Erase chars on right side of line.
         [self setCharsFrom:VT100GridCoordMake(rightMargin - n + 1, lineNumber)
                         to:VT100GridCoordMake(rightMargin, lineNumber)
                     toChar:defaultChar
@@ -1307,6 +1375,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     }
 }
 
+// NOTE: `rect` is *not* inclusive of rect.end.y, unlike most uses of VT100GridRect.
 - (void)scrollRect:(VT100GridRect)rect downBy:(int)distance softBreak:(BOOL)softBreak {
     DLog(@"scrollRect:%d,%d %dx%d downBy:%d",
              rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, distance);
@@ -1335,8 +1404,6 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
         }
 
         // clear DWC's that are about to get orphaned
-        int si = sourceIndex;
-        int di = destIndex;
         for (int iteration = 0; iteration < rect.size.height; iteration++) {
             const int lineNumber = iteration + rect.origin.y;
             [self erasePossibleDoubleWidthCharInLineNumber:lineNumber
@@ -1345,8 +1412,6 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             [self erasePossibleDoubleWidthCharInLineNumber:lineNumber
                                           startingAtOffset:rightIndex
                                                   withChar:defaultChar];
-            si -= direction;
-            di -= direction;
         }
 
         // Move lines.
@@ -1447,7 +1512,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     }
 }
 
-- (void)setContentsFromDVRFrame:(screen_char_t *)s
+- (void)setContentsFromDVRFrame:(const screen_char_t *)s
                   metadataArray:(iTermMetadata *)sourceMetadataArray
                            info:(DVRFrameInfo)info {
     [self setCharsFrom:VT100GridCoordMake(0, 0)
@@ -1471,24 +1536,24 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     }
     for (int y = 0; y < MIN(info.height, size_.height); y++) {
         screen_char_t *dest = [self screenCharsAtLineNumber:y];
-        screen_char_t *src = s + ((y + sourceLineOffset) * (info.width + 1));
+        const screen_char_t *src = s + ((y + sourceLineOffset) * (info.width + 1));
         memmove(dest, src, sizeof(screen_char_t) * charsToCopyPerLine);
         if (size_.width != info.width) {
             // Not copying continuation marks, set them all to hard.
             dest[size_.width] = dest[size_.width - 1];
             dest[size_.width].code = EOL_HARD;
         }
-        if (charsToCopyPerLine < info.width && src[charsToCopyPerLine].code == DWC_RIGHT) {
+        if (charsToCopyPerLine < info.width && ScreenCharIsDWC_RIGHT(src[charsToCopyPerLine])) {
             dest[charsToCopyPerLine - 1].code = 0;
             dest[charsToCopyPerLine - 1].complexChar = NO;
         }
-        if (charsToCopyPerLine - 1 < info.width && src[charsToCopyPerLine - 1].code == TAB_FILLER) {
+        if (charsToCopyPerLine - 1 < info.width && ScreenCharIsTAB_FILLER(src[charsToCopyPerLine - 1])) {
             dest[charsToCopyPerLine - 1].code = '\t';
             dest[charsToCopyPerLine - 1].complexChar = NO;
         }
         [self setMetadata:sourceMetadataArray[y] forLine:y];
     }
-    [self markAllCharsDirty:YES];
+    [self markAllCharsDirty:YES updateTimestamps:NO];
 
     const int yOffset = MAX(0, info.height - size_.height);
     self.cursorX = MIN(size_.width - 1, MAX(0, info.cursorX));
@@ -1525,11 +1590,11 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             } else if (p[x].code && !p[x].complexChar) {
                 if (p[x].code > 0 && p[x].code < 128) {
                     line[ox] = p[x].code;
-                } else if (p[x].code == DWC_RIGHT) {
+                } else if (ScreenCharIsDWC_RIGHT(p[x])) {
                     line[ox] = '-';
-                } else if (p[x].code == TAB_FILLER) {
+                } else if (ScreenCharIsTAB_FILLER(p[x])) {
                     line[ox] = ' ';
-                } else if (p[x].code == DWC_SKIP) {
+                } else if (ScreenCharIsDWC_SKIP(p[x])) {
                     line[ox] = '>';
                 } else {
                     line[ox] = '?';
@@ -1563,6 +1628,45 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
                             adjustedLength);
 }
 
+- (int)scrollWholeScreenDownByLines:(int)count poppingFromLineBuffer:(LineBuffer *)lineBuffer {
+    int result = 0;
+    for (int i = 0; i < count; i++) {
+        if ([self scrollWholeScreenDownPoppingFromLineBuffer:lineBuffer]) {
+            result += 1;
+        } else {
+            break;
+        }
+    }
+    return result;
+}
+
+- (BOOL)scrollWholeScreenDownPoppingFromLineBuffer:(LineBuffer *)lineBuffer {
+    const int width = self.size.width;
+    if ([lineBuffer numLinesWithWidth:width] == 0 || width < 1) {
+        return NO;
+    }
+    [self scrollRect:VT100GridRectMake(0, 0, width, self.size.height)
+              downBy:1
+           softBreak:NO];
+    screen_char_t *line = [self screenCharsAtLineNumber:0];
+    int eol = 0;
+    iTermImmutableMetadata metadata;
+    screen_char_t continuation;
+    const BOOL ok = [lineBuffer popAndCopyLastLineInto:line
+                                                 width:width
+                                     includesEndOfLine:&eol
+                                              metadata:&metadata
+                                          continuation:&continuation];
+    assert(ok);
+    [[self lineInfoAtLineNumber:0] setMetadataFromImmutable:metadata];
+    line[width] = continuation;
+    line[width].code = eol;
+    if (eol == EOL_DWC) {
+        ScreenCharSetDWC_SKIP(&line[width - 1]);
+    }
+    return YES;
+}
+
 - (BOOL)restoreScreenFromLineBuffer:(LineBuffer *)lineBuffer
                     withDefaultChar:(screen_char_t)defaultChar
                   maxLinesToRestore:(int)maxLines {
@@ -1581,7 +1685,6 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
     BOOL foundCursor = NO;
     BOOL prevLineStartsWithDoubleWidth = NO;
-    int numPopped = 0;
     while (destLineNumber >= 0) {
         screen_char_t *dest = [self screenCharsAtLineNumber:destLineNumber];
         memcpy(dest, defaultLine, sizeof(screen_char_t) * size_.width);
@@ -1600,23 +1703,22 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             }
         }
         int cont;
-        iTermMetadata metadata;
+        iTermImmutableMetadata metadata;
         screen_char_t continuation;
-        ++numPopped;
         assert([lineBuffer popAndCopyLastLineInto:dest
                                             width:size_.width
                                 includesEndOfLine:&cont
                                          metadata:&metadata
                                      continuation:&continuation]);
-        [[self lineInfoAtLineNumber:destLineNumber] setMetadata:metadata];
+        [[self lineInfoAtLineNumber:destLineNumber] setMetadataFromImmutable:metadata];
         if (cont && dest[size_.width - 1].code == 0 && prevLineStartsWithDoubleWidth) {
             // If you pop a soft-wrapped line that's a character short and the
             // line below it starts with a DWC, it's safe to conclude that a DWC
             // was wrapped.
-            dest[size_.width - 1].code = DWC_SKIP;
+            ScreenCharSetDWC_SKIP(&dest[size_.width - 1]);
             cont = EOL_DWC;
         }
-        if (dest[1].code == DWC_RIGHT) {
+        if (ScreenCharIsDWC_RIGHT(dest[1])) {
             prevLineStartsWithDoubleWidth = YES;
         } else {
             prevLineStartsWithDoubleWidth = NO;
@@ -1624,7 +1726,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
         dest[size_.width] = continuation;
         dest[size_.width].code = cont;
         if (cont == EOL_DWC) {
-            dest[size_.width - 1].code = DWC_SKIP;
+            ScreenCharSetDWC_SKIP(&dest[size_.width - 1]);
         }
         --destLineNumber;
     }
@@ -1650,7 +1752,6 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 - (screen_char_t *)resultLine {
     const int length = sizeof(screen_char_t) * (size_.width + 1);
     if (resultLine_.length != length) {
-        [resultLine_ release];
         resultLine_ = [[NSMutableData alloc] initWithLength:length];
     }
     return (screen_char_t *)[resultLine_ mutableBytes];
@@ -1712,8 +1813,8 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             char c = line[x].code;
             if (line[x].code == 0) c = '.';
             if (line[x].code > 127) c = '?';
-            if (line[x].code == DWC_RIGHT) c = '-';
-            if (line[x].code == DWC_SKIP) {
+            if (ScreenCharIsDWC_RIGHT(line[x])) c = '-';
+            if (ScreenCharIsDWC_SKIP(line[x])) {
                 assert(x == size_.width - 1);
                 c = '>';
             }
@@ -1729,7 +1830,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
 - (NSString *)compactLineDumpWithTimestamps {
     NSMutableString *dump = [NSMutableString string];
-    NSDateFormatter *fmt = [[[NSDateFormatter alloc] init] autorelease];
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     [fmt setTimeStyle:NSDateFormatterLongStyle];
 
     for (int y = 0; y < size_.height; y++) {
@@ -1738,8 +1839,8 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             char c = line[x].code;
             if (line[x].code == 0) c = '.';
             if (line[x].code > 127) c = '?';
-            if (line[x].code == DWC_RIGHT) c = '-';
-            if (line[x].code == DWC_SKIP) {
+            if (ScreenCharIsDWC_RIGHT(line[x])) c = '-';
+            if (ScreenCharIsDWC_SKIP(line[x])) {
                 assert(x == size_.width - 1);
                 c = '>';
             }
@@ -1763,8 +1864,8 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
             char c = line[x].code;
             if (line[x].code == 0) c = '.';
             if (line[x].code > 127) c = '?';
-            if (line[x].code == DWC_RIGHT) c = '-';
-            if (line[x].code == DWC_SKIP) {
+            if (ScreenCharIsDWC_RIGHT(line[x])) c = '-';
+            if (ScreenCharIsDWC_SKIP(line[x])) {
                 assert(x == size_.width - 1);
                 c = '>';
             }
@@ -2023,9 +2124,9 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 #pragma mark - Private
 
 - (NSMutableArray *)linesWithSize:(VT100GridSize)size {
-    NSMutableArray *lines = [[[NSMutableArray alloc] init] autorelease];
+    NSMutableArray *lines = [[NSMutableArray alloc] init];
     for (int i = 0; i < size.height; i++) {
-        [lines addObject:[[[self defaultLineOfWidth:size.width] mutableCopy] autorelease]];
+        [lines addObject:[[self defaultLineOfWidth:size.width] mutableCopy]];
     }
     return lines;
 }
@@ -2033,7 +2134,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 - (NSMutableArray *)lineInfosWithSize:(VT100GridSize)size {
     NSMutableArray *dirty = [NSMutableArray array];
     for (int i = 0; i < size.height; i++) {
-        [dirty addObject:[[[VT100LineInfo alloc] initWithWidth:size_.width] autorelease]];
+        [dirty addObject:[[VT100LineInfo alloc] initWithWidth:size_.width]];
     }
     return dirty;
 }
@@ -2080,11 +2181,9 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
     NSMutableData *line = [NSMutableData dataWithLength:length];
 
-    [cachedDefaultLine_ release];
     cachedDefaultLine_ = nil;
     [self clearLineData:line];
-
-    cachedDefaultLine_ = [line retain];
+    cachedDefaultLine_ = line;
 
     return line;
 }
@@ -2140,7 +2239,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
                     length:len
                    partial:(continuationMark != EOL_HARD)
                      width:size_.width
-                  metadata:[[self lineInfoAtLineNumber:0] metadata]
+                  metadata:[[self lineInfoAtLineNumber:0] immutableMetadata]
               continuation:line[size_.width]];
     int dropped;
     if (!unlimitedScrollback) {
@@ -2188,13 +2287,15 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
 // Warning: does not set dirty.
 - (void)setSize:(VT100GridSize)newSize {
+    [self setSize:newSize withSideEffects:YES];
+}
+
+- (void)setSize:(VT100GridSize)newSize withSideEffects:(BOOL)withSideEffects {
     if (newSize.width != size_.width || newSize.height != size_.height) {
         DLog(@"Grid for %@ resized to %@", self.delegate, VT100GridSizeDescription(newSize));
         size_ = newSize;
-        [lines_ release];
-        [lineInfos_ release];
-        lines_ = [[self linesWithSize:newSize] retain];
-        lineInfos_ = [[self lineInfosWithSize:newSize] retain];
+        lines_ = [self linesWithSize:newSize];
+        lineInfos_ = [self lineInfosWithSize:newSize];
 
         scrollRegionRows_.location = MIN(scrollRegionRows_.location, size_.height - 1);
         scrollRegionRows_.length = MIN(scrollRegionRows_.length,
@@ -2206,7 +2307,9 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
         cursor_.x = MIN(cursor_.x, size_.width - 1);
         self.cursorY = MIN(cursor_.y, size_.height - 1);
-        [self.delegate gridDidResize];
+        if (withSideEffects) {
+            [self.delegate gridDidResize];
+        }
     }
 }
 
@@ -2246,7 +2349,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
     }
 
     screen_char_t *line = [self screenCharsAtLineNumber:cy];
-    if (line[cx].code == DWC_RIGHT) {
+    if (ScreenCharIsDWC_RIGHT(line[cx])) {
         if (cx > 0) {
             if (dwc) {
                 *dwc = YES;
@@ -2294,7 +2397,7 @@ externalAttributeIndex:(iTermExternalAttributeIndex *)ea {
 
 - (BOOL)haveDoubleWidthExtensionAt:(VT100GridCoord)coord {
     screen_char_t sct = [self characterAt:coord];
-    return !sct.complexChar && (sct.code == DWC_RIGHT || sct.code == DWC_SKIP);
+    return !sct.complexChar && (ScreenCharIsDWC_RIGHT(sct) || ScreenCharIsDWC_SKIP(sct));
 }
 
 - (VT100GridCoord)successorOf:(VT100GridCoord)origin {
@@ -2333,7 +2436,7 @@ static void DumpBuf(screen_char_t* p, int n) {
     screen_char_t *line = [self screenCharsAtLineNumber:lineNumber];
     if (line[size_.width].code == EOL_DWC) {
         line[size_.width].code = EOL_HARD;
-        if (line[size_.width - 1].code == DWC_SKIP) {  // This really should always be the case.
+        if (ScreenCharIsDWC_SKIP(line[size_.width - 1])) {  // This really should always be the case.
             line[size_.width - 1].code = 0;
             [self eraseExternalAttributesAt:VT100GridCoordMake(size_.width - 1, lineNumber)
                                       count:1];
@@ -2377,7 +2480,7 @@ static void DumpBuf(screen_char_t* p, int n) {
                                 startingAtOffset:(int)offset
                                         withChar:(screen_char_t)c {
     screen_char_t *aLine = [self screenCharsAtLineNumber:lineNumber];
-    if (offset >= 0 && offset < size_.width - 1 && aLine[offset + 1].code == DWC_RIGHT) {
+    if (offset >= 0 && offset < size_.width - 1 && ScreenCharIsDWC_RIGHT(aLine[offset + 1])) {
         aLine[offset] = c;
         aLine[offset + 1] = c;
         [self eraseExternalAttributesAt:VT100GridCoordMake(offset, lineNumber)
@@ -2449,25 +2552,31 @@ static void DumpBuf(screen_char_t* p, int n) {
 
 #pragma mark - NSCopying
 
-- (id)copyWithZone:(NSZone *)zone {
-    VT100Grid *theCopy = [[VT100Grid alloc] initWithSize:size_
-                                                delegate:delegate_];
-    [theCopy->lines_ release];
-    theCopy->lines_ = [[NSMutableArray alloc] init];
-    for (NSObject *line in lines_) {
-        [theCopy->lines_ addObject:[[line mutableCopy] autorelease]];
-    }
-    [theCopy->lineInfos_ release];
-    theCopy->lineInfos_ = [[NSMutableArray alloc] init];
-    for (VT100LineInfo *line in lineInfos_) {
-        [theCopy->lineInfos_ addObject:[[line copy] autorelease]];
-    }
-    theCopy->screenTop_ = screenTop_;
+- (VT100Grid *)copy {
+    return [self copyWithZone:nil];
+}
+
+- (void)copyMiscellaneousStateTo:(VT100Grid *)theCopy {
     theCopy->cursor_ = cursor_;  // Don't use property to avoid delegate call
     theCopy.scrollRegionRows = scrollRegionRows_;
     theCopy.scrollRegionCols = scrollRegionCols_;
     theCopy.useScrollRegionCols = useScrollRegionCols_;
     theCopy.savedDefaultChar = savedDefaultChar_;
+}
+
+- (id)copyWithZone:(NSZone *)zone {
+    VT100Grid *theCopy = [[VT100Grid alloc] initWithSize:size_
+                                                delegate:delegate_];
+    theCopy->lines_ = [[NSMutableArray alloc] init];
+    for (NSObject *line in lines_) {
+        [theCopy->lines_ addObject:[line mutableCopy]];
+    }
+    theCopy->lineInfos_ = [[NSMutableArray alloc] init];
+    for (VT100LineInfo *line in lineInfos_) {
+        [theCopy->lineInfos_ addObject:[line copy]];
+    }
+    theCopy->screenTop_ = screenTop_;
+    [self copyMiscellaneousStateTo:theCopy];
 
     return theCopy;
 }

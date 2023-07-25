@@ -32,6 +32,8 @@
 #import "iTermEventTap.h"
 #import "iTermFlagsChangedNotification.h"
 #import "iTermHotKeyController.h"
+#import "iTermKeyMappings.h"
+#import "iTermKeystroke.h"
 #import "iTermModifierRemapper.h"
 #import "iTermNotificationCenter.h"
 #import "iTermPreferences.h"
@@ -41,11 +43,12 @@
 #import "NSArray+iTerm.h"
 #import "NSEvent+iTerm.h"
 #import "NSDictionary+iTerm.h"
+#import "NSImage+iTerm.h"
 #import "NSResponder+iTerm.h"
 #import "NSTextField+iTerm.h"
 #import "NSView+iTerm.h"
 #import "NSWindow+iTerm.h"
-#import "NSImage+iTerm.h"
+#import "NSResponder+iTerm.h"
 #import "PreferencePanel.h"
 #import "PseudoTerminal.h"
 #import "PTYSession.h"
@@ -64,13 +67,13 @@ NSString *const iTermApplicationWillShowModalWindow = @"iTermApplicationWillShow
 NSString *const iTermApplicationDidCloseModalWindow = @"iTermApplicationDidCloseModalWindow";
 
 @interface iTermApplication()
-@property(nonatomic, retain) NSStatusItem *statusBarItem;
+@property(nonatomic, strong) NSStatusItem *statusBarItem;
 @end
 
 static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 
 @interface iTermApplication()
-@property(nonatomic, retain, readwrite) NSWindow *it_windowBecomingKey;
+@property(nonatomic, strong, readwrite) NSWindow *it_windowBecomingKey;
 @end
 
 @implementation iTermApplication {
@@ -81,14 +84,11 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
     // Have we received didBecomeActive without a subsequent didResignActive?
     BOOL _it_active;
     BOOL _it_restorableStateInvalid;
+    BOOL _leader;
 }
 
 - (void)dealloc {
-    [_fakeCurrentEvent release];
-    [_statusBarItem release];
     [self removeObserver:self forKeyPath:@"modalWindow"];
-    [_it_windowBecomingKey release];
-    [super dealloc];
 }
 
 + (iTermApplication *)sharedApplication {
@@ -141,6 +141,10 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 }
 
 - (void)it_applicationDidResignActive:(NSNotification *)notification {
+    DLog(@"Resign active");
+    if (_leader) {
+        [self toggleLeader];
+    }
     _it_active = NO;
 }
 
@@ -208,14 +212,28 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
     }
 }
 
+- (NSEvent *)eventByRemappingEvent:(NSEvent *)event {
+    if (![[iTermModifierRemapper sharedInstance] isAnyModifierRemapped]) {
+        DLog(@"Not remapping modifiers");
+        return event;
+    }
+    CGEventRef maybeRemappedCGEvent = [[iTermModifierRemapper sharedInstance] eventByRemappingEvent:[event CGEvent]
+                                                                                           eventTap:nil];
+    if (!maybeRemappedCGEvent) {
+        return nil;
+    }
+    event = [NSEvent eventWithCGEvent:maybeRemappedCGEvent];
+    DLog(@"Remapped modifiers to %@", event);
+    return event;
+}
+
 - (NSEvent *)eventByRemappingForSecureInput:(NSEvent *)event {
-    if ([[iTermModifierRemapper sharedInstance] isAnyModifierRemapped] &&
-        (IsSecureEventInputEnabled() || ![[iTermModifierRemapper sharedInstance] isRemappingModifiers])) {
+    if (IsSecureEventInputEnabled() || ![[iTermModifierRemapper sharedInstance] isRemappingModifiers]) {
         // The event tap is not working, but we can still remap modifiers for non-system
         // keys. Only things like cmd-tab will not be remapped in this case. Otherwise,
         // the event tap performs the remapping.
-        event = [NSEvent eventWithCGEvent:[[iTermModifierRemapper sharedInstance] eventByRemappingEvent:[event CGEvent]]];
-        DLog(@"Remapped modifiers to %@", event);
+        DLog(@"May need remapping because secure input is on or event tap not running");
+        return [self eventByRemappingEvent:event];
     }
     return event;
 }
@@ -228,20 +246,28 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
     return window;
 }
 
-- (BOOL)routeEventToShortcutInputView:(NSEvent *)event {
+- (iTermShortcutInputView *)focusedShortcutInputView {
     NSResponder *firstResponder = [[NSApp it_keyWindow] firstResponder];
     if ([firstResponder isKindOfClass:[iTermShortcutInputView class]]) {
-        iTermShortcutInputView *shortcutView = (iTermShortcutInputView *)firstResponder;
-        if (shortcutView) {
-            if (event.keyCode == iTermBogusVirtualKeyCode) {
-                // You can't register a carbon hotkey for these so just ignore them when listening for a shortcut.
-                return YES;
-            }
-            [shortcutView handleShortcutEvent:event];
-            return YES;
-        }
+        return (iTermShortcutInputView *)firstResponder;
     }
-    return NO;
+    return nil;
+}
+
+- (BOOL)routeEventToShortcutInputView:(NSEvent *)event {
+    iTermShortcutInputView *shortcutView = [self focusedShortcutInputView];
+    if (!shortcutView) {
+        DLog(@"No shortcut input view");
+        return NO;
+    }
+    if (event.keyCode == iTermBogusVirtualKeyCode) {
+        // You can't register a carbon hotkey for these so just ignore them when listening for a shortcut.
+        DLog(@"Bogus keycode");
+        return YES;
+    }
+    DLog(@"Routing event to shortcut input view");
+    [shortcutView handleShortcutEvent:event];
+    return YES;
 }
 
 - (int)digitKeyForEvent:(NSEvent *)event {
@@ -374,13 +400,48 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
     }
 
     if (okToRemap && [currentSession hasActionableKeyMappingForEvent:event]) {
-        if (currentSession.copyMode && [currentSession copyModeConsumesEvent:event]) {
+        if ([currentSession sessionModeConsumesEvent:event]) {
             return NO;
         }
         // Remap key.
         DLog(@"Remapping to actionable event");
         [currentSession keyDown:event];
         return YES;
+    }
+    return NO;
+}
+
+- (BOOL)handleLeader:(NSEvent *)event {
+    if (event.modifierFlags & iTermLeaderModifierFlag) {
+        DLog(@"Leader flag unset");
+        return NO;
+    }
+    if (_leader) {
+        DLog(@"Re-send event with leader modifier flag set");
+        NSEvent *modified = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                             location:event.locationInWindow
+                                        modifierFlags:event.modifierFlags | iTermLeaderModifierFlag
+                                            timestamp:event.timestamp
+                                         windowNumber:event.windowNumber
+                                              context:nil
+                                           characters:event.characters
+                          charactersIgnoringModifiers:event.charactersIgnoringModifiers
+                                            isARepeat:event.isARepeat
+                                              keyCode:event.keyCode];
+        [self sendEvent:modified];
+        DLog(@"Now disable leader");
+        [self toggleLeader];
+        return YES;
+    }
+    if ([[iTermKeyMappings leader] isEqual:[iTermKeystroke withEvent:event]]) {
+        // Pressed the leader
+        DLog(@"Leader pressed");
+        iTermShortcutInputView *shortcutInputView = [self focusedShortcutInputView];
+        if (!shortcutInputView || shortcutInputView.leaderAllowed) {
+            DLog(@"Not in a shortcut input view. Toggle leader.");
+            [self toggleLeader];
+            return YES;
+        }
     }
     return NO;
 }
@@ -431,9 +492,11 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 }
 
 - (BOOL)handleShortcutWithoutTerminal:(NSEvent *)event {
-    if ([[self keyWindow] isTerminalWindow]) {
+    if ([[self keyWindow] isTerminalWindow] && [[[self keyWindow] firstResponder] it_isTerminalResponder]) {
+        // Route to PTYTextView through normal channels.
         return NO;
     }
+    // A special key binding action that works regardless of first responder.
     if ([PTYSession handleShortcutWithoutTerminal:event]) {
         DLog(@"handled by session");
         return YES;
@@ -458,8 +521,23 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 
 
 - (BOOL)handleFlagsChangedEvent:(NSEvent *)event {
+    if (_leader && !(event.modifierFlags & iTermLeaderModifierFlag)) {
+        DLog(@"Flags changed while leader on. Rewrite event with leader flag and resend");
+        NSEvent *flagChangedPlusHelp = [NSEvent keyEventWithType:NSEventTypeFlagsChanged
+                                                        location:event.locationInWindow
+                                                   modifierFlags:event.modifierFlags | iTermLeaderModifierFlag
+                                                       timestamp:event.timestamp
+                                                    windowNumber:event.windowNumber
+                                                         context:nil
+                                                      characters:@""
+                                     charactersIgnoringModifiers:@""
+                                                       isARepeat:NO
+                                                         keyCode:event.keyCode];
+        [self sendEvent:flagChangedPlusHelp];
+        return YES;
+    }
     if ([self routeEventToShortcutInputView:event]) {
-        [[iTermFlagsChangedEventTap sharedInstance] resetCount];
+        [[iTermFlagsChangedEventTap sharedInstanceCreatingIfNeeded:NO] resetCount];
         return YES;
     }
     DLog(@"Posting flags-changed notification for event %@", event);
@@ -469,6 +547,13 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 
 - (BOOL)handleKeyDownEvent:(NSEvent *)event {
     DLog(@"Received KeyDown event: %@. Key window is %@. First responder is %@", event, [self keyWindow], [[self keyWindow] firstResponder]);
+    if ((event.modifierFlags & iTermLeaderModifierFlag)) {
+        DLog(@"Leader flag set");
+    }
+
+    if ([self handleLeader:event]) {
+        return YES;
+    }
 
     if ([self dispatchHotkeyLocally:event]) {
         return YES;
@@ -517,20 +602,59 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 
 // override to catch key press events very early on
 - (void)sendEvent:(NSEvent *)event {
-    if ([event type] == NSEventTypeFlagsChanged) {
-        event = [self eventByRemappingForSecureInput:event];
-        if ([self handleFlagsChangedEvent:event]) {
-            return;
-        }
-    } else if ([event type] == NSEventTypeKeyDown) {
-        event = [self eventByRemappingForSecureInput:event];
-        if ([self handleKeyDownEvent:event]) {
-            return;
-        }
-        DLog(@"NSKeyDown event taking the regular path");
-    } else if (event.type == NSEventTypeScrollWheel && (event.momentumPhase == NSEventPhaseChanged ||
-                                                        event.momentumPhase == NSEventPhaseEnded)) {
-        [self handleScrollWheelEvent:event];
+    switch (event.type) {
+        case NSEventTypeFlagsChanged:
+            if (_leader) {
+                [self makeCursorSparkles];
+            }
+            event = [self eventByRemappingForSecureInput:event];
+            if (!event) {
+                DLog(@"Disard event");
+                return;
+            }
+            if ([self handleFlagsChangedEvent:event]) {
+                return;
+            }
+            break;
+        case NSEventTypeKeyDown:
+            event = [self eventByRemappingForSecureInput:event];
+            if (!event) {
+                DLog(@"Disard event");
+                return;
+            }
+            if ([self handleKeyDownEvent:event]) {
+                return;
+            }
+            DLog(@"NSKeyDown event taking the regular path");
+            break;
+        case NSEventTypeKeyUp:
+            if (_leader) {
+                [self makeCursorSparkles];
+            }
+            break;
+        case NSEventTypeScrollWheel:
+            event = [self eventByRemappingEvent:event];
+            if (event.momentumPhase == NSEventPhaseChanged ||
+                event.momentumPhase == NSEventPhaseEnded) {
+                [self handleScrollWheelEvent:event];
+            }
+            break;
+        case NSEventTypeMouseMoved:
+        case NSEventTypeMouseExited:
+        case NSEventTypeMouseEntered:
+        case NSEventTypeLeftMouseUp:
+        case NSEventTypeLeftMouseDown:
+        case NSEventTypeLeftMouseDragged:
+        case NSEventTypeRightMouseUp:
+        case NSEventTypeRightMouseDown:
+        case NSEventTypeRightMouseDragged:
+        case NSEventTypeOtherMouseUp:
+        case NSEventTypeOtherMouseDown:
+        case NSEventTypeOtherMouseDragged:
+            event = [self eventByRemappingEvent:event];
+            break;
+        default:
+            break;
     }
 
     [super sendEvent:event];
@@ -577,13 +701,13 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 
         if ([iTermAdvancedSettingsModel statusBarIcon]) {
             NSImage *image = [NSImage it_imageNamed:@"StatusItem" forClass:self.class];
+            image.template = YES;
             self.statusBarItem = [[NSStatusBar systemStatusBar] statusItemWithLength:image.size.width];
             _statusBarItem.button.title = @"";
             _statusBarItem.button.image = image;
-            _statusBarItem.button.alternateImage = [NSImage it_imageNamed:@"StatusItemAlt" forClass:self.class];
             ((NSButtonCell *)_statusBarItem.button.cell).highlightsBy = NSChangeBackgroundCellMask;
 
-            _statusBarItem.menu = [[self delegate] statusBarMenu];
+            _statusBarItem.menu = [(id<iTermApplicationDelegate>)[self delegate] statusBarMenu];
         }
     } else if (_statusBarItem != nil) {
         [[NSStatusBar systemStatusBar] removeStatusItem:_statusBarItem];
@@ -637,9 +761,9 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
     const NSTimeInterval deadlineToOpen = ([NSDate timeIntervalSinceReferenceDate] +
                                            [iTermAdvancedSettingsModel timeToWaitForEmojiPanel]);
     [iTermWindowHacks pollForCharacterPanelToOpenOrCloseWithCompletion:^BOOL(BOOL open) {
-        if (open && _it_characterPanelShouldOpenSoon) {
-            _it_characterPanelShouldOpenSoon = NO;
-            _it_characterPanelIsOpen = YES;
+        if (open && self->_it_characterPanelShouldOpenSoon) {
+            self->_it_characterPanelShouldOpenSoon = NO;
+            self->_it_characterPanelIsOpen = YES;
         } else if (!open && self.it_characterPanelIsOpen) {
             self->_it_characterPanelShouldOpenSoon = NO;
             self->_it_characterPanelIsOpen = NO;
@@ -651,15 +775,101 @@ static const char *iTermApplicationKVOKey = "iTermApplicationKVOKey";
 }
 
 - (void)it_makeWindowKey:(NSWindow *)window {
-    NSWindow *saved = [self.it_windowBecomingKey retain];
+    NSWindow *saved = self.it_windowBecomingKey;
     self.it_windowBecomingKey = window;
     [window makeKeyAndOrderFront:nil];
-    self.it_windowBecomingKey = [saved autorelease];
+    self.it_windowBecomingKey = saved;
 }
 
 - (void)invalidateRestorableState {
     [super invalidateRestorableState];
     _it_restorableStateInvalid = YES;
+}
+
+- (void)toggleLeader {
+    if (_leader) {
+        DLog(@"leader up");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.01 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[NSCursor arrowCursor] set];
+        });
+        NSEvent *event = [self currentEvent];
+        NSEvent *flagUp = [NSEvent keyEventWithType:NSEventTypeFlagsChanged
+                                           location:event.locationInWindow
+                                      modifierFlags:event.modifierFlags & ~iTermLeaderModifierFlag
+                                          timestamp:event.timestamp
+                                       windowNumber:event.windowNumber
+                                            context:nil
+                                         characters:@""
+                        charactersIgnoringModifiers:@""
+                                          isARepeat:NO
+                                            keyCode:kVK_Help];
+        [self sendEvent:flagUp];
+    } else {
+        DLog(@"leader down");
+        [self makeCursorSparkles];
+        NSEvent *event = [self currentEvent];
+        NSEvent *flagDown = [NSEvent keyEventWithType:NSEventTypeFlagsChanged
+                                             location:event.locationInWindow
+                                        modifierFlags:event.modifierFlags | iTermLeaderModifierFlag
+                                            timestamp:event.timestamp
+                                         windowNumber:event.windowNumber
+                                              context:nil
+                                           characters:@""
+                          charactersIgnoringModifiers:@""
+                                            isARepeat:NO
+                                              keyCode:kVK_Help];
+        [self sendEvent:flagDown];
+    }
+    _leader = !_leader;
+}
+
+- (void)makeCursorSparkles {
+    if (@available(macOS 11.0, *)) {
+        static NSCursor *sparkles;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            NSImage *image = [NSImage imageWithSystemSymbolName:@"sparkles"
+                                       accessibilityDescription:@"Leader pending"];
+            NSImage *black = [image it_imageWithTintColor:[NSColor blackColor]];
+            NSImage *white = [image it_imageWithTintColor:[NSColor whiteColor]];
+            NSSize size = image.size;
+            size.width *= 1.25;
+            size.height *= 1.25;
+            NSImage *composite = [NSImage imageOfSize:NSMakeSize(size.width + 1, size.height + 1)
+                                            drawBlock:^{
+                for (int dx = 0; dx <= 2; dx++) {
+                    for (int dy = 0; dy <= 2; dy++){
+                        if (dx == 1 && dy == 1) {
+                            continue;
+                        }
+                        [white drawInRect:NSMakeRect(dx / 2,
+                                                     dy / 2,
+                                                     size.width,
+                                                     size.height)
+                                 fromRect:NSZeroRect
+                                operation:NSCompositingOperationSourceOver
+                                 fraction:1];
+                    }
+                }
+                [black drawInRect:NSMakeRect(1.0 / 2,
+                                             1.0 / 2,
+                                             size.width,
+                                             size.height)
+                         fromRect:NSZeroRect
+                        operation:NSCompositingOperationSourceOver
+                         fraction:1];
+            }];
+            sparkles = [[NSCursor alloc] initWithImage:composite hotSpot:NSMakePoint(size.width / 2.0, size.height / 2.0)];
+        });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [sparkles set];
+        });
+    }
+}
+
+- (void)reportException:(NSException *)exception {
+    CrashLog(@"reportException: %@", exception.debugDescription);
+    [super reportException:exception];
 }
 
 @end

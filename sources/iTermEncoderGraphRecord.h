@@ -6,8 +6,11 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "iTermTuple.h"
 
 NS_ASSUME_NONNULL_BEGIN
+
+@class iTermChangeTrackingDictionary;
 
 @interface iTermEncoderGraphRecord: NSObject
 @property (nonatomic, readonly) NSDictionary<NSString *, id> *pod;
@@ -17,7 +20,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSString *key;
 @property (nonatomic, readonly, weak) iTermEncoderGraphRecord *parent;
 @property (nullable, nonatomic, readonly) id propertyListValue;
-@property (nonatomic, strong) NSNumber *rowid;
+@property (nullable, nonatomic, strong) NSNumber *rowid;
 @property (nonatomic, readonly) NSData *data;  // encoded pod
 @property (nonatomic, readonly) NSString *compactDescription;
 
@@ -33,6 +36,7 @@ NS_ASSUME_NONNULL_BEGIN
 // You probably want to use arrayWithKey or dictionaryWithKey. This is very low level.
 - (iTermEncoderGraphRecord * _Nullable)childRecordWithKey:(NSString *)key
                                                identifier:(NSString *)identifier;
+- (void)ensureIndexOfGraphRecords;
 
 - (void)enumerateArrayWithKey:(NSString *)key
                         block:(void (^NS_NOESCAPE)(NSString *identifier,
@@ -46,6 +50,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)stringWithKey:(NSString *)key;
 - (nullable id)objectWithKey:(NSString *)key class:(Class)theClass;
 - (void)eraseRowIDs;
+
+- (NSMutableDictionary<iTermTuple<NSString *, NSString *> *, iTermEncoderGraphRecord *> *)index;
+
 @end
 
 @interface NSObject (iTermEncoderGraphRecord)

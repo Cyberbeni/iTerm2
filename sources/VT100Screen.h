@@ -1,12 +1,16 @@
 #import <Cocoa/Cocoa.h>
+#import "iTermColorMap.h"
 #import "iTermEncoderAdapter.h"
 #import "iTermIntervalTreeObserver.h"
 #import "iTermMetadata.h"
-#import "PTYNoteViewController.h"
+#import "HighlightTrigger.h"
+#import "PTYAnnotation.h"
 #import "PTYTextViewDataSource.h"
+#import "PTYTriggerEvaluator.h"
 #import "SCPPath.h"
 #import "ScreenCharArray.h"
 #import "VT100ScreenDelegate.h"
+#import "VT100SyncResult.h"
 #import "VT100Terminal.h"
 #import "VT100Token.h"
 
@@ -14,20 +18,26 @@
 @class iTermNotificationController;
 @class iTermMark;
 @class iTermStringLine;
+@protocol iTermTemporaryDoubleBufferedGridControllerReading;
 @class LineBuffer;
 @class IntervalTree;
 @class PTYTask;
+@protocol PortholeMarkReading;
 @class VT100Grid;
-@class VT100RemoteHost;
+@class VT100MutableScreenConfiguration;
+@protocol VT100RemoteHostReading;
 @class VT100ScreenMark;
-@protocol iTermMark;
+@protocol VT100ScreenMarkReading;
+@protocol VT100ScreenConfiguration;
+@class VT100ScreenMutableState;
 @class VT100Terminal;
 @class iTermAsyncFilter;
+@protocol iTermEchoProbeDelegate;
+@class iTermExpect;
 @protocol iTermFilterDestination;
-
-// Dictionary keys for -highlightTextInRange:basedAtAbsoluteLineNumber:absoluteLineNumber:color:
-extern NSString * const kHighlightForegroundColor;
-extern NSString * const kHighlightBackgroundColor;
+@protocol iTermMark;
+@class iTermSlownessDetector;
+@class iTermTokenExecutor;
 
 // Key into dictionaryValue to get screen state.
 extern NSString *const kScreenStateKey;
@@ -37,43 +47,31 @@ extern int kVT100ScreenMinRows;
 extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 
 @interface VT100Screen : NSObject <
-    PTYNoteViewControllerDelegate,
     PTYTextViewDataSource,
-    VT100GridDelegate,
-    VT100TerminalDelegate> {
-@private
-    // This is here because the unit test needs to manipulate it.
-    // Scrollback buffer
-    LineBuffer* linebuffer_;
-}
+    PTYTriggerEvaluatorDataSource>
 
-@property(nonatomic, retain) VT100Terminal *terminal;
+@property(nonatomic) BOOL terminalEnabled;
 @property(nonatomic, assign) BOOL audibleBell;
 @property(nonatomic, assign) BOOL showBellIndicator;
 @property(nonatomic, assign) BOOL flashBell;
-@property(nonatomic, assign) id<VT100ScreenDelegate> delegate;
-@property(nonatomic, weak) id<iTermIntervalTreeObserver> intervalTreeObserver;
+@property(atomic, weak) id<VT100ScreenDelegate> delegate;
 @property(nonatomic, assign) BOOL postUserNotifications;
 @property(nonatomic, assign) BOOL cursorBlinks;
 @property(nonatomic, assign) BOOL allowTitleReporting;
-@property(nonatomic, assign) unsigned int maxScrollbackLines;
-@property(nonatomic, assign) BOOL unlimitedScrollback;
-@property(nonatomic, assign) BOOL useColumnScrollRegion;
-@property(nonatomic, assign) BOOL saveToScrollbackInAlternateScreen;
+@property(nonatomic, readonly) unsigned int maxScrollbackLines;
+@property(nonatomic, readonly) BOOL unlimitedScrollback;
+@property(nonatomic, readonly) BOOL useColumnScrollRegion;
+@property(nonatomic, readonly) BOOL saveToScrollbackInAlternateScreen;
+// Main thread only! Unlike all other state in VT100Screen, this one is never seen by the screen mutator.
 @property(nonatomic, retain) DVR *dvr;
 @property(nonatomic, assign) BOOL trackCursorLineMovement;
-@property(nonatomic, assign) BOOL appendToScrollbackWithStatusBar;
+@property(nonatomic, readonly) BOOL appendToScrollbackWithStatusBar;
 @property(nonatomic, readonly) VT100GridAbsCoordRange lastCommandOutputRange;
-@property(nonatomic, assign) iTermUnicodeNormalization normalization;
 @property(nonatomic, readonly) BOOL shellIntegrationInstalled;  // Just a guess.
 @property(nonatomic, readonly) NSIndexSet *animatedLines;
 @property(nonatomic, readonly) VT100GridAbsCoord startOfRunningCommandOutput;
 @property(nonatomic, readonly) int lineNumberOfCursor;
 @property(nonatomic, readonly) NSSize viewSize;
-
-// Valid while at the command prompt only. Gives the range of the current prompt. Meaningful
-// only if the end is not equal to the start.
-@property(nonatomic, readonly) VT100GridAbsCoordRange currentPromptRange;
 
 // Valid only if its x component is nonnegative.
 // Gives the coordinate where the current command begins.
@@ -83,71 +81,49 @@ extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 // contents are reflowed, and the selection is updated. It is a little slow so be judicious.
 @property(nonatomic, assign) VT100GridSize size;
 
-// Designated initializer.
-- (instancetype)initWithTerminal:(VT100Terminal *)terminal;
+@property(nonatomic, weak) id<iTermIntervalTreeObserver> intervalTreeObserver;
 
-// Destructively sets the screen size.
-- (void)destructivelySetScreenWidth:(int)width height:(int)height;
+@property(nonatomic, retain, readonly) id<iTermColorMapReading> colorMap;
+@property(nonatomic, readonly) id<iTermTemporaryDoubleBufferedGridControllerReading> temporaryDoubleBuffer;
+@property(nonatomic, readonly) id<VT100ScreenConfiguration> config;
+@property(nonatomic, readonly) long long fakePromptDetectedAbsLine;
+@property(nonatomic, readonly) long long lastPromptLine;
+@property(nonatomic, readonly) BOOL echoProbeIsActive;
 
-// Convert a run to one without nulls on either end.
-- (VT100GridRun)runByTrimmingNullsFromRun:(VT100GridRun)run;
+@property (nonatomic, readonly) BOOL terminalSoftAlternateScreenMode;
+@property (nonatomic, readonly) MouseMode terminalMouseMode;
+@property (nonatomic, readonly) NSStringEncoding terminalEncoding;
+@property (nonatomic, readonly) BOOL terminalSendReceiveMode;
+@property (nonatomic, readonly) VT100Output *terminalOutput;
+@property (nonatomic, readonly) BOOL terminalAllowPasteBracketing;
+@property (nonatomic, readonly) BOOL terminalBracketedPasteMode;
+@property (nonatomic, readonly) NSMutableArray<NSNumber *> *terminalSendModifiers;
+@property (nonatomic, readonly) VT100TerminalKeyReportingFlags terminalKeyReportingFlags;
+@property (nonatomic, readonly) BOOL terminalReportFocus;
+@property (nonatomic, readonly) BOOL terminalReportKeyUp;
+@property (nonatomic, readonly) BOOL terminalCursorMode;
+@property (nonatomic, readonly) BOOL terminalKeypadMode;
+@property (nonatomic, readonly) BOOL terminalReceivingFile;
+@property (nonatomic, readonly) BOOL terminalMetaSendsEscape;
+@property (nonatomic, readonly) BOOL terminalReverseVideo;
+@property (nonatomic, readonly) BOOL terminalAlternateScrollMode;
+@property (nonatomic, readonly) BOOL terminalAutorepeatMode;
+@property (nonatomic, readonly) int terminalCharset;
+@property (nonatomic, readonly) NSDictionary *terminalState;
+
+// Where the next tail-find needs to begin.
+@property (nonatomic) long long savedFindContextAbsPos;
+@property (nonatomic, strong) FindContext *findContext;
+@property (nonatomic, readonly) BOOL sendingIsBlocked;
+
+@property (nonatomic, readonly) BOOL isAtCommandPrompt;
 
 // Indicates if line drawing mode is enabled for any character set, or if the current character set
 // is not G0.
 - (BOOL)allCharacterSetPropertiesHaveDefaultValues;
 
-- (void)showCursor:(BOOL)show;
-
 // Preserves the prompt, but erases screen and scrollback buffer.
 - (void)clearBuffer;
-- (void)clearBufferSavingPrompt:(BOOL)savePrompt;
-
-// Clears the scrollback buffer, leaving screen contents alone.
-- (void)clearScrollbackBuffer;
-
-- (void)appendScreenChars:(screen_char_t *)line
-                   length:(int)length
-   externalAttributeIndex:(iTermExternalAttributeIndex *)externalAttributes
-             continuation:(screen_char_t)continuation;
-- (void)setContentsFromLineBuffer:(LineBuffer *)lineBuffer;
-
-// Append a string to the screen at the current cursor position. The terminal's insert and wrap-
-// around modes are respected, the cursor is advanced, the screen may be scrolled, and the line
-// buffer may change.
-- (void)appendStringAtCursor:(NSString *)string;
-- (void)appendAsciiDataAtCursor:(AsciiData *)asciiData;
-
-- (void)removeLastLine;
-
-// This is a hacky thing that moves the cursor to the next line, not respecting scroll regions.
-// It's used for the tmux status screen.
-- (void)crlf;
-
-// Move the cursor down one position, scrolling if needed. Scroll regions are respected.
-- (void)linefeed;
-
-// Sets the primary grid's contents and scrollback history. |history| is an array of NSData
-// containing screen_char_t's. It contains a bizarre workaround for tmux bugs.
-- (void)setHistory:(NSArray *)history;
-
-// Sets the alt grid's contents. |lines| is NSData with screen_char_t's.
-- (void)setAltScreen:(NSArray *)lines;
-
-// Load state from tmux. The |state| dictionary has keys from the kStateDictXxx values.
-- (void)setTmuxState:(NSDictionary *)state;
-
-// Set the colors in the range relative to the start of the given line number.
-// See kHighlightXxxColor constants at the top of this file for dict keys, values are NSColor*s.
-- (void)highlightTextInRange:(NSRange)range
-   basedAtAbsoluteLineNumber:(long long)absoluteLineNumber
-                      colors:(NSDictionary *)colors;
-
-- (void)linkTextInRange:(NSRange)range
-   basedAtAbsoluteLineNumber:(long long)absoluteLineNumber
-                     URLCode:(unsigned int)code;
-
-// Load a frame from a dvr decoder.
-- (void)setFromFrame:(screen_char_t*)s len:(int)len metadata:(NSArray<NSArray *> *)metadataArrays info:(DVRFrameInfo)info;
 
 // Save the position of the end of the scrollback buffer without the screen appended.
 - (void)storeLastPositionInLineBufferAsFindContextSavedPosition;
@@ -166,14 +142,7 @@ extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 - (NSString *)compactLineDumpWithHistoryAndContinuationMarks;
 
 // This is provided for testing only.
-- (VT100Grid *)currentGrid;
-
-// Called when a bell is to be run. Applies rate limiting and kicks off the bell indicators
-// (notifications, flashing lights, sounds) per user preference.
-- (void)activateBell;
-
-// Show an inline image. image and data are mutually exclusive.
-- (void)appendNativeImageAtCursorWithName:(NSString *)name width:(int)width;
+- (id<VT100GridReading>)currentGrid;
 
 - (void)resetAnimatedLines;
 
@@ -182,26 +151,24 @@ extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 
 #pragma mark - Marks and notes
 
-- (VT100ScreenMark *)lastMark;
-- (VT100ScreenMark *)lastPromptMark;
-- (VT100RemoteHost *)lastRemoteHost;
-- (VT100ScreenMark *)promptMarkWithGUID:(NSString *)guid;
+- (id<VT100ScreenMarkReading>)lastMark;
+- (id<VT100ScreenMarkReading>)lastPromptMark;
+- (id<VT100RemoteHostReading>)lastRemoteHost;
+- (id<VT100ScreenMarkReading>)promptMarkWithGUID:(NSString *)guid;
+- (id<VT100ScreenMarkReading>)namedMarkWithGUID:(NSString *)guid;
 - (BOOL)markIsValid:(iTermMark *)mark;
-- (id<iTermMark>)addMarkStartingAtAbsoluteLine:(long long)line
-                                       oneLine:(BOOL)oneLine
-                                       ofClass:(Class)markClass;
 - (VT100GridRange)lineNumberRangeOfInterval:(Interval *)interval;
 - (void)enumeratePromptsFrom:(NSString *)maybeFirst
                           to:(NSString *)maybeLast
-                       block:(void (^ NS_NOESCAPE)(VT100ScreenMark *mark))block;
-// These methods normally only return one object, but if there is a tie, all of the equally-positioned marks/notes are returned.
-- (NSArray *)lastMarksOrNotes;
-- (NSArray *)firstMarksOrNotes;
+                       block:(void (^ NS_NOESCAPE)(id<VT100ScreenMarkReading> mark))block;
+- (void)enumeratePortholes:(void (^ NS_NOESCAPE)(id<PortholeMarkReading> mark))block;
 
-- (NSArray *)lastMarks;
-- (NSArray *)firstMarks;
-- (NSArray *)lastAnnotations;
-- (NSArray *)firstAnnotations;
+// These methods normally only return one object, but if there is a tie, all of the equally-positioned marks/notes are returned.
+
+- (NSArray<id<VT100ScreenMarkReading>> *)lastMarks;
+- (NSArray<id<VT100ScreenMarkReading>> *)firstMarks;
+- (NSArray<id<PTYAnnotationReading>> *)lastAnnotations;
+- (NSArray<id<PTYAnnotationReading>> *)firstAnnotations;
 
 - (NSArray *)marksOrNotesBefore:(Interval *)location;
 - (NSArray *)marksOrNotesAfter:(Interval *)location;
@@ -214,12 +181,10 @@ extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 
 - (BOOL)containsMark:(id<iTermMark>)mark;
 - (void)clearToLastMark;
-- (void)clearFromAbsoluteLineToEnd:(long long)absLine;
 
-- (void)setWorkingDirectory:(NSString *)workingDirectory onLine:(int)line pushed:(BOOL)pushed;
 - (NSString *)workingDirectoryOnLine:(int)line;
-- (VT100RemoteHost *)remoteHostOnLine:(int)line;
-- (VT100ScreenMark *)lastCommandMark;  // last mark representing a command
+- (id<VT100RemoteHostReading>)remoteHostOnLine:(int)line;
+- (id<VT100ScreenMarkReading>)lastCommandMark;  // last mark representing a command
 
 - (BOOL)encodeContents:(id<iTermEncoderAdapter>)encoder
           linesDropped:(int *)linesDroppedOut;
@@ -229,35 +194,69 @@ extern const NSInteger VT100ScreenBigFileDownloadThreshold;
 // such as selections.
 - (void)restoreFromDictionary:(NSDictionary *)dictionary
      includeRestorationBanner:(BOOL)includeRestorationBanner
-                knownTriggers:(NSArray *)triggers
                    reattached:(BOOL)reattached;
-- (void)restoreInitialSize;
-
-// Zero-based (as VT100GridCoord always is), unlike -cursorX and -cursorY.
-- (void)setCursorPosition:(VT100GridCoord)coord;
 
 // Uninitialize timestamps.
 - (void)resetTimestamps;
-- (NSInteger)generationForLine:(int)y;
 
-- (void)enumerateLinesInRange:(NSRange)range block:(void (^)(int line, ScreenCharArray *, iTermMetadata, BOOL *))block;
+- (void)enumerateLinesInRange:(NSRange)range block:(void (^)(int line, ScreenCharArray *, iTermImmutableMetadata, BOOL *))block;
 
-// Fake shell integration via triggers APIs
-- (void)promptDidStartAt:(VT100GridAbsCoord)coord;
-- (void)commandDidStartAt:(VT100GridAbsCoord)coord;
-- (BOOL)commandDidEndAtAbsCoord:(VT100GridAbsCoord)coord;
-
-- (VT100GridCoordRange)coordRangeForInterval:(Interval *)interval;
-
-- (BOOL)confirmBigDownloadWithBeforeSize:(NSInteger)sizeBefore
-                               afterSize:(NSInteger)afterSize
-                                    name:(NSString *)name;
 - (void)enumerateObservableMarks:(void (^ NS_NOESCAPE)(iTermIntervalTreeObjectType, NSInteger))block;
+- (void)setColorsFromDictionary:(NSDictionary<NSNumber *, id> *)dict;
+- (void)setColor:(NSColor *)color forKey:(int)key;
+- (void)userDidPressReturn;
+
+- (BOOL)shouldExpectPromptMarks;
+
+- (NSString *)commandInRange:(VT100GridCoordRange)range;
+- (BOOL)haveCommandInRange:(VT100GridCoordRange)range;
+- (VT100GridCoordRange)commandRange;
+- (VT100GridCoordRange)extendedCommandRange;
+- (void)injectData:(NSData *)data;
+
+typedef NS_ENUM(NSUInteger, VT100ScreenTriggerCheckType) {
+    VT100ScreenTriggerCheckTypeNone,
+    VT100ScreenTriggerCheckTypePartialLines,
+    VT100ScreenTriggerCheckTypeFullLines
+};
+
+- (VT100ScreenState *)switchToSharedState;
+- (void)restoreState:(VT100ScreenState *)state;
+
+- (VT100SyncResult)synchronizeWithConfig:(VT100MutableScreenConfiguration *)sourceConfig
+                                  expect:(iTermExpect *)maybeExpect
+                           checkTriggers:(VT100ScreenTriggerCheckType)checkTriggers
+                           resetOverflow:(BOOL)resetOverflow
+                            mutableState:(VT100ScreenMutableState *)mutableState;
+- (void)performBlockWithJoinedThreads:(void (^ NS_NOESCAPE)(VT100Terminal *terminal,
+                                                            VT100ScreenMutableState *mutableState,
+                                                            id<VT100ScreenDelegate> delegate))block;
+- (void)performLightweightBlockWithJoinedThreads:(void (^ NS_NOESCAPE)(VT100ScreenMutableState *mutableState))block;
+- (void)mutateAsynchronously:(void (^)(VT100Terminal *terminal,
+                                       VT100ScreenMutableState *mutableState,
+                                       id<VT100ScreenDelegate> delegate))block;
+- (void)beginEchoProbeWithBackspace:(NSData *)backspace
+                           password:(NSString *)password
+                           delegate:(id<iTermEchoProbeDelegate>)echoProbeDelegate;
+- (void)sendPasswordInEchoProbe;
+- (void)setEchoProbeDelegate:(id<iTermEchoProbeDelegate>)echoProbeDelegate;
+- (void)resetEchoProbe;
+- (void)threadedReadTask:(char *)buffer length:(int)length;
+
+- (void)destructivelySetScreenWidth:(int)width
+                             height:(int)height
+                       mutableState:(VT100ScreenMutableState *)mutableState;
+- (NSDictionary<NSString *, NSString *> *)exfiltratedEnvironmentVariables:(NSArray<NSString *> *)names;
+
+// These record the state that should be restored when ssh ends.
+- (void)restoreSavedState:(NSDictionary *)savedState;
+- (NSArray<id<VT100ScreenMarkReading>> *)namedMarks;
 
 @end
 
 @interface VT100Screen (Testing)
 
-- (void)setMayHaveDoubleWidthCharacters:(BOOL)value;
+// Destructively sets the screen size.
+- (void)destructivelySetScreenWidth:(int)width height:(int)height;
 
 @end

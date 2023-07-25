@@ -54,37 +54,33 @@ extern const int kColorMapAnsiBrightModifier;
 extern const int kColorMap24bitBase;
 
 @class iTermColorMap;
+@protocol iTermColorMapReading;
+@class VT100SavedColorsSlot;
 
 @protocol iTermColorMapDelegate <NSObject>
 
-- (void)colorMap:(iTermColorMap *)colorMap didChangeColorForKey:(iTermColorMapKey)theKey;
+- (void)colorMap:(iTermColorMap *)colorMap didChangeColorForKey:(iTermColorMapKey)theKey from:(NSColor *)before to:(NSColor *)after;
 - (void)colorMap:(iTermColorMap *)colorMap dimmingAmountDidChangeTo:(double)dimmingAmount;
 - (void)colorMap:(iTermColorMap *)colorMap mutingAmountDidChangeTo:(double)mutingAmount;
 
 @end
 
-// This class holds the collection of colors used by a single session. Some colors are index-mapped
-// (foreground, background, etc.). An 8-bit gamut (kColorMap8bitBase to kColorMap8bitBase+255)
-// exists, as does a 24-bit gamut (kColorMap24bitBase to kColorMap24bitBase+16777215). Additionally,
-// two transformations on colors are performed by this class. Dimming moves colors by
-// self.dimmingAmount towards a neutral gray, and is used to indicate a session's inactivity. Muting
-// moves colors towards the background color and is used by the "cursor boost" feature to make the
-// cursor stand out more.
-@interface iTermColorMap : NSObject<NSCopying>
+@protocol iTermImmutableColorMapDelegate<NSObject>
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap didChangeColorForKey:(iTermColorMapKey)theKey from:(NSColor *)before to:(NSColor *)after;
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap dimmingAmountDidChangeTo:(double)dimmingAmount;
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap mutingAmountDidChangeTo:(double)mutingAmount;
+@end
 
-@property(nonatomic, assign) BOOL dimOnlyText;
-@property(nonatomic, assign) double dimmingAmount;
-@property(nonatomic, assign) double mutingAmount;
-@property(nonatomic, assign) id<iTermColorMapDelegate> delegate;
-@property(nonatomic, assign) double minimumContrast;
-@property(nonatomic, assign) BOOL useSeparateColorsForLightAndDarkMode;
-@property(nonatomic, assign) BOOL darkMode;
+@protocol iTermColorMapReading<NSCopying, NSObject>
+@property(nonatomic, readonly) BOOL dimOnlyText;
+@property(nonatomic, readonly) double dimmingAmount;
+@property(nonatomic, readonly) double mutingAmount;
+@property(nonatomic, readonly) double minimumContrast;
+@property(nonatomic, readonly) BOOL useSeparateColorsForLightAndDarkMode;
+@property(nonatomic, readonly) BOOL darkMode;
+@property(nonatomic, readonly) NSInteger generation;
+@property(nonatomic, readonly) CGFloat faintTextAlpha;
 
-+ (iTermColorMapKey)keyFor8bitRed:(int)red
-                            green:(int)green
-                             blue:(int)blue;
-
-- (void)setColor:(NSColor *)theColor forKey:(iTermColorMapKey)theKey;
 - (NSColor *)colorForKey:(iTermColorMapKey)theKey;
 - (vector_float4)fastColorForKey:(iTermColorMapKey)theKey;
 
@@ -105,8 +101,9 @@ extern const int kColorMap24bitBase;
 
 // Returns non-nil profile key name for valid logical colors, ANSI colors, and bright ANSI colors.
 - (NSString *)profileKeyForColorMapKey:(int)theKey;
+- (NSString *)profileKeyForBaseKey:(NSString *)baseKey;  // Adds light/dark modifier if needed
 - (iTermColorMapKey)keyForSystemMessageForBackground:(BOOL)background;
-- (NSDictionary<NSNumber *, NSString *> *)colormapKeyToProfileKeyDictionary ;
+- (NSDictionary<NSNumber *, NSString *> *)colormapKeyToProfileKeyDictionary;
 
 - (iTermColorMapKey)keyForColor:(int)theIndex
                           green:(int)green
@@ -117,4 +114,45 @@ extern const int kColorMap24bitBase;
              useCustomBoldColor:(BOOL)useCustomBoldColor
                    brightenBold:(BOOL)brightenBold;
 
+- (NSColor *)colorForCode:(int)theIndex
+                    green:(int)green
+                     blue:(int)blue
+                colorMode:(ColorMode)theMode
+                     bold:(BOOL)isBold
+                    faint:(BOOL)isFaint
+             isBackground:(BOOL)isBackground
+       useCustomBoldColor:(BOOL)useCustomBoldColor
+             brightenBold:(BOOL)brightenBold;
+
+- (iTermColorMap *)copy;
+- (VT100SavedColorsSlot *)savedColorsSlot;
 @end
+
+// This class holds the collection of colors used by a single session. Some colors are index-mapped
+// (foreground, background, etc.). An 8-bit gamut (kColorMap8bitBase to kColorMap8bitBase+255)
+// exists, as does a 24-bit gamut (kColorMap24bitBase to kColorMap24bitBase+16777215). Additionally,
+// two transformations on colors are performed by this class. Dimming moves colors by
+// self.dimmingAmount towards a neutral gray, and is used to indicate a session's inactivity. Muting
+// moves colors towards the background color and is used by the "cursor boost" feature to make the
+// cursor stand out more.
+@interface iTermColorMap : NSObject<iTermColorMapReading>
+
+@property(nonatomic, assign) BOOL dimOnlyText;
+@property(nonatomic, assign) double dimmingAmount;
+@property(nonatomic, assign) double mutingAmount;
+@property(nonatomic, assign) id<iTermColorMapDelegate> delegate;
+@property(nonatomic, assign) double minimumContrast;
+@property(nonatomic, assign) BOOL useSeparateColorsForLightAndDarkMode;
+@property(nonatomic, assign) BOOL darkMode;
+@property(nonatomic, readonly) id<iTermColorMapReading> sanitizingAdapter;
+@property(nonatomic, assign) CGFloat faintTextAlpha;
+
++ (iTermColorMapKey)keyFor8bitRed:(int)red
+                            green:(int)green
+                             blue:(int)blue;
+
+- (void)setColor:(NSColor *)theColor forKey:(iTermColorMapKey)theKey;
+- (iTermColorMap *)copy;
+
+@end
+

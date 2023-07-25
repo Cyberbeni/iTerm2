@@ -35,10 +35,26 @@
     return self;
 }
 
+- (void)encodeChildrenWithKey:(NSString *)key
+                  identifiers:(NSArray<NSString *> *)identifiers
+                   generation:(NSInteger)generation
+                        block:(BOOL (^)(NSString * _Nonnull,
+                                        NSUInteger,
+                                        iTermGraphEncoder * _Nonnull,
+                                        BOOL * _Nonnull))block {
+    if (identifiers.count > 16 && _previousRevision.graphRecords.count > 16) {
+        // Avoid quadratic complexity when encoding a big child into a big array.
+        // Each of `identifiers` needs to check if it exists in `_previousRevision`.
+        [_previousRevision ensureIndexOfGraphRecords];
+    }
+    [super encodeChildrenWithKey:key identifiers:identifiers generation:generation block:block];
+}
+
 - (BOOL)encodeChildWithKey:(NSString *)key
                 identifier:(NSString *)identifier
                 generation:(NSInteger)generation
                      block:(BOOL (^ NS_NOESCAPE)(iTermGraphEncoder *subencoder))block {
+    // This is called N times for N identifiers in a single array `key`
     iTermEncoderGraphRecord *record = [_previousRevision childRecordWithKey:key
                                                                  identifier:identifier];
     if (!record) {
@@ -98,23 +114,21 @@
                                   NSNumber *parent,
                                   NSString *path,
                                   BOOL *stop))block {
-    iTermOrderedDictionary<NSDictionary *, iTermEncoderGraphRecord *> *beforeDict =
+    iTermOrderedDictionary<iTermTuple<NSString *, NSString *> *, iTermEncoderGraphRecord *> *beforeDict =
     [iTermOrderedDictionary byMapping:preRecord.graphRecords block:^id _Nonnull(NSUInteger index,
                                                                                 iTermEncoderGraphRecord * _Nonnull record) {
-        return @{ @"key": record.key,
-                  @"identifier": record.identifier };
+        return [iTermTuple tupleWithObject:record.key andObject:record.identifier];
     }];
-    iTermOrderedDictionary<NSDictionary *, iTermEncoderGraphRecord *> *afterDict =
+    iTermOrderedDictionary<iTermTuple<NSString *, NSString *> *, iTermEncoderGraphRecord *> *afterDict =
     [iTermOrderedDictionary byMapping:postRecord.graphRecords block:^id _Nonnull(NSUInteger index,
                                                                                 iTermEncoderGraphRecord * _Nonnull record) {
-        return @{ @"key": record.key,
-                  @"identifier": record.identifier };
+        return [iTermTuple tupleWithObject:record.key andObject:record.identifier];
     }];
     __block BOOL ok = YES;
-    void (^handle)(NSDictionary *,
+    void (^handle)(iTermTuple<NSString *, NSString *> *,
                    iTermEncoderGraphRecord *,
                    NSString *,
-                   BOOL *) = ^(NSDictionary *key,
+                   BOOL *) = ^(iTermTuple<NSString *, NSString *> *key,
                                iTermEncoderGraphRecord *record,
                                NSString *path,
                                BOOL *stop) {
@@ -144,19 +158,21 @@
              afterDict.debugString];
         }
     };
-    NSMutableSet<NSDictionary *> *seenKeys = [NSMutableSet set];
-    [beforeDict.keys enumerateObjectsUsingBlock:^(NSDictionary * _Nonnull key, NSUInteger idx, BOOL * _Nonnull stop) {
-        handle(key, beforeDict[key], [NSString stringWithFormat:@"%@.%@[%@]", path, key[@"key"], key[@"identifier"]], stop);
+    NSMutableSet<iTermTuple<NSString *, NSString *> *> *seenKeys = [NSMutableSet set];
+    [beforeDict.keys enumerateObjectsUsingBlock:^(iTermTuple<NSString *, NSString *> * _Nonnull key, NSUInteger idx, BOOL * _Nonnull stop) {
+        handle(key, beforeDict[key], [NSString stringWithFormat:@"%@.%@[%@]",
+                                      path, key.firstObject, key.secondObject], stop);
         [seenKeys addObject:key];
     }];
     if (!ok) {
         return NO;
     }
-    [afterDict.keys enumerateObjectsUsingBlock:^(NSDictionary * _Nonnull key, NSUInteger idx, BOOL * _Nonnull stop) {
+    [afterDict.keys enumerateObjectsUsingBlock:^(iTermTuple<NSString *, NSString *> * _Nonnull key, NSUInteger idx, BOOL * _Nonnull stop) {
         if ([seenKeys containsObject:key]) {
             return;
         }
-        handle(key, afterDict[key], [NSString stringWithFormat:@"%@.%@[%@]", path, key[@"key"], key[@"identifier"]], stop);
+        handle(key, afterDict[key], [NSString stringWithFormat:@"%@.%@[%@]",
+                                     path, key.firstObject, key.secondObject], stop);
     }];
     return ok;
 }

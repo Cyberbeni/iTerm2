@@ -13,6 +13,7 @@
 #import "NSColor+iTerm.h"
 #import "NSImage+iTerm.h"
 #import "NSObject+iTerm.h"
+#import "iTermPresentationController.h"
 
 #ifndef MAC_OS_X_VERSION_10_16
 @interface NSImage(ImageFuture)
@@ -21,6 +22,28 @@
 #endif
 
 @implementation NSImage (iTerm)
+
++ (NSSize)pointSizeOfGeneratedImageWithPixelSize:(NSSize)pixelSize {
+    // This might make a 1x or a 2x bitmap depending on ✨something secret✨
+    NSImage *test = [NSImage imageOfSize:NSMakeSize(1, 1) drawBlock:^{
+        [[NSColor blackColor] set];
+        NSRectFill(NSMakeRect(0, 0, 1, 1));
+    }];
+
+    CGFloat scale = 1;
+    for (NSImageRep *rep in test.representations) {
+        scale = MAX(scale, rep.pixelsWide);
+    }
+
+    NSSize pointSize = {
+        .width = pixelSize.width / scale,
+        .height = pixelSize.height / scale
+    };
+    DLog(@"Pixel size %@ -> point size %@ because %@", NSStringFromSize(pixelSize),
+         NSStringFromSize(pointSize),
+         test);
+    return pointSize;
+}
 
 - (NSImage *)it_imageFillingSize:(NSSize)size {
     const CGFloat imageAspectRatio = self.size.width / self.size.height;
@@ -294,47 +317,14 @@
     return storage;
 }
 
-- (NSData *)rawDataForMetalOfSize:(NSSize)unsafeSize {
-    const NSSize size = NSMakeSize(round(unsafeSize.width), round(unsafeSize.height));
-
-    CGImageRef cgImage = [self CGImageForProposedRect:nil context:nil hints:nil];
-
-    size_t bitsPerComponent = 8;
-    size_t bytesPerRow = size.width * bitsPerComponent * 4 / 8;
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGBitmapInfo bitmapInfo = (CGBitmapInfo)kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault;
-    NSMutableData *data = [NSMutableData dataWithLength:bytesPerRow * ceil(size.height)];
-    CGContextRef context = CGBitmapContextCreate(data.mutableBytes,
-                                                 size.width,
-                                                 size.height,
-                                                 bitsPerComponent,
-                                                 bytesPerRow,
-                                                 colorSpace,
-                                                 bitmapInfo);
-    if (!context) {
-        DLog(@"Failed to create bitmap context width=%@ height=%@ bpc=%@ bpr=%@ cs=%@",
-             @(size.width), @(size.height), @(bitsPerComponent), @(bytesPerRow), colorSpace);
-        return nil;
-    }
-    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
-
-    // Flip the context so the positive Y axis points down
-    CGContextTranslateCTM(context, 0, size.height);
-    CGContextScaleCTM(context, 1, -1);
-
-    CGContextDrawImage(context, CGRectMake(0, 0, size.width, size.height), cgImage);
-
-    CFRelease(context);
-
-    return data;
-
-}
-
 - (NSImage *)safelyResizedImageWithSize:(NSSize)unsafeSize
                         destinationRect:(NSRect)destinationRect
                                   scale:(CGFloat)scale {
+    DLog(@"safelyResizedImageWithSize:%@ destinationRect:%@ scale:%@",
+         NSStringFromSize(unsafeSize), NSStringFromRect(destinationRect), @(scale));
     NSSize newSize = NSMakeSize(round(unsafeSize.width) * scale, round(unsafeSize.height) * scale);
     if (!self.isValid) {
+        DLog(@"Invalid");
         return nil;
     }
 
@@ -350,13 +340,15 @@
                                              bytesPerRow:0
                                             bitsPerPixel:0];
     rep.size = newSize;
-
+    DLog(@"rep=%@", rep);
     [NSGraphicsContext saveGraphicsState];
     [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:rep]];
-    [self drawInRect:NSMakeRect(NSMinX(destinationRect) * scale,
-                                NSMinY(destinationRect) * scale,
-                                NSWidth(destinationRect) * scale,
-                                NSHeight(destinationRect) * scale)
+    const NSRect scaledDestinationRect = NSMakeRect(NSMinX(destinationRect) * scale,
+                                                    NSMinY(destinationRect) * scale,
+                                                    NSWidth(destinationRect) * scale,
+                                                    NSHeight(destinationRect) * scale);
+    DLog(@"scaledDestinationRect=%@", NSStringFromRect(scaledDestinationRect));
+    [self drawInRect:scaledDestinationRect
             fromRect:NSZeroRect
            operation:NSCompositingOperationCopy
             fraction:1.0];
@@ -365,6 +357,7 @@
     NSImage *newImage = [[NSImage alloc] initWithSize:NSMakeSize(newSize.width / scale,
                                                                  newSize.height / scale)];
     [newImage addRepresentation:rep];
+    DLog(@"newImage=%@", newImage);
     return newImage;
 }
 
@@ -468,19 +461,43 @@
     return (CGFloat)rep.pixelsWide / self.size.width;
 }
 
++ (CGFloat)programaticallyCreatedImageScale {
+    static CGFloat scale;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [iTermPresentationController sharedInstance];
+        [[NSNotificationCenter defaultCenter] addObserverForName:iTermScreenParametersDidChangeNontrivally
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            scale = 0;
+        }];
+    });
+    if (!scale) {
+        DLog(@"Recompute scale");
+        NSImage *image = [NSImage imageOfSize:NSMakeSize(1, 1) drawBlock:^{}];
+        scale = [image scaleFactor];
+    }
+    DLog(@"Programatically created images have scale %f", scale);
+    return scale;
+}
+
 - (NSImage *)it_imageScaledByX:(CGFloat)xScale y:(CGFloat)yScale {
     const NSSize size = self.size;
     if (size.width == 0 || size.height == 0) {
         return self;
     }
+    DLog(@"Scale image by x=%f y=%f. Image=%@", xScale, yScale, self);
     CGFloat adjustment = 1;
-    if ([self scaleFactor] == 1) {
+    if ([self scaleFactor] == 1 && [NSImage programaticallyCreatedImageScale] > 1) {
+        DLog(@"Use adjustment of 0.5 since we will create a 2x image");
         // We have no choice but to produce a 2x image from here. If the source is 1x, make the
         // returned image half the size in points so it'll be the same as the input image.
         adjustment = 0.5;
     }
     const NSSize destSize = NSMakeSize(self.size.width * fabs(xScale) * adjustment,
                                        self.size.height * fabs(yScale) * adjustment);
+    DLog(@"Draw into destination fo size %@", NSStringFromSize(destSize));
     NSImage *image = [NSImage imageOfSize:destSize
                                 drawBlock:^{
         NSAffineTransform *transform = [NSAffineTransform transform];
@@ -594,6 +611,25 @@ static NSBitmapImageRep * iTermCreateBitmapRep(NSSize size,
     return [[NSColorSpace alloc] initWithCGColorSpace:cgColorSpace];
 }
 
+- (NSImage *)it_subimageWithRect:(NSRect)rect {
+    const NSRect bounds = NSMakeRect(0, 0, self.size.width, self.size.height);
+    NSImageRep *representation = [self bestRepresentationForRect:bounds
+                                                         context:nil
+                                                           hints:nil];
+
+    return [NSImage imageWithSize:rect.size
+                          flipped:NO
+                   drawingHandler:^BOOL(NSRect destination) {
+        BOOL ret = [representation drawInRect:destination
+                                     fromRect:rect
+                                    operation:NSCompositingOperationCopy
+                                     fraction:1.0
+                               respectFlipped:NO
+                                        hints:nil];
+        return ret;
+    }];
+}
+
 @end
 
 @implementation NSBitmapImageRep(iTerm)
@@ -603,4 +639,62 @@ static NSBitmapImageRep * iTermCreateBitmapRep(NSSize size,
     return [[image it_imageOfSize:size] it_bitmapImageRep];
 }
 
+// Assumes premultiplied alpha and little endian. Floating point must be 16 bit.
+- (MTLPixelFormat)metalPixelFormat {
+    const MTLPixelFormat unsupportedFormatsMask = (NSBitmapFormatAlphaNonpremultiplied |
+                                                   NSBitmapFormatSixteenBitBigEndian |
+                                                   NSBitmapFormatThirtyTwoBitBigEndian |
+                                                   NSBitmapFormatThirtyTwoBitLittleEndian |
+                                                   NSBitmapFormatSixteenBitLittleEndian);  // Doesn't apply to 16-bit ints, not quite sure what this is for.
+    if (self.bitmapFormat & unsupportedFormatsMask) {
+        return MTLPixelFormatInvalid;
+    }
+    if (self.bitmapFormat & NSBitmapFormatFloatingPointSamples) {
+        // Note that 16-bit floats don't have NSBitmapFormatSixteenBitLittleEndian set. That's only for ints.
+        return MTLPixelFormatRGBA16Float;
+    }
+    const NSInteger bitsPerSample = self.bitsPerPixel / self.samplesPerPixel;
+    if (bitsPerSample == 16) {
+        return MTLPixelFormatRGBA16Unorm;
+    }
+    return MTLPixelFormatRGBA8Unorm;
+}
+
+- (NSBitmapImageRep *)it_bitmapWithAlphaLast {
+    if (!(self.bitmapFormat & NSBitmapFormatAlphaFirst)) {
+        return self;
+    }
+    const unsigned char *source = self.bitmapData;
+    const NSUInteger samplesPerPixel = self.samplesPerPixel;
+    const NSUInteger bytesPerSample = self.bitsPerSample / 8;
+    const NSUInteger stride = samplesPerPixel * bytesPerSample;
+    NSMutableData *storage = [NSMutableData dataWithLength:bytesPerSample * samplesPerPixel * self.pixelsWide * self.pixelsHigh];
+    unsigned char *storageBase = (unsigned char *)storage.mutableBytes;
+    for (NSUInteger i = 0; i < self.bytesPerRow * self.pixelsHigh; i += stride) {
+        unsigned char *dest = storageBase + i;
+        char temp[stride];
+        memmove(temp, source + i, stride);
+        // First, move the stuff that isn't alpha.
+        const NSUInteger nonAlphaLength = (samplesPerPixel - 1) * bytesPerSample;
+        memmove(dest,
+                source + i + bytesPerSample,
+                nonAlphaLength);
+        // Now move alpha.
+        memmove(dest + nonAlphaLength,
+                source + i,
+                bytesPerSample);
+    }
+    unsigned char *planes[1] = { storageBase };
+    return [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:planes
+                                                   pixelsWide:self.pixelsWide
+                                                   pixelsHigh:self.pixelsHigh
+                                                bitsPerSample:self.bitsPerSample
+                                              samplesPerPixel:self.samplesPerPixel
+                                                     hasAlpha:YES
+                                                     isPlanar:NO
+                                               colorSpaceName:self.colorSpaceName
+                                                 bitmapFormat:self.bitmapFormat & ~NSBitmapFormatAlphaFirst
+                                                  bytesPerRow:self.bytesPerRow
+                                                 bitsPerPixel:self.bitsPerPixel];
+}
 @end

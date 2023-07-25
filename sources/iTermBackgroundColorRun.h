@@ -20,6 +20,12 @@ typedef struct {
     ColorMode bgColorMode;
     BOOL selected;
     BOOL isMatch;
+    // Because subpixel AA only works with "atop" blending, we have to blend fg & bg before drawing.
+    // Although I would rather draw an fg with 50% alpha, that won't look good with subpixel AA.
+    // This introduces a per-cell dependency between fg & bg. In order to not lose the optimization
+    // where we only use unprocessed colors, track this so we don't merge background runs when faint
+    // text is present.
+    BOOL beneathFaintText;
 } iTermBackgroundColorRun;
 
 // NOTE: This does not compare the ranges.
@@ -30,7 +36,8 @@ NS_INLINE BOOL iTermBackgroundColorRunsEqual(iTermBackgroundColorRun *a,
             a->bgBlue == b->bgBlue &&
             a->bgColorMode == b->bgColorMode &&
             a->selected == b->selected &&
-            a->isMatch == b->isMatch);
+            a->isMatch == b->isMatch &&
+            a->beneathFaintText == b->beneathFaintText);
 }
 
 // A collection of color runs for a single line, along with info about the line itself.
@@ -47,16 +54,21 @@ NS_INLINE BOOL iTermBackgroundColorRunsEqual(iTermBackgroundColorRun *a,
 
 // Creates a new autoreleased iTermBackgroundColorRunsInLine object that's ready to use.
 // Fills in *anyBlinkPtr with YES if some character in the range is blinking.
-+ (instancetype)backgroundRunsInLine:(screen_char_t *)theLine
++ (instancetype)backgroundRunsInLine:(const screen_char_t *)theLine
                           lineLength:(int)width
                                  row:(int)row  // Row number in datasource
                      selectedIndexes:(NSIndexSet *)selectedIndexes
                          withinRange:(NSRange)charRange
                              matches:(NSData *)matches
                             anyBlink:(BOOL *)anyBlinkPtr
-                       textExtractor:(iTermTextExtractor *)extractor
-                                   y:(CGFloat)y  // Value for self.y
-                                line:(int)line;  // Value for self.line
+                                   y:(CGFloat)y;  // Value for self.y
+
++ (instancetype)defaultRunOfLength:(int)width
+                               row:(int)row
+                                 y:(CGFloat)y;
+
+- (iTermBackgroundColorRun *)runAtIndex:(int)i;
+- (iTermBackgroundColorRun *)lastRun;
 
 @end
 

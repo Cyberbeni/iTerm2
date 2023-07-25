@@ -23,6 +23,10 @@ class SearchableComboListViewController: NSViewController {
     @IBOutlet public weak var visualEffectView: NSVisualEffectView!
     private var closeOnSelect = true
     public var tableViewController: SearchableComboTableViewController?
+    var widestItemWidth: CGFloat {
+        return tableViewController?.widestItemWidth ?? 0
+    }
+
     let groups: [SearchableComboViewGroup]
 
     public var selectedItem: SearchableComboViewItem? {
@@ -83,6 +87,31 @@ class SearchableComboListViewController: NSViewController {
         }
         return nil
     }
+
+    func item(withIdentifier identifier: NSUserInterfaceItemIdentifier) -> SearchableComboViewItem? {
+        for group in groups {
+            for item in group.items {
+                guard let itemIdentifier = item.identifier else {
+                    continue
+                }
+                if itemIdentifier as NSString as NSUserInterfaceItemIdentifier == identifier {
+                    return item
+                }
+            }
+        }
+        return nil
+    }
+
+    func item(withTitle title: String) -> SearchableComboViewItem? {
+        for group in groups {
+            for item in group.items {
+                if item.label == title {
+                    return item
+                }
+            }
+        }
+        return nil
+    }
 }
 
 extension SearchableComboListViewController: NSTextFieldDelegate {
@@ -125,8 +154,8 @@ extension SearchableComboListViewController: SearchableComboTableViewControllerD
         return groups
     }
 
-    func searchableComboTableViewController(
-        _ tableViewController: SearchableComboTableViewController, didType event: NSEvent) {
+    func searchableComboTableViewController(_ tableViewController: SearchableComboTableViewController,
+                                            didType event: NSEvent) {
         // Restore keyboard focus to the search field.
         guard searchField.window != nil else {
             return
@@ -135,9 +164,11 @@ extension SearchableComboListViewController: SearchableComboTableViewControllerD
         guard let fieldEditor = searchField.window?.fieldEditor(false, for: searchField) else {
             return
         }
-        fieldEditor.selectedRange = NSRange(location: fieldEditor.string.utf16.count, length: 0)
+        let insertionRange = NSRange(location: fieldEditor.string.utf16.count, length: 0)
+        fieldEditor.selectedRange = insertionRange
         fieldEditor.keyDown(with: event)
-        tableView.window?.makeFirstResponder(tableView)
+        tableView.window?.makeFirstResponder(searchField)
+        fieldEditor.selectedRange = NSRange(location: fieldEditor.string.utf16.count, length: 0)
     }
 }
 

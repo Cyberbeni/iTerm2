@@ -9,6 +9,7 @@
 #import "NSObject+iTerm.h"
 
 #import "iTermWeakProxy.h"
+#import "NSJSONSerialization+iTerm.h"
 
 #import <objc/runtime.h>
 
@@ -135,6 +136,22 @@
     id result = [self castFrom:object];
     assert(result);
     return result;
+}
+
++ (void)it_enumerateDynamicProperties:(void (^)(NSString *name))block {
+    unsigned int propcount = 0;
+    objc_property_t *props = class_copyPropertyList(self, &propcount);
+    for (unsigned int i = 0; i < propcount; i++) {
+        objc_property_t prop = props[i];
+        char *value = property_copyAttributeValue(prop, "D");
+        if (value == nil) {
+            continue;
+        }
+        free(value);
+        const char *name = property_getName(prop);
+        block([NSString stringWithUTF8String:name]);
+    }
+    free(props);
 }
 
 - (void)performSelectorWithObjects:(NSArray *)tuple {
@@ -298,6 +315,9 @@
             if (oops) {
                 return oops;
             }
+            if (![key isKindOfClass:[NSString class]]) {
+                return [NSString stringWithFormat:@"key %@ in dictionary at %@ is %@, not NSString", key, path, NSStringFromClass([key class])];
+            }
         }
         return nil;
     }
@@ -319,6 +339,38 @@
 
 - (NSString *)it_addressString {
     return [NSString stringWithFormat:@"%p", self];
+}
+
+- (NSData *)it_keyValueCodedData {
+    NSKeyedArchiver *archiver = [[NSKeyedArchiver alloc] initRequiringSecureCoding:NO];
+    [archiver encodeObject:self forKey:@"root"];
+    [archiver finishEncoding];
+    return [archiver encodedData];
+}
+
++ (instancetype)it_fromKeyValueCodedData:(NSData *)data {
+    NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:nil];
+    if (!unarchiver) {
+        return nil;
+    }
+    NSArray *classes = @[
+        [NSArray class],
+        [NSDictionary class],
+        [NSString class],
+        [NSNumber class],
+        [NSDate class]
+    ];
+    id object = [self castFrom:[unarchiver decodeObjectOfClasses:[NSSet setWithArray:classes] forKey:@"root"]];
+    [unarchiver finishDecoding];
+    return object;
+}
+
+- (NSString *)jsonEncoded {
+    return [NSJSONSerialization it_jsonStringForObject:self];
+}
+
++ (instancetype)fromJsonEncodedString:(NSString *)string {
+    return [self castFrom:[NSJSONSerialization it_objectForJsonString:string]];
 }
 
 @end

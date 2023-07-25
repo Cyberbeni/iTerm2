@@ -17,6 +17,7 @@
 #import "iTermTextExtractor.h"
 #import "iTermURLActionFactory.h"
 #import "iTermUserDefaults.h"
+#import "NSEvent+iTerm.h"
 #import "NSHost+iTerm.h"
 #import "NSObject+iTerm.h"
 #import "NSURL+iTerm.h"
@@ -45,40 +46,50 @@
     return [self.delegate urlActionHelperShouldIgnoreHardNewlines:self];
 }
 
-- (void)urlActionForClickAtCoord:(VT100GridCoord)coord
-                      completion:(void (^)(URLAction *))completion {
-    [self urlActionForClickAtCoord:coord
-            respectingHardNewlines:![self ignoreHardNewlinesInURLs]
-                        completion:completion];
+- (id<iTermCancelable>)urlActionForClickAtCoord:(VT100GridCoord)coord
+                                     completion:(void (^)(URLAction *))completion {
+    return [self urlActionForClickAtCoord:coord
+                   respectingHardNewlines:![self ignoreHardNewlinesInURLs]
+                                alternate:NO
+                               completion:completion];
 }
 
-- (void)urlActionForClickAtCoord:(VT100GridCoord)coord
-          respectingHardNewlines:(BOOL)respectHardNewlines
-                      completion:(void (^)(URLAction *))completion {
+- (id<iTermCancelable>)urlActionForClickAtCoord:(VT100GridCoord)coord
+                         respectingHardNewlines:(BOOL)respectHardNewlines
+                                      alternate:(BOOL)alternate
+                                     completion:(void (^)(URLAction *))completion {
     DLog(@"urlActionForClickAt:%@ respectingHardNewlines:%@",
          VT100GridCoordDescription(coord), @(respectHardNewlines));
     if (coord.y < 0) {
         completion(nil);
-        return;
+        return nil;
     }
-    iTermImageInfo *imageInfo = [self.delegate urlActionHelper:self imageInfoAt:coord];
+    id<iTermImageInfoReading> imageInfo = [self.delegate urlActionHelper:self imageInfoAt:coord];
     if (imageInfo) {
         completion([URLAction urlActionToOpenImage:imageInfo]);
-        return;
+        return nil;
     }
     iTermTextExtractor *extractor = [self.delegate urlActionHelperNewTextExtractor:self];
     if ([extractor characterAt:coord].code == 0) {
         completion(nil);
-        return;
+        return nil;
     }
     [extractor restrictToLogicalWindowIncludingCoord:coord];
 
+    __block id<iTermCancelable> urlActionFactoryCanceler = nil;
+    iTermBlockCanceller *canceller = [[iTermBlockCanceller alloc] initWithBlock:^{
+        [urlActionFactoryCanceler cancelOperation];
+    }];
     [self.delegate urlActionHelper:self
             workingDirectoryOnLine:coord.y
                         completion:^(NSString *workingDirectory) {
+        urlActionFactoryCanceler =
         [iTermURLActionFactory urlActionAtCoord:coord
                             respectHardNewlines:respectHardNewlines
+                                      alternate:alternate
                                workingDirectory:workingDirectory ?: @""
+                                          scope:[self.delegate urlActionHelperScope:self]
+                                          owner:[self.delegate urlActionHelperOwner:self]
                                      remoteHost:[self.delegate urlActionHelper:self remoteHostOnLine:coord.y]
                                       selectors:[self.delegate urlActionHelperSmartSelectionActionSelectorDictionary:self]
                                           rules:[self.delegate urlActionHelperSmartSelectionRules:self]
@@ -89,6 +100,7 @@
                                     }
                                      completion:completion];
     }];
+    return canceller;
 }
 
 - (void)openTargetWithEvent:(NSEvent *)event inBackground:(BOOL)openInBackground {
@@ -101,6 +113,7 @@
     // that it doesn't work well. Hard EOLs mid-url are very common. Let's try always ignoring them.
     [self urlActionForClickAtCoord:coord
             respectingHardNewlines:![self ignoreHardNewlinesInURLs]
+                         alternate:!!(event.it_modifierFlags & NSEventModifierFlagOption)
                         completion:^(URLAction *action) {
                             [weakSelf finishOpeningTargetWithEvent:event
                                                              coord:coord
@@ -133,6 +146,8 @@
 
     NSDictionary *attributes = [self.delegate urlActionHelperAttributes:self];
     NSSize size = [name sizeWithAttributes:attributes];
+    size.width = MAX(1, size.width);
+    size.height = MAX(1, size.height);
     size.height = [self.delegate urlActionHelperLineHeight:self];
     NSImage *const image = [[NSImage alloc] initWithSize:size];
     [image lockFocus];
@@ -314,6 +329,7 @@
                 NSURL *url = [NSURL URLWithUserSuppliedString:action.string];
                 if ([url.scheme isEqualToString:@"file"] &&
                     url.host.length > 0 &&
+                    url.path.length > 0 &&
                     ![url.host isEqualToString:[NSHost fullyQualifiedDomainName]]) {
                     SCPPath *path = [[SCPPath alloc] init];
                     path.path = url.path;
@@ -340,7 +356,7 @@
 
             case kURLActionOpenImage:
                 DLog(@"Open image");
-                [[NSWorkspace sharedWorkspace] openFile:[(iTermImageInfo *)action.identifier nameForNewSavedTempFile]];
+                [[NSWorkspace sharedWorkspace] openFile:[(id<iTermImageInfoReading>)action.identifier nameForNewSavedTempFile]];
                 break;
 
             case kURLActionSecureCopyFile:

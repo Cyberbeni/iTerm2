@@ -17,6 +17,7 @@
 #import "iTermTabBarControlView.h"
 #import "iTermWindowShortcutLabelTitlebarAccessoryViewController.h"
 #import "NSDate+iTerm.h"
+#import "NSScreen+iTerm.h"
 #import "NSWindow+iTerm.h"
 #import "SessionView.h"
 #import "PTYTab.h"
@@ -113,6 +114,21 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
     return NO;
 }
 
+- (void)updateTitlebarSeparatorStyle {
+    if (@available(macOS 11.0, *)) {
+        // .none is harmful outside full screen mode because it causes the titlebar to be the wrong color.
+        // In order to avoid having the separator in non-fullscreen windows, we use a series of disgusting hacks.
+        // See commit 883a3faac0392dbea9464e5255212c96b9f1470c.
+        // .none is absolutely necessary in full screen mode to avoid a flashing white line. 
+        // See commit 0257ba8f8398240c813c35aa72fe2f652cb11b1e.
+        if ([self lionFullScreen] && !exitingLionFullscreen_) {
+            self.window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+        } else {
+            self.window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleAutomatic;
+        }
+    }
+}
+
 - (NSWindow *)setWindowWithWindowType:(iTermWindowType)windowType
                       savedWindowType:(iTermWindowType)savedWindowType
                windowTypeForStyleMask:(iTermWindowType)windowTypeForStyleMask
@@ -165,9 +181,7 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
     myWindow.movable = [self.class windowTypeIsMovable:windowType];
 
     [self updateForTransparency:(NSWindow<PTYWindow> *)myWindow];
-    if (@available(macOS 11.0, *)) {
-        myWindow.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
-    }
+    [self updateTitlebarSeparatorStyle];
     [self setWindow:myWindow];
 
     if (@available(macOS 10.16, *)) {
@@ -647,8 +661,7 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
 
 - (NSRect)traditionalFullScreenFrameForScreen:(NSScreen *)screen {
     NSRect screenFrame = [screen frame];
-    NSRect frameMinusMenuBar = screenFrame;
-    frameMinusMenuBar.size.height -= [[[NSApplication sharedApplication] mainMenu] menuBarHeight];
+    NSRect frameMinusMenuBar = [screen frameExceptMenuBar];
     BOOL menuBarIsVisible = NO;
 
     if ([self fullScreenWindowFrameShouldBeShiftedDownBelowMenuBarOnScreen:screen]) {
@@ -801,13 +814,11 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
 - (void)windowDidEnterFullScreenImpl:(NSNotification *)notification {
     DLog(@"Window did enter lion fullscreen %@", self);
 
-    if (@available(macOS 11.0, *)) {
-        self.window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
-    }
     zooming_ = NO;
     togglingLionFullScreen_ = NO;
     _fullScreenRetryCount = 0;
     lionFullScreen_ = YES;
+    [self updateTitlebarSeparatorStyle];
     [self updateTabBarControlIsTitlebarAccessory];
     [self didChangeAnyFullScreen];
     [self.contentView.tabBarControl setFlashing:YES];
@@ -875,7 +886,7 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
                                                             object:self.swipeIdentifier];
     }
     exitingLionFullscreen_ = YES;
-
+    [self updateTitlebarSeparatorStyle];
     [self updateTabBarControlIsTitlebarAccessory];
     [self updateForTransparency:(NSWindow<PTYWindow> *)self.window];
     [self.contentView.tabBarControl updateFlashing];
@@ -929,6 +940,10 @@ iTermWindowType iTermWindowTypeNormalized(iTermWindowType windowType) {
     [self updateForTransparency:self.ptyWindow];
     [self addShortcutAccessorViewControllerToTitleBarIfNeeded];
     [self updateTabColors];  // This updates the window's background colors in case some panes are now transparent.
+    [self.contentView setCurrentSessionAlpha:self.currentSession.textview.transparencyAlpha];
+    for (PTYSession *session in self.allSessions) {
+        [session invalidateBlend];
+    }
     [self didFinishFullScreenTransitionSuccessfully:YES];
     [self updateVariables];
 
@@ -967,6 +982,10 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
     if (hotkeyWindowType == iTermHotkeyWindowTypeFloatingPanel) {
         mask = NSWindowStyleMaskNonactivatingPanel;
     }
+    NSWindowStyleMask resizable = NSWindowStyleMaskResizable;
+    if (![iTermAdvancedSettingsModel allowLiveResize]) {
+        resizable = 0;
+    }
     switch (iTermThemedWindowType(windowType)) {
         case WINDOW_TYPE_TOP:
         case WINDOW_TYPE_BOTTOM:
@@ -982,7 +1001,7 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
                     NSWindowStyleMaskTitled |
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable |
-                    NSWindowStyleMaskResizable);
+                    resizable);
 
         case WINDOW_TYPE_TRADITIONAL_FULL_SCREEN:
             return mask | NSWindowStyleMaskBorderless | NSWindowStyleMaskMiniaturizable;
@@ -993,7 +1012,7 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
                     NSWindowStyleMaskTitled |
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable |
-                    NSWindowStyleMaskResizable);
+                    resizable);
 
         case WINDOW_TYPE_COMPACT_MAXIMIZED:
             return (mask |
@@ -1002,7 +1021,7 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable |
                     NSWindowStyleMaskTexturedBackground |
-                    NSWindowStyleMaskResizable);
+                    resizable);
 
         case WINDOW_TYPE_MAXIMIZED:
             return (mask |
@@ -1010,7 +1029,7 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable |
                     NSWindowStyleMaskTexturedBackground |
-                    NSWindowStyleMaskResizable);
+                    resizable);
 
         case WINDOW_TYPE_LION_FULL_SCREEN:
         case WINDOW_TYPE_ACCESSORY:
@@ -1022,7 +1041,7 @@ BOOL iTermWindowTypeIsCompact(iTermWindowType windowType) {
                     NSWindowStyleMaskTitled |
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable |
-                    NSWindowStyleMaskResizable |
+                    resizable |
                     NSWindowStyleMaskTexturedBackground);
     }
 }

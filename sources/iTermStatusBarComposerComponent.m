@@ -107,8 +107,16 @@
     return [[self viewController] stringValue];
 }
 
+- (void)insertText:(NSString *)text {
+    [self.viewController insertText:text];
+}
+
 - (void)setStringValue:(NSString *)stringValue {
     [[self viewController] setStringValue:stringValue];
+}
+
+- (NSRect)cursorFrameInScreenCoordinates {
+    return [[self viewController] cursorFrameInScreenCoordinates];
 }
 
 #pragma mark - iTermStatusBarComponent
@@ -120,9 +128,8 @@
 - (NSView *)statusBarComponentView {
     [self updateForTerminalBackgroundColor];
 
-    VT100RemoteHost *remoteHost = [[VT100RemoteHost alloc] init];
-    remoteHost.hostname = [self.scope valueForVariableName:iTermVariableKeySessionHostname];
-    remoteHost.username = [self.scope valueForVariableName:iTermVariableKeySessionUsername];
+    VT100RemoteHost *remoteHost = [[VT100RemoteHost alloc] initWithUsername:[self.scope valueForVariableName:iTermVariableKeySessionUsername]
+                                                                   hostname:[self.scope valueForVariableName:iTermVariableKeySessionHostname]];
 
     [self.viewController setHost:remoteHost];
     return self.viewController.view;
@@ -135,16 +142,14 @@
 - (void)updateForTerminalBackgroundColor {
     NSView *view = self.viewController.view;
     const iTermPreferencesTabStyle tabStyle = [iTermPreferences intForKey:kPreferenceKeyTabStyle];
-    if (@available(macOS 10.14, *)) {
-        if (tabStyle == TAB_STYLE_MINIMAL) {
-            if ([self.delegate statusBarComponentTerminalBackgroundColorIsDark:self]) {
-                view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-            } else {
-                view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
-            }
+    if (tabStyle == TAB_STYLE_MINIMAL) {
+        if ([self.delegate statusBarComponentTerminalBackgroundColorIsDark:self]) {
+            view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
         } else {
-            view.appearance = nil;
+            view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
         }
+    } else {
+        view.appearance = nil;
     }
 }
 

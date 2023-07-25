@@ -244,6 +244,10 @@
     return copy;
 }
 
+- (id)mutableCopyWithZone:(NSZone *)zone {
+    return [self copyWithZone:zone];
+}
+
 - (void)eraseAt:(int)x {
     [_attributes removeObjectForKey:@(x + _offset)];
 }
@@ -260,17 +264,19 @@
     }
 }
 
-+ (iTermExternalAttributeIndex *)concatenationOf:(iTermExternalAttributeIndex *)lhs
-                                      length:(int)lhsLength
-                                        with:(iTermExternalAttributeIndex *)rhs
-                                      length:(int)rhsLength {
++ (iTermExternalAttributeIndex *)concatenationOf:(id<iTermExternalAttributeIndexReading>)lhs
+                                          length:(int)lhsLength
+                                            with:(id<iTermExternalAttributeIndexReading>)rhs
+                                          length:(int)rhsLength {
     iTermExternalAttributeIndex *result = [[iTermExternalAttributeIndex alloc] init];
     [result appendValuesFrom:lhs range:NSMakeRange(0, lhsLength) at:0];
     [result appendValuesFrom:rhs range:NSMakeRange(0, rhsLength) at:lhsLength];
     return result;
 }
 
-- (void)appendValuesFrom:(iTermExternalAttributeIndex *)source range:(NSRange)range at:(int)base {
+- (void)appendValuesFrom:(id<iTermExternalAttributeIndexReading>)source
+                   range:(NSRange)range
+                      at:(int)base {
     [source.attributes enumerateKeysAndObjectsUsingBlock:^(NSNumber * _Nonnull key, iTermExternalAttribute * _Nonnull obj, BOOL * _Nonnull stop) {
         const int intKey = key.intValue;
         if (intKey < range.location) {
@@ -287,6 +293,12 @@
 
 static NSString *const iTermExternalAttributeKeyUnderlineColor = @"uc";
 static NSString *const iTermExternalAttributeKeyURLCode = @"url";
+
+@interface iTermExternalAttribute()
+@property (atomic, readwrite) BOOL hasUnderlineColor;
+@property (atomic, readwrite) VT100TerminalColorValue underlineColor;
+@property (atomic, readwrite) unsigned int urlCode;
+@end
 
 @implementation iTermExternalAttribute
 
@@ -314,8 +326,6 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
 + (instancetype)fromData:(NSData *)data {
     iTermTLVDecoder *decoder = [[iTermTLVDecoder alloc] initWithData:data];
     
-    int version = 1;
-    
     // v1
     BOOL hasUnderlineColor;
     if (![decoder decodeBool:&hasUnderlineColor]) {
@@ -341,9 +351,7 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
     
     // v2
     unsigned int urlCode = 0;
-    if ([decoder decodeUnsignedInt:&urlCode]) {
-        version = 2;
-    }
+    [decoder decodeUnsignedInt:&urlCode];
     
     if (!hasUnderlineColor && urlCode == 0) {
         return nil;
@@ -360,9 +368,9 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
                                urlCode:(unsigned int)urlCode {
     self = [self init];
     if (self) {
-        _hasUnderlineColor = YES;
-        _underlineColor = color;
-        _urlCode = urlCode;
+        self.hasUnderlineColor = YES;
+        self.underlineColor = color;
+        self.urlCode = urlCode;
     }
     return self;
 }
@@ -370,7 +378,7 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
 - (instancetype)initWithURLCode:(unsigned int)urlCode {
     self = [self init];
     if (self) {
-        _urlCode = urlCode;
+        self.urlCode = urlCode;
     }
     return self;
 }
@@ -540,6 +548,10 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
     return self;
 }
 
+- (id)mutableCopyWithZone:(NSZone *)zone {
+    return [self copyWithZone:zone];
+}
+
 - (id)copyWithZone:(NSZone *)zone {
     return self;
 }
@@ -574,9 +586,39 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
 
 @end
 
+@interface NSMutableData(ScreenCharMigration)
+- (void)migrateV2ToV3InPlace;
+@end
+
+@implementation NSMutableData(ScreenCharMigration)
+- (void)migrateV2ToV3InPlace {
+    screen_char_t *chars = (screen_char_t *)self.mutableBytes;
+    for (NSUInteger i = 0; i < self.length / sizeof(screen_char_t); i++) {
+        if (!chars[i].complexChar &&
+            !chars[i].image &&
+            chars[i].code >= ITERM2_LEGACY_PRIVATE_BEGIN &&
+            chars[i].code <= ITERM2_LEGACY_PRIVATE_END) {
+            chars[i].code = ITERM2_PRIVATE_BEGIN + (chars[i].code - ITERM2_LEGACY_PRIVATE_BEGIN);
+        }
+    }
+}
+@end
+
 @implementation NSData(iTermExternalAttributes)
 
-- (NSData *)modernizedScreenCharArray:(iTermExternalAttributeIndex **)indexOut {
+- (void)migrateV2ToV1:(NSMutableData *)modern {
+    screen_char_t *chars = (screen_char_t *)modern.mutableBytes;
+    for (NSUInteger i = 0; i < self.length / sizeof(screen_char_t); i++) {
+        if (!chars[i].complexChar &&
+            !chars[i].image &&
+            chars[i].code >= ITERM2_PRIVATE_BEGIN &&
+            chars[i].code <= ITERM2_PRIVATE_END) {
+            chars[i].code = ITERM2_LEGACY_PRIVATE_BEGIN + (chars[i].code - ITERM2_PRIVATE_BEGIN);
+        }
+    }
+}
+
+- (NSData *)migrateV1ToV3:(iTermExternalAttributeIndex **)indexOut {
     const legacy_screen_char_t *source = (legacy_screen_char_t *)self.bytes;
     const NSUInteger length = self.length;
     assert(length < NSUIntegerMax);
@@ -617,10 +659,17 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
             dest[i].urlCode = 0;
         }
     }
+    [modern migrateV2ToV3InPlace];
     if (indexOut) {
         *indexOut = eaIndex;
     }
     return modern;
+}
+
+- (NSMutableData *)migrateV2ToV3 {
+    NSMutableData *temp = [self mutableCopy];
+    [temp migrateV2ToV3InPlace];
+    return temp;
 }
 
 - (NSData *)legacyScreenCharArrayWithExternalAttributes:(iTermExternalAttributeIndex * _Nullable)eaIndex {
@@ -635,6 +684,7 @@ static NSString *const iTermExternalAttributeKeyURLCode = @"url";
     for (NSUInteger i = 0; i < count; i++) {
         dest[i].urlCode = eaIndex[i].urlCode;
     }
+    [self migrateV2ToV1:legacyData];
     return legacyData;
 }
 

@@ -298,13 +298,13 @@ static BOOL gMonochromeText;
 
     const iTermVertex vertices[] = {
         // Pixel Positions, Texture Coordinates
-        { { vw,  0 }, { w, 0 } },
-        { { 0,   0 }, { 0, 0 } },
-        { { 0,  vh }, { 0, h } },
+        { { vw,  0 + _verticalOffset }, { w, 0 } },
+        { { 0,   0 + _verticalOffset }, { 0, 0 } },
+        { { 0,  vh + _verticalOffset }, { 0, h } },
 
-        { { vw,  0 }, { w, 0 } },
-        { { 0,  vh }, { 0, h } },
-        { { vw, vh }, { w, h } },
+        { { vw,  0 + _verticalOffset }, { w, 0 } },
+        { { 0,  vh + _verticalOffset }, { 0, h } },
+        { { vw, vh + _verticalOffset }, { w, h } },
     };
     entry.quad = [_verticesPool requestBufferFromContext:poolContext
                                                withBytes:vertices
@@ -421,7 +421,6 @@ static NSString *const VertexFunctionName(const BOOL &underlined,
 
     // The vertex buffer's texture coordinates depend on the texture map's atlas size so it must
     // be initialized after the texture map.
-    __block NSInteger totalInstances = 0;
     __block iTermTextureDimensions previousTextureDimensions;
     __block id<MTLBuffer> previousTextureDimensionsBuffer = nil;
 
@@ -434,7 +433,6 @@ static NSString *const VertexFunctionName(const BOOL &underlined,
                              iTermMetalUnderlineDescriptor strikethroughDescriptor,
                              BOOL underlined,
                              BOOL emoji) {
-        totalInstances += instances;
         __block id<MTLBuffer> vertexBuffer;
         [tState measureTimeForStat:iTermTextRendererStatNewQuad ofBlock:^{
             vertexBuffer = [self quadOfSize:CGSizeMake(glyphSize.x, glyphSize.y)
@@ -577,4 +575,7 @@ static NSString *const VertexFunctionName(const BOOL &underlined,
     }
 }
 
+@end
+
+@implementation iTermOffscreenCommandLineTextRenderer
 @end

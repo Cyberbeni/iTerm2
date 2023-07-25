@@ -42,7 +42,7 @@
 @end
 
 @interface PTYScroller()
-@property (nonatomic, retain) iTermScrollAccumulator *accumulator;
+@property (nonatomic, strong) iTermScrollAccumulator *accumulator;
 @end
 
 @implementation PTYScroller
@@ -83,11 +83,6 @@
     return YES;
 }
 
-- (void)dealloc {
-    [_accumulator release];
-    [super dealloc];
-}
-
 // rdar://45295749/
 - (void)dismemberForScrollerStyle:(NSScrollerStyle)scrollerStyle NS_AVAILABLE_MAC(10_14) {
     DLog(@"Begin dismembering the scroll bar");
@@ -126,7 +121,7 @@
 }
 
 - (void)setScrollerStyle:(NSScrollerStyle)scrollerStyle {
-    DLog(@"%@: set scroller style to %@ from\n%@", self, @(scrollerStyle), [NSThread callStackSymbols]);
+    DLog(@"%@: set scroller style to %@ from %@:\n%@", self, @(scrollerStyle), @(self.scrollerStyle), [NSThread callStackSymbols]);
 
     if (scrollerStyle != NSScrollerStyleOverlay) {
         _ptyScrollerState = PTYScrollerStateLegacy;
@@ -135,13 +130,21 @@
     }
     [self.ptyScrollerDelegate ptyScrollerDidTransitionToState:_ptyScrollerState];
 
-    if (@available(macOS 10.14, *)) {
-        if (PTYScrollView.shouldDismember) {
-            [self dismemberForScrollerStyle:scrollerStyle];
-            return;
-        }
+    if (PTYScrollView.shouldDismember) {
+        [self dismemberForScrollerStyle:scrollerStyle];
+        return;
     }
     [super setScrollerStyle:scrollerStyle];
+}
+
+- (void)setFrame:(NSRect)frame {
+    DLog(@"%@: set frame to %@ from %@\n%@", self, NSStringFromRect(frame), NSStringFromRect(self.frame), [NSThread callStackSymbols]);
+    [super setFrame:frame];
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+    DLog(@"%@: set frame size to %@ from %@\n%@", self, NSStringFromSize(newSize), NSStringFromSize(self.frame.size), [NSThread callStackSymbols]);
+    [super setFrameSize:newSize];
 }
 
 - (iTermScrollAccumulator *)accumulator {
@@ -187,6 +190,12 @@
     return [self scrollerStyle] == NSScrollerStyleLegacy;
 }
 
+- (void)viewDidChangeEffectiveAppearance {
+    DLog(@"Appearance of %@ is now %@ from %@",
+         self, self.effectiveAppearance, [NSThread callStackSymbols]);
+    [super viewDidChangeEffectiveAppearance];
+}
+
 @end
 
 @implementation PTYScrollView {
@@ -214,19 +223,11 @@
         DLog(@"Set new scroller's style  %@ -> %@", @(aScroller.scrollerStyle), @([NSScroller preferredScrollerStyle]));
         aScroller.scrollerStyle = [NSScroller preferredScrollerStyle];
         [self setVerticalScroller:aScroller];
-        [aScroller release];
         self.verticalScrollElasticity = NSScrollElasticityNone;
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(it_scrollViewDidScroll:) name:NSScrollViewDidLiveScrollNotification object:self];
     }
 
     return self;
-}
-
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [_scroller release];
-
-    [super dealloc];
 }
 
 - (NSString *)description {
@@ -245,9 +246,9 @@
 - (CGFloat)accumulateVerticalScrollFromEvent:(NSEvent *)theEvent {
     const CGFloat lineHeight = self.verticalLineScroll;
     if ([iTermAdvancedSettingsModel useModernScrollWheelAccumulator]) {
-        return [self.ptyVerticalScroller.accumulator deltaYForEvent:theEvent lineHeight:lineHeight];
+        return [self.ptyVerticalScroller.accumulator deltaForEvent:theEvent increment:lineHeight];
     } else {
-        return [self.ptyVerticalScroller.accumulator legacyDeltaYForEvent:theEvent lineHeight:lineHeight];
+        return [self.ptyVerticalScroller.accumulator legacyDeltaForEvent:theEvent increment:lineHeight];
     }
 }
 
@@ -309,8 +310,7 @@
 }
 
 - (void)setVerticalScroller:(NSScroller *)verticalScroller {
-    [_scroller autorelease];
-    _scroller = [verticalScroller retain];
+    _scroller = verticalScroller;
     [super setVerticalScroller:verticalScroller];
 }
 

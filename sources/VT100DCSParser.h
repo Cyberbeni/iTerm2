@@ -11,14 +11,27 @@
 #import "iTermParser.h"
 #import "CVector.h"
 
+NS_ASSUME_NONNULL_BEGIN
+
 @protocol VT100DCSParserHook<NSObject>
 
 @property(nonatomic, readonly) NSString *hookDescription;
 
+typedef NS_ENUM(NSUInteger, VT100DCSParserHookResult) {
+    // Can't continue until new input arrives.
+    VT100DCSParserHookResultBlocked,
+
+    // May have done a partial read. Check again. (formerly NO)
+    VT100DCSParserHookResultCanReadAgain,
+
+    // Totally broken. Unhook the parser.  (formerly YES)
+    VT100DCSParserHookResultUnhook
+};
+
 // Return YES if it should unhook.
-- (BOOL)handleInput:(iTermParserContext *)context
-support8BitControlCharacters:(BOOL)support8BitControlCharacters
-              token:(VT100Token *)result;
+- (VT100DCSParserHookResult)handleInput:(iTermParserContext *)context
+           support8BitControlCharacters:(BOOL)support8BitControlCharacters
+                                  token:(VT100Token *)result;
 
 @end
 
@@ -27,6 +40,9 @@ typedef NS_ENUM(NSInteger, DcsTermcapTerminfoRequestName) {
     kDcsTermcapTerminfoRequestTerminalName,
     kDcsTermcapTerminfoRequestiTerm2ProfileName,
     kDcsTermcapTerminfoRequestTerminfoName,
+    kDcsTermcapTerminfoRequestNumberOfColors,
+    kDcsTermcapTerminfoRequestNumberOfColors2,
+    kDcsTermcapTerminfoRequestDirectColorWidth,
 
     // key_backspace               kbs       kb     backspace key
     kDcsTermcapTerminfoRequestKey_kb,
@@ -275,6 +291,10 @@ typedef NS_ENUM(NSInteger, VT100DCSState) {
 - (void)reset;
 
 - (void)startTmuxRecoveryModeWithID:(NSString *)dcsID;
+- (void)cancelTmuxRecoveryMode;
+
+- (void)startConductorRecoveryModeWithID:(NSString *)dcsID;
+- (void)cancelConductorRecoveryMode;
 
 @end
 
@@ -288,3 +308,6 @@ typedef NS_ENUM(NSInteger, VT100DCSState) {
 @property(nonatomic, readonly) NSString *data;
 
 @end
+
+NS_ASSUME_NONNULL_END
+

@@ -38,7 +38,7 @@
     // Does nothing because the point of this thing is to not redo unnecessary work.
 }
 
-- (NSKeyedUnarchiver *)unarchiver {
+- (NSKeyedUnarchiver * _Nullable)unarchiver {
     NSKeyedArchiver *archiver = [[NSKeyedArchiver alloc] initRequiringSecureCoding:NO];
     archiver.requiresSecureCoding = NO;
     [archiver encodeInteger:_index forKey:@"index"];
@@ -164,6 +164,7 @@
     [_db whenReady:^{
         DLog(@"db is ready now");
         completion([[iTermRestorableStateSQLiteIndex alloc] initWithGraphRecord:self->_db.record]);
+        [self->_db doHousekeeping];
     }];
 }
 

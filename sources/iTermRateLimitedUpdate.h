@@ -8,6 +8,8 @@
 
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface iTermRateLimitedUpdate : NSObject
 
 @property (nonatomic) NSTimeInterval minimumInterval;
@@ -17,6 +19,7 @@
 // When suppression mode is off, the last invocation during the idle time will run after the idle time ends.
 // When suppression mode is on, any invocations during the idle time will be ignored.
 @property (nonatomic) BOOL suppressionMode;
+@property (nonatomic, strong) dispatch_queue_t queue;
 
 - (instancetype)initWithName:(NSString *)name
                 minimumInterval:(NSTimeInterval)minimumInterval NS_DESIGNATED_INITIALIZER;
@@ -31,7 +34,7 @@
 // A target/action version of the above.
 - (void)performRateLimitedSelector:(SEL)selector
                           onTarget:(id)target
-                        withObject:(id)object;
+                        withObject:(id _Nullable)object;
 
 // If there is a pending block, do it now (synchronously) and cancel the delayed perform.
 - (void)force;
@@ -50,3 +53,4 @@
 @interface iTermRateLimitedIdleUpdate : iTermRateLimitedUpdate
 @end
 
+NS_ASSUME_NONNULL_END

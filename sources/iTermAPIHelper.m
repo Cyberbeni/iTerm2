@@ -212,7 +212,7 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
     NSSet<NSString *> *providedArguments = [NSSet setWithArray:explicitParameters.allKeys];
     NSSet<NSString *> *requiredArguments = [self it_requiredArguments];
     if (![requiredArguments isSubsetOfSet:providedArguments]) {
-        // Does not contain all required arguments
+        DLog(@"Does not contain all required arguments. require=%@ have=%@", requiredArguments, providedArguments);
         return NO;
     }
 
@@ -221,25 +221,33 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
     for (ITMRPCRegistrationRequest_RPCArgument *defaultArgument in self.defaultsArray) {
         NSString *name = defaultArgument.name;
         NSString *path = defaultArgument.path;
+        DLog(@"Try default argument %@=%@", name, path);
         BOOL isOptional = NO;
         if ([path hasSuffix:@"?"]) {
+            DLog(@"is optional");
             isOptional = YES;
             path = [path substringToIndex:path.length - 1];
         }
         if (params[name]) {
+            DLog(@"don't care, there was an explicit value provided");
             // An explicit value was provided, which overrides the default.
             continue;
         }
         id value = [scope valueForVariableName:path];
+        DLog(@"value=%@", value);
         if (value) {
+            DLog(@"accept value");
             params[name] = value;
             continue;
         }
         if (!isOptional) {
+            DLog(@"Fail - missing non-optional value for %@", name);
             return NO;
         }
+        DLog(@"accept nil value");
         params[name] = [NSNull null];
     }
+    DLog(@"Success. Set fullParameters to %@", params);
     *fullParameters = params;
     return YES;
 }
@@ -387,39 +395,57 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
     return result;
 }
 
-+ (BOOL)internalRequireApplescriptAuth {
++ (iTermNoAuthStatus)noAuthStatus:(out NSString **)contentsPtr {
     NSError *error = nil;
     NSDictionary<NSFileAttributeKey, id> *attributes =
         [[NSFileManager defaultManager] attributesOfItemAtPath:[self noauthPath]
                                                          error:&error];
     if (!attributes || error) {
-        return YES;
+        return iTermNoAuthStatusNone;
     }
     if ([attributes[NSFileOwnerAccountID] integerValue] != 0) {
-        return YES;
+        return iTermNoAuthStatusNone;
+    }
+    NSString *actualContents = [NSString stringWithContentsOfFile:[self noauthPath] encoding:NSUTF8StringEncoding error:nil];
+    if (contentsPtr) {
+        *contentsPtr = actualContents;
+    }
+    const BOOL contentsCorrect = [[self noauthMagic] isEqualToString:actualContents];
+    if (contentsCorrect) {
+        return iTermNoAuthStatusValid;
+    }
+    return iTermNoAuthStatusCorrupt;
+}
+
++ (BOOL)internalRequireApplescriptAuth {
+    NSString *actualContents = nil;
+    switch ([self noAuthStatus:&actualContents]) {
+        case iTermNoAuthStatusNone:
+            return YES;
+        case iTermNoAuthStatusValid:
+            return NO;
+        case iTermNoAuthStatusCorrupt:
+            break;
     }
     static NSString *valueForLastWarning = nil;
-    NSString *actualContents = [NSString stringWithContentsOfFile:[self noauthPath] encoding:NSUTF8StringEncoding error:nil];
-    const BOOL contentsCorrect = [[self noauthMagic] isEqualToString:actualContents];
-    if (!contentsCorrect) {
-        if (valueForLastWarning && [valueForLastWarning isEqualToString:actualContents]) {
-            return YES;
-        }
-        valueForLastWarning = actualContents;
-
-        const iTermWarningSelection selection =
-        [iTermWarning showWarningWithTitle:@"The location of your Application Support directory appears to have moved or its contents have changed unexpectedly. As a precaution, the authentication mechanism for Python API scripts for iTerm2 has been reverted to always require Automation permission."
-                                   actions:@[ @"OK", @"Reveal Preference" ]
-                                 accessory:nil
-                                identifier:@"NoSyncAppSupportMoved"
-                               silenceable:kiTermWarningTypePermanentlySilenceable
-                                   heading:@"Python API Permissions Reset"
-                                    window:nil];
-        if (selection == kiTermWarningSelection1) {
-            [[PreferencePanel sharedInstance] openToPreferenceWithKey:kPreferenceKeyAPIAuthentication];
-        }
+    if (valueForLastWarning && [valueForLastWarning isEqualToString:actualContents]) {
+        return YES;
     }
-    return !contentsCorrect;
+    valueForLastWarning = actualContents;
+
+    const iTermWarningSelection selection =
+    [iTermWarning showWarningWithTitle:@"The location of your Application Support directory appears to have moved or its contents have changed unexpectedly. As a precaution, the authentication mechanism for Python API scripts for iTerm2 has been reverted to always require Automation permission."
+                               actions:@[ @"OK", @"Reveal Preference" ]
+                             accessory:nil
+                            identifier:@"NoSyncAppSupportMoved"
+                           silenceable:kiTermWarningTypePermanentlySilenceable
+                               heading:@"Python API Permissions Reset"
+                                window:nil];
+    if (selection == kiTermWarningSelection1) {
+        [[PreferencePanel sharedInstance] openToPreferenceWithKey:kPreferenceKeyAPIAuthentication];
+    }
+
+    return YES;
 }
 
 + (BOOL)createNoAuthFile:(NSWindow *)window {
@@ -500,7 +526,7 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
     NSString *path = [self noauthPath];
     path = [path stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
     path = [path stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\\\\\""];
-    NSString *sourceCode = [NSString stringWithFormat:@"do shell script \"umask 077; TF=$(mktemp); printf '%%s' '%@' > \\\"$TF\\\" && chmod a+r \\\"$TF\\\" && mv \\\"$TF\\\" \\\"%@\\\" || rm -f \\\"$TF\\\"\" with administrator privileges",
+    NSString *sourceCode = [NSString stringWithFormat:@"do shell script \"umask 077; TF=$(mktemp); printf '%%s' '%@' > \\\"$TF\\\" && chmod a+r \\\"$TF\\\" && mv \\\"$TF\\\" \\\"%@\\\" || rm -f \\\"$TF\\\"\" with prompt \"iTerm2 needs to modify a secure setting.\" with administrator privileges",
                             [self noauthMagic],
                             path];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:sourceCode];
@@ -646,6 +672,14 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
                                                  selector:@selector(layoutChanged:)
                                                      name:iTermDidCreateTerminalWindowNotification
                                                    object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(layoutChanged:)
+                                                     name:NSWindowDidEndLiveResizeNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(layoutChanged:)
+                                                     name:@"iTermWindowDidResize"
+                                                   object:nil];
         // End layoutChanged:
 
         [[NSNotificationCenter defaultCenter] addObserver:self
@@ -683,6 +717,10 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(profileDidChange:)
                                                      name:kReloadAddressBookNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(sessionDidResize:)
+                                                     name:PTYSessionDidResizeNotification
                                                    object:nil];
     }
     return self;
@@ -789,6 +827,30 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
         notification.terminateSessionNotification.sessionId = session.guid;
         [self postAPINotification:notification toConnectionKey:key];
     }];
+}
+
+- (void)sessionDidResize:(NSNotification *)notification {
+    PTYSession *session = notification.object;
+    DLog(@"%@", session);
+    if (![session isKindOfClass:[PTYSession class]]) {
+        DLog(@"Not a session");
+        return;
+    }
+    NSWindow *window = session.delegate.realParentWindow.window;
+    if (!window) {
+        DLog(@"No window");
+        return;
+    }
+    if (window.inLiveResize) {
+        DLog(@"In live resize");
+        return;
+    }
+    if (session.delegate.sessionBelongsToTabWhoseSplitsAreBeingDragged) {
+        DLog(@"Splits being dragged");
+        return;
+    }
+    DLog(@"Calling layoutChanged:");
+    [self layoutChanged:nil];
 }
 
 - (void)layoutChanged:(NSNotification *)notification {
@@ -954,21 +1016,30 @@ static BOOL iTermAPIHelperLastApplescriptAuthRequiredSetting;
                        explicitParameters:(NSDictionary<NSString *, id> *)explicitParameters
                                     scope:(iTermVariableScope *)scope
                            fullParameters:(out NSDictionary<NSString *, id> **)fullParameters {
+    DLog(@"Looking for connection key for rpc. name=%@ params=%@", name, explicitParameters);
     if ([name hasPrefix:@"iterm2."]) {
+        DLog(@"Private namespace - reject");
+        *fullParameters = explicitParameters;
         return nil;
     }
+    DLog(@"All RPC subscriptions:\n%@", self.serverOriginatedRPCSubscriptions);
     for (NSString *signature in self.serverOriginatedRPCSubscriptions) {
+        DLog(@"Consider %@", signature);
         iTermTuple<id, ITMNotificationRequest *> *tuple = self.serverOriginatedRPCSubscriptions[signature];
         ITMNotificationRequest *request = tuple.secondObject;
         if (![request.rpcRegistrationRequest.it_fullyQualifiedName isEqualToString:name]) {
+            DLog(@"%@ does not match %@, reject", request.rpcRegistrationRequest.it_fullyQualifiedName, name);
             continue;
         }
         if ([request.rpcRegistrationRequest it_satisfiesExplicitParameters:explicitParameters
                                                                      scope:scope
                                                             fullParameters:fullParameters]) {
+            DLog(@"Accept it");
             return tuple.firstObject;
         }
+        DLog(@"Does not satisfy explicit parameters, reject");
     }
+    *fullParameters = explicitParameters;
     return nil;
 }
 

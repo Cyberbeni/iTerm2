@@ -42,6 +42,10 @@
 - (void)advancedPasteWithConfiguration:(NSString *)configuration
                          fromSelection:(BOOL)fromSelection
                              withEvent:(NSEvent *)event;
+- (void)selectMenuItemWithIdentifier:(NSString *)identifier
+                               title:(NSString *)title
+                               event:(NSEvent *)event;
+- (void)invokeScriptFunction:(NSString *)function withEvent:(NSEvent *)event;
 @end
 
 @interface PointerController : NSObject

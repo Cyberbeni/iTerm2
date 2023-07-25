@@ -210,7 +210,7 @@ static iTermController *gSharedInstance;
     [_restorableSessions release];
     [_currentRestorableSessionsStack release];
     [_fullScreenWindowManager release];
-    [_lastSelection release];
+    [_lastSelectionPromise release];
     [_setCurrentTerminalHelper release];
     [super dealloc];
 }
@@ -288,8 +288,8 @@ static iTermController *gSharedInstance;
 }
 
 - (BOOL)terminalIsObscured:(id<iTermWindowController>)terminal {
-    static const double kOcclusionThreshold = 0.4;
-    return [self terminalIsObscured:terminal threshold:kOcclusionThreshold];
+    return [self terminalIsObscured:terminal
+                          threshold:[iTermAdvancedSettingsModel notificationOcclusionThreshold]];
 }
 
 - (BOOL)terminalIsObscured:(id<iTermWindowController>)terminal threshold:(double)threshold {
@@ -326,6 +326,15 @@ static iTermController *gSharedInstance;
 - (void)newSessionWithSameProfile:(id)sender newWindow:(BOOL)newWindow {
     Profile *bookmark = nil;
     if (_frontTerminalWindowController) {
+        const BOOL tmux = [[_frontTerminalWindowController currentSession] isTmuxClient];
+        if (tmux) {
+            if (newWindow) {
+                [_frontTerminalWindowController newTmuxWindow:sender];
+            } else {
+                [_frontTerminalWindowController newTmuxTabAtIndex:nil];
+            }
+            return;
+        }
         bookmark = [[_frontTerminalWindowController currentSession] profile];
     }
     BOOL divorced = ([[ProfileModel sessionsInstance] bookmarkWithGuid:bookmark[KEY_GUID]] != nil);
@@ -369,6 +378,12 @@ static iTermController *gSharedInstance;
                               didMakeSession:nil
                                   completion:nil];
     }
+}
+
+- (NSArray<PTYSession *> *)allSessions {
+    return [_terminalWindows flatMapWithBlock:^NSArray *(PseudoTerminal *anObject) {
+        return anObject.allSessions;
+    }];
 }
 
 - (NSArray<PseudoTerminal *> *)terminalsSortedByNumber {
@@ -963,7 +978,15 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
     [self openNewSessionsFromMenu:[sender menu] inNewWindow:YES];
 }
 
+- (NSString *)ancestryIdentifierForMenu:(NSMenu *)menu {
+    if (!menu.supermenu) {
+        return menu.title;
+    }
+    return [menu.title stringByAppendingFormat:@".%@", [self ancestryIdentifierForMenu:menu.supermenu]];
+}
+
 - (void)addBookmarksToMenu:(NSMenu *)aMenu
+                 supermenu:(NSMenu *)supermenu
               withSelector:(SEL)selector
            openAllSelector:(SEL)openAllSelector
                 startingAt:(int)startingAt {
@@ -983,7 +1006,8 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
                         startingAtItem:startingAt
                               withTags:[b objectForKey:KEY_TAGS]
                                 params:params
-                                 atPos:i];
+                                 atPos:i
+                            identifier:nil];
     }
 }
 
@@ -1071,6 +1095,7 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
 
 - (void)didFinishCreatingTmuxWindow:(PseudoTerminal *)windowController {
     [[[iTermHotKeyController sharedInstance] profileHotKeyForWindowController:windowController] showHotKeyWindow];
+    [windowController ensureSaneFrame];
 }
 
 - (void)makeTerminalWindowFullScreen:(NSWindowController<iTermWindowController> *)term {
@@ -1423,6 +1448,67 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
     NSArray<NSString *> *const combinedArray = [@[escapedCommand] arrayByAddingObjectsFromArray:escapedArguments];
     NSString *const commandLine = [combinedArray componentsJoinedByString:@" "];
     return [NSString stringWithFormat:@"sh -c \"%@\"", commandLine];
+}
+
+- (NSWindow *)openSingleUseLoginWindowAndWrite:(NSData *)data completion:(void (^)(PTYSession *session))completion {
+    MutableProfile *profile = [[[[ProfileModel sharedInstance] defaultProfile] mutableCopy] autorelease];
+    profile[KEY_CUSTOM_DIRECTORY] = kProfilePreferenceInitialDirectoryHomeValue;
+    profile[KEY_CUSTOM_COMMAND] = kProfilePreferenceCommandTypeCustomShellValue;
+    if ([profile[KEY_WINDOW_TYPE] integerValue] == WINDOW_TYPE_TRADITIONAL_FULL_SCREEN ||
+        [profile[KEY_WINDOW_TYPE] integerValue] == WINDOW_TYPE_LION_FULL_SCREEN) {
+        profile[KEY_WINDOW_TYPE] = @(iTermWindowDefaultType());
+    }
+
+    PseudoTerminal *term = nil;
+    term = [[[PseudoTerminal alloc] initWithSmartLayout:YES
+                                             windowType:WINDOW_TYPE_ACCESSORY
+                                        savedWindowType:WINDOW_TYPE_ACCESSORY
+                                                 screen:-1
+                                       hotkeyWindowType:iTermHotkeyWindowTypeNone
+                                                profile:profile] autorelease];
+    [self addTerminalWindow:term];
+
+    DLog(@"Open login window");
+    void (^makeSession)(Profile *, PseudoTerminal *, void (^)(PTYSession *)) =
+    ^(Profile *profile, PseudoTerminal *term, void (^makeSessionCompletion)(PTYSession *))  {
+        profile = [profile dictionaryBySettingObject:@"" forKey:KEY_INITIAL_TEXT];
+        profile = [profile dictionaryBySettingObject:@(iTermSessionEndActionClose)
+                                              forKey:KEY_SESSION_END_ACTION];
+        term.window.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
+        profile = [profile dictionaryBySettingObject:@0 forKey:KEY_UNDO_TIMEOUT];
+
+        [term asyncCreateTabWithProfile:profile
+                            withCommand:nil
+                            environment:nil
+                               tabIndex:nil
+                         didMakeSession:^(PTYSession *session) {
+            session.shortLivedSingleUse = YES;
+            session.isSingleUseSession = YES;
+            if (data) {
+                [session writeLatin1EncodedData:data broadcastAllowed:NO reporting:NO];
+            }
+            makeSessionCompletion(session);
+        }
+                             completion:nil];
+    };
+    [iTermSessionLauncher launchBookmark:profile
+                              inTerminal:term
+                                 withURL:nil
+                        hotkeyWindowType:iTermHotkeyWindowTypeNone
+                                 makeKey:YES
+                             canActivate:YES
+                      respectTabbingMode:NO
+                                   index:nil
+                                 command:nil
+                             makeSession:makeSession
+                          didMakeSession:^(PTYSession *session) { }
+                              completion:^(PTYSession * _Nonnull session, BOOL ok) {
+        if (completion) {
+            completion(ok ? session : nil);
+        }
+    }];
+    [term.window makeKeyAndOrderFront:nil];
+    return term.window;
 }
 
 // This is meant for standalone command lines when used with DoNotEscape, like: man date || sleep 3

@@ -7,7 +7,28 @@
 //
 
 #import "NSScreen+iTerm.h"
+
+#import "DebugLogging.h"
 #import "NSArray+iTerm.h"
+#import "NSDate+iTerm.h"
+#import "NSObject+iTerm.h"
+#import "iTermTuple.h"
+#import "iTerm2SharedARC-Swift.h"
+
+static char iTermNSScreenSupportsHighFrameRatesCacheKey;
+
+@interface iTermTuple(Array)
+@property (nonatomic, readonly) NSPoint pointValue;
+@end
+
+@implementation iTermTuple(Array)
+
+- (NSPoint)pointValue {
+    return NSMakePoint([NSNumber castFrom:self.firstObject].doubleValue,
+                       [NSNumber castFrom:self.secondObject].doubleValue);
+}
+
+@end
 
 @implementation NSScreen (iTerm)
 
@@ -39,6 +60,92 @@
         }
     }
     return nil;
+}
+
+static CGFloat iTermAreaOfIntersection(NSRect r1, NSRect r2) {
+    const NSRect intersection = NSIntersectionRect(r1, r2);
+    return intersection.size.width * intersection.size.height;
+}
+
++ (double)fractionOfFrameOnAnyScreen:(NSRect)frame
+                   recommendedOrigin:(NSPoint *)recommendedOriginPtr {
+    __block double areaOnScreen = 0;
+    [self.screens enumerateObjectsUsingBlock:^(NSScreen * _Nonnull screen, NSUInteger idx, BOOL * _Nonnull stop) {
+        areaOnScreen += iTermAreaOfIntersection(screen.frame, frame);
+    }];
+    const double frameArea = frame.size.width * frame.size.height;
+    const double fraction = areaOnScreen / frameArea;
+    if (!recommendedOriginPtr) {
+        return fraction;
+    }
+    *recommendedOriginPtr = frame.origin;
+    if (frameArea <= areaOnScreen) {
+        return fraction;
+    }
+    // Try to find a better origin.
+    NSScreen *mainScreen = [self bestScreenForRect:frame];
+    if (!mainScreen) {
+        return fraction;
+    }
+
+    *recommendedOriginPtr = [mainScreen improvedOrigin:frame];
+    return fraction;
+}
+
++ (NSScreen *)bestScreenForRect:(NSRect)frame {
+    return [self.screens maxWithBlock:^NSComparisonResult(NSScreen *obj1, NSScreen *obj2) {
+        const CGFloat lhs = iTermAreaOfIntersection(obj1.frame, frame);
+        const CGFloat rhs = iTermAreaOfIntersection(obj2.frame, frame);
+        if (lhs != rhs) {
+            return [@(lhs) compare:@(rhs)];
+        }
+        // Tiebreak by choosing leftmost screen so the comparison is stable.
+        if (obj1.frame.origin.x != obj2.frame.origin.x) {
+            return [@(obj1.frame.origin.x) compare:@(obj2.frame.origin.x)];
+        }
+        return [@(obj1.frame.origin.y)compare:@(obj2.frame.origin.y)];
+    }];
+}
+
+- (NSPoint)improvedOrigin:(NSRect)frame {
+    const NSRect myFrame = self.visibleFrame;
+    NSArray<NSNumber *> *xOriginCandidates = @[
+        @(NSMinX(myFrame)),
+        @(NSMaxX(myFrame) - NSWidth(frame)),
+        @(NSMinX(frame))
+    ];;
+    NSArray<NSNumber *> *yOriginCandidates = @[
+        @(NSMinY(myFrame)),
+        @(NSMaxY(myFrame) - NSHeight(frame)),
+        @(NSMinY(frame))
+    ];
+    NSArray<iTermTuple<NSNumber *, NSNumber *> *> *tuples = [iTermTuple cartesianProductOfArray:xOriginCandidates
+                                                                                           with:yOriginCandidates];
+    double (^l2)(NSPoint, NSPoint) = ^double(NSPoint p1, NSPoint p2) {
+        const double dx = p1.x - p2.x;
+        const double dy = p1.y - p2.y;
+        return sqrt(dx * dx + dy * dy);
+    };
+    iTermTuple<NSNumber *, NSNumber *> *best = [tuples maxWithBlock:^NSComparisonResult(iTermTuple<NSNumber *, NSNumber *> *v1,
+                                                                                        iTermTuple<NSNumber *, NSNumber *> *v2) {
+        const NSPoint p1 = v1.pointValue;
+        const NSPoint p2 = v2.pointValue;
+
+        const NSRect r1 = NSMakeRect(p1.x, p1.y, NSWidth(frame), NSHeight(frame));
+        const NSRect r2 = NSMakeRect(p2.x, p2.y, NSWidth(frame), NSHeight(frame));
+
+        const double a1 = iTermAreaOfIntersection(r1, myFrame);
+        const double a2 = iTermAreaOfIntersection(r2, myFrame);
+
+        if (a1 != a2) {
+            return [@(a1) compare:@(a2)];
+        }
+
+        const CGFloat d1 = l2(p1, frame.origin);
+        const CGFloat d2 = l2(p2, frame.origin);
+        return [@(-d1) compare:@(-d2)];
+    }];
+    return best.pointValue;
 }
 
 - (NSRect)visibleFrameIgnoringHiddenDock {
@@ -92,16 +199,41 @@
     return NO;
 }
 
+- (CGFloat)notchHeight {
+    if (@available(macOS 12.0, *)) {
+        return self.safeAreaInsets.top;
+    }
+    return 0;
+}
+
+- (NSRect)frameExceptNotch {
+    NSRect frame = self.frame;
+    const CGFloat notchHeight = [self notchHeight];
+    frame.size.height -= notchHeight;
+    return frame;
+}
+
+- (CGFloat)it_menuBarHeight {
+    if (@available(macOS 12, *)) {
+        // When the "current" screen has a notch, there doesn't seem to be a way to get the height
+        // of the menu bar on other screens :(
+        return MAX(24, self.safeAreaInsets.top);
+    }
+    return NSApp.mainMenu.menuBarHeight;
+}
+
 - (NSRect)frameExceptMenuBar {
     if ([[NSScreen screens] firstObject] == self || [NSScreen screensHaveSeparateSpaces]) {
         NSRect frame = self.frame;
-        // NSApp.mainMenu.menuBarHeight returns 0 when there's a Lion
-        // fullscreen window in another display. I guess it will probably
-        // always be 22 :)
-        frame.size.height -= 22;
+        // NSApp.mainMenu.menuBarHeight used to return 0 when there's a Lion
+        // fullscreen window in another display, and it still does if the menu bar is hidden.
+        // Use a collection of hacks to make a better guess.
+        const CGFloat hackyGuess = NSHeight(self.frame) - NSHeight(self.visibleFrame) - NSMinY(self.visibleFrame) + NSMinY(self.frame) - 1;
+        const CGFloat notchHeight = [self notchHeight];
+        frame.size.height -= MAX(MAX(hackyGuess, [self it_menuBarHeight]), notchHeight);
         return frame;
     } else {
-        return self.frame;
+        return [self frameExceptNotch];
     }
 }
 
@@ -126,61 +258,8 @@
     return (CGDirectDisplayID)number.unsignedLongLongValue;
 }
 
-static io_service_t iTermGetIOService(CGDirectDisplayID displayID) {
-    io_iterator_t serialPortIterator = 0;
-    io_service_t ioServ = 0;
-    CFMutableDictionaryRef matching = IOServiceMatching("IODisplayConnect");
-    const kern_return_t kernResult = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &serialPortIterator);
-    if (kernResult != KERN_SUCCESS) {
-        return 0;
-    }
-    if (serialPortIterator == 0) {
-        return 0;
-    }
-
-    ioServ = IOIteratorNext(serialPortIterator);
-    while (ioServ != 0) {
-        NSDictionary *info = (__bridge_transfer NSDictionary *)IODisplayCreateInfoDictionary(ioServ, kIODisplayOnlyPreferredName);
-        const unsigned int vendorID = [info[@kDisplayVendorID] unsignedIntValue];
-        const unsigned int productID = [info[@kDisplayProductID] unsignedIntValue];
-        const unsigned int serialNumber = [info[@kDisplaySerialNumber] unsignedIntValue];
-
-        if (CGDisplayVendorNumber(displayID) == vendorID &&
-            CGDisplayModelNumber(displayID) == productID &&
-            CGDisplaySerialNumber(displayID) == serialNumber) {
-            return ioServ;
-        }
-
-        ioServ = IOIteratorNext(serialPortIterator);
-    }
-    return 0;
-}
-
-- (NSString *)it_legacyNonUniqueName NS_DEPRECATED_MAC(10_14, 10_15) {
-    const CGDirectDisplayID displayID = [self it_displayID];
-    io_service_t ioServicePort = iTermGetIOService(displayID);
-    if (ioServicePort == 0) {
-        return [self it_fallbackName];
-    }
-
-    NSDictionary *info = (__bridge_transfer NSDictionary *)IODisplayCreateInfoDictionary(ioServicePort, kIODisplayOnlyPreferredName);
-    if (!info) {
-        return [self it_fallbackName];
-    }
-
-    NSDictionary *productName = info[@"DisplayProductName"];
-    if (!productName.allValues.firstObject) {
-        return [self it_fallbackName];
-    }
-    return productName.allValues.firstObject;
-}
-
 - (NSString *)it_nonUniqueName {
-    if (@available(macOS 10.15, *)) {
-        return [self localizedName];
-    } else {
-        return [self it_legacyNonUniqueName];
-    }
+    return [self localizedName];
 }
 
 - (NSString *)it_fallbackName {
@@ -290,30 +369,101 @@ static io_service_t iTermGetIOService(CGDirectDisplayID displayID) {
         return YES;
     }];
     if (myWindowIsFullScreenOnThisScreen) {
+        DLog(@"No - one of my windows is fullscreen on %@", self);
         return NO;
     }
     NSSet<NSNumber *> *windowNumbers = [NSSet setWithArray:[[NSApp windows] mapWithBlock:^id(NSWindow *window) {
         return @(window.windowNumber);
     }]];
     NSArray<NSDictionary *> *allInfos = [NSScreen it_allWindowInfoDictionaries];
-    return [allInfos anyWithBlock:^BOOL(NSDictionary *windowInfo) {
-        const CGRect windowFrame = [NSScreen windowBoundsRectFromWindowInfoDictionary:windowInfo];
-        if (!NSEqualRects(windowFrame, screenFrame)) {
-            return NO;
-        }
+    NSArray<NSDictionary *> *relevantInfos = [allInfos filteredArrayUsingBlock:^BOOL(NSDictionary *windowInfo) {
+        DLog(@"Consider %@", windowInfo);
         if ([windowInfo[(__bridge NSString *)kCGWindowAlpha] doubleValue] <= 0) {
+            DLog(@"Reject: Nonpositive alpha");
             return NO;
         }
         if (![windowInfo[(__bridge NSString *)kCGWindowIsOnscreen] boolValue]) {
+            DLog(@"Reject: not on screen");
             return NO;
         }
         NSNumber *windowNumber = windowInfo[(__bridge NSString *)kCGWindowNumber];
         if ([windowNumbers containsObject:windowNumber]) {
+            DLog(@"Reject: this is my window");
             // Is my own window.
+            return NO;
+        }
+        if ([windowInfo[(__bridge  NSString *)kCGWindowOwnerName] isEqual:@"Window Server"] &&
+            [windowInfo[(__bridge  NSString *)kCGWindowName] isEqual:@"Menubar"]) {
+            DLog(@"Accept: is menu bar");
+            return YES;
+        }
+        if ([windowInfo[(__bridge NSString *)kCGWindowLayer] doubleValue] > 0) {
+            DLog(@"Reject: Higher layer");
+            return NO;
+        }
+        const CGRect windowFrame = [NSScreen windowBoundsRectFromWindowInfoDictionary:windowInfo];
+        if (!NSIntersectsRect(windowFrame, screenFrame)) {
+            DLog(@"Reject: Not on this screen");
             return NO;
         }
         return YES;
     }];
+    return [self windowInfos:relevantInfos framesTileScreenFrame:screenFrame];
+}
+
+- (BOOL)windowInfos:(NSArray<NSDictionary *> *)infos framesTileScreenFrame:(NSRect)screenFrame {
+    iTermTilingChecker *checker = [[iTermTilingChecker alloc] init];
+    for (NSDictionary *windowInfo in infos) {
+        const CGRect windowFrame = [NSScreen windowBoundsRectFromWindowInfoDictionary:windowInfo];
+        [checker addRect:windowFrame];
+    }
+    // For some reason there's a 1 pixel margin on the left that goes unused (at least in Ventura)
+    // This is a terrible hack but I can't find any other way to determine if you're on a desktop
+    // for some other app's fullscren window and this tiling BS is needed for split screen FS windows.
+    [checker addRect:NSMakeRect(screenFrame.origin.x, screenFrame.origin.y, 1, screenFrame.size.height)];
+    return [checker tilesFrame:screenFrame];
+}
+
+- (NSNumber *)it_cachedSupportsHighFrameRates {
+    iTermTuple<NSNumber *, NSNumber *> *tuple = [self it_associatedObjectForKey:&iTermNSScreenSupportsHighFrameRatesCacheKey];
+    if (!tuple) {
+        return nil;
+    }
+    const NSTimeInterval now = [NSDate it_timeSinceBoot];
+    const NSTimeInterval age = now - tuple.secondObject.doubleValue;
+    if (age > 1) {
+        return nil;
+    }
+    return tuple.firstObject;
+}
+
+- (void)it_setSupportsHighFrameRates:(BOOL)value {
+    iTermTuple<NSNumber *, NSNumber *> *tuple = [iTermTuple tupleWithObject:@(value)
+                                                                  andObject:@([NSDate it_timeSinceBoot])];
+    [self it_setAssociatedObject:tuple forKey:&iTermNSScreenSupportsHighFrameRatesCacheKey];
+}
+
+- (BOOL)it_supportsHighFrameRates {
+    NSNumber *cached = [self it_cachedSupportsHighFrameRates];
+    if (cached) {
+        return [cached boolValue];
+    }
+    CGDirectDisplayID displayID = [self it_displayID];
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
+    const double refreshRate = mode ? CGDisplayModeGetRefreshRate(mode) : 60;
+    CGDisplayModeRelease(mode);
+    const BOOL result = refreshRate >= 120;
+    [self it_setSupportsHighFrameRates:result];
+    return result;
+}
+
++ (NSScreen *)screenContainingCoordinate:(NSPoint)point {
+    for (NSScreen *screen in [NSScreen screens]) {
+        if (NSPointInRect(point, screen.frame)) {
+            return screen;
+        }
+    }
+    return nil;
 }
 
 @end

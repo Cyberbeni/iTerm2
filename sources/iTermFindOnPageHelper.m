@@ -7,10 +7,20 @@
 //
 
 #import "iTermFindOnPageHelper.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "DebugLogging.h"
 #import "FindContext.h"
 #import "iTermSelection.h"
 #import "SearchResult.h"
+
+@interface FindCursor()
+@property (nonatomic, readwrite) FindCursorType type;
+@property (nonatomic, readwrite) VT100GridAbsCoord coord;
+@property (nonatomic, strong, readwrite) iTermExternalSearchResult *external;
+@end
+
+@implementation FindCursor
+@end
 
 @interface iTermFindOnPageHelper()
 @property (nonatomic, strong) SearchResult *selectedResult;
@@ -35,11 +45,6 @@ typedef struct {
 @implementation iTermFindOnPageHelper {
     // Find context just after initialization.
     FindContext *_copiedContext;
-
-    // Find cursor. -1,-1 if no cursor. This is used to select which search result should be
-    // highlighted. If searching forward, it'll be after the find cursor; if searching backward it
-    // will be before the find cursor.
-    VT100GridAbsCoord _findCursor;
 
     // Is a find currently executing?
     BOOL _findInProgress;
@@ -88,16 +93,9 @@ typedef struct {
         _highlightMap = [[NSMutableDictionary alloc] init];
         _copiedContext = [[FindContext alloc] init];
         _locations = [[NSMutableIndexSet alloc] init];
+        _findCursor = [[FindCursor alloc] init];
     }
     return self;
-}
-
-- (void)dealloc {
-    [_highlightMap release];
-    [_copiedContext release];
-    [_selectedResult release];
-    [_locations release];
-    [super dealloc];
 }
 
 - (void)locationsDidChange NS_AVAILABLE_MAC(10_14) {
@@ -171,18 +169,16 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
         _lastStringSearchedFor = [aString copy];
 
         [_delegate setNeedsDisplay:YES];
+        [_delegate findOnPageHelperSearchExternallyFor:aString mode:mode];
     }
 }
 
 - (void)clearHighlights {
-    [_lastStringSearchedFor release];
     _lastStringSearchedFor = nil;
 
-    [_searchResults release];
-    if (@available(macOS 10.14, *)) {
-        [_locations removeAllIndexes];
-        [self locationsDidChange];
-    }
+    [_locations removeAllIndexes];
+    [self locationsDidChange];
+
     _searchResults = [[NSMutableOrderedSet alloc] init];
     _cachedCounts.valid = NO;
 
@@ -190,6 +186,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     _haveRevealedSearchResult = NO;
     [_highlightMap removeAllObjects];
     _searchingForNextResult = NO;
+    [_delegate findOnPageHelperRemoveExternalHighlights];
 
     [_delegate setNeedsDisplay:YES];
 }
@@ -199,7 +196,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (void)resetFindCursor {
-    _findCursor = VT100GridAbsCoordMake(-1, -1);
+    _findCursor.type = FindCursorTypeInvalid;
 }
 
 // continueFind is called by a timer in the client until it returns NO. It does
@@ -209,6 +206,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 // 2. If _searchingForNextResult is true, highlight the next result before/after
 //   the current selection and flip _searchingForNextResult to false.
 - (BOOL)continueFind:(double *)progress
+            rangeOut:(NSRange *)rangePtr
              context:(FindContext *)context
                width:(int)width
        numberOfLines:(int)numberOfLines
@@ -221,7 +219,9 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     if (_findInProgress) {
         // Collect more results.
         more = [_delegate continueFindAllResults:newSearchResults
-                                       inContext:context];
+                                        rangeOut:rangePtr
+                                       inContext:context
+                                   rangeSearched:NULL];
         *progress = [context progress];
     } else {
         *progress = 1;
@@ -253,6 +253,17 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     return more;
 }
 
+- (void)addExternalResults:(NSArray<iTermExternalSearchResult *> *)externalResults
+                     width:(int)width {
+    [externalResults enumerateObjectsUsingBlock:^(iTermExternalSearchResult *externalResult,
+                                                  NSUInteger i,
+                                                  BOOL * _Nonnull stop) {
+        SearchResult *searchResult = [SearchResult searchResultFromExternal:externalResult
+                                                                      index:i];
+        [self addSearchResult:searchResult width:width];
+    }];
+}
+
 - (void)addSearchResult:(SearchResult *)searchResult width:(int)width {
     if ([_searchResults containsObject:searchResult]) {
         // Tail find produces duplicates sometimes. This can break monotonicity.
@@ -274,41 +285,45 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
                                                  }
                                              }];
     [_searchResults insertObject:searchResult atIndex:insertionIndex];
-    if (@available(macOS 10.14, *)) {
-        [_locations addIndex:searchResult.absStartY];
-        [self locationsDidChange];
+    if (searchResult.isExternal) {
+        [_locations addIndex:searchResult.externalAbsY];
+    } else {
+        [_locations addIndex:searchResult.internalAbsStartY];
     }
+    [self locationsDidChange];
     _cachedCounts.valid = NO;
 
     // Update highlights.
-    for (long long y = searchResult.absStartY; y <= searchResult.absEndY; y++) {
-        NSNumber* key = [NSNumber numberWithLongLong:y];
-        NSMutableData* data = _highlightMap[key];
-        BOOL set = NO;
-        if (!data) {
-            data = [NSMutableData dataWithLength:(width / 8 + 1)];
-            char* b = [data mutableBytes];
-            memset(b, 0, (width / 8) + 1);
-            set = YES;
-        }
-        char* b = [data mutableBytes];
-        int lineEndX = MIN(searchResult.endX + 1, width);
-        int lineStartX = searchResult.startX;
-        if (searchResult.absEndY > y) {
-            lineEndX = width;
-        }
-        if (y > searchResult.absStartY) {
-            lineStartX = 0;
-        }
-        for (int i = lineStartX; i < lineEndX; i++) {
-            const int byteIndex = i/8;
-            const int bit = 1 << (i & 7);
-            if (byteIndex < [data length]) {
-                b[byteIndex] |= bit;
+    if (!searchResult.isExternal) {
+        for (long long y = searchResult.internalAbsStartY; y <= searchResult.internalAbsEndY; y++) {
+            NSNumber* key = @(y);
+            NSMutableData *data = _highlightMap[key];
+            BOOL set = NO;
+            if (!data) {
+                data = [NSMutableData dataWithLength:(width / 8 + 1)];
+                char* b = [data mutableBytes];
+                memset(b, 0, (width / 8) + 1);
+                set = YES;
             }
-        }
-        if (set) {
-            _highlightMap[key] = data;
+            char* b = [data mutableBytes];
+            int lineEndX = MIN(searchResult.internalEndX + 1, width);
+            int lineStartX = searchResult.internalStartX;
+            if (searchResult.internalAbsEndY > y) {
+                lineEndX = width;
+            }
+            if (y > searchResult.internalAbsStartY) {
+                lineStartX = 0;
+            }
+            for (int i = lineStartX; i < lineEndX; i++) {
+                const int byteIndex = i/8;
+                const int bit = 1 << (i & 7);
+                if (byteIndex < [data length]) {
+                    b[byteIndex] |= bit;
+                }
+            }
+            if (set) {
+                _highlightMap[key] = data;
+            }
         }
     }
 }
@@ -318,8 +333,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     if (selectedResult == _selectedResult) {
         return;
     }
-    [_selectedResult autorelease];
-    _selectedResult = [selectedResult retain];
+    _selectedResult = selectedResult;
     [self.delegate findOnPageSelectedResultDidChange];
 }
 
@@ -338,15 +352,15 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     if (forward) {
         start = [_searchResults count] - 1;
         stride = -1;
-        if ([self haveFindCursor]) {
-            const NSInteger afterCurrentSelectionPos = _findCursor.x + _findCursor.y * width + offset;
+        if (_findCursor.type == FindCursorTypeCoord) {
+            const NSInteger afterCurrentSelectionPos = _findCursor.coord.x + _findCursor.coord.y * width + offset;
             range = NSMakeRange(afterCurrentSelectionPos, MAX(0, bottomLimitPos - afterCurrentSelectionPos));
         }
     } else {
         start = 0;
         stride = 1;
-        if ([self haveFindCursor]) {
-            const NSInteger beforeCurrentSelectionPos = _findCursor.x + _findCursor.y * width - offset;
+        if (_findCursor.type == FindCursorTypeCoord) {
+            const NSInteger beforeCurrentSelectionPos = _findCursor.coord.x + _findCursor.coord.y * width - offset;
             range = NSMakeRange(topLimitPos, MAX(0, beforeCurrentSelectionPos - topLimitPos));
         } else {
             range = NSMakeRange(topLimitPos, MAX(0, bottomLimitPos - topLimitPos));
@@ -354,13 +368,14 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     }
     BOOL found = NO;
     VT100GridCoordRange selectedRange = VT100GridCoordRangeMake(0, 0, 0, 0);
+    iTermExternalSearchResult *external = nil;
 
     // The position and result of the first/last (if going backward/forward) result to wrap around
     // to if nothing is found. Reset to -1/nil when wrapping is not needed, so its nilness entirely
     // determines whether wrapping should occur.
     long long wrapAroundResultPosition = -1;
     SearchResult *wrapAroundResult = nil;
-    NSInteger currentIndex = 0;
+    BOOL haveFoundExternalCursor = NO;
     for (int j = 0, i = start; !found && j < [_searchResults count]; j++) {
         SearchResult* r = _searchResults[i];
         i += stride;
@@ -369,24 +384,52 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
         } else if (i >= _searchResults.count) {
             i -= _searchResults.count;
         }
-        if (r.absEndY < overflowAdjustment) {
+        if (found) {
             continue;
         }
-        currentIndex += 1;
-        NSInteger pos = r.startX + (long long)r.absStartY * width;
-        if (!found) {
-            if (NSLocationInRange(pos, range)) {
-                found = YES;
-                wrapAroundResult = nil;
-                wrapAroundResultPosition = -1;
-                self.selectedResult = r;
+        if (_findCursor.type == FindCursorTypeExternal &&
+            !haveFoundExternalCursor &&
+            r.externalResult == _findCursor.external) {
+            haveFoundExternalCursor = YES;
+        }
+        NSInteger pos;
+        if (r.isExternal) {
+            if (r.externalAbsY < overflowAdjustment) {
+                continue;
+            }
+            pos = r.externalAbsY * width;
+        } else {
+            if (r.internalAbsEndY < overflowAdjustment) {
+                continue;
+            }
+            pos = r.internalStartX + (long long)r.internalAbsStartY * width;
+        }
+        assert(!found);
+        if (_findCursor.type == FindCursorTypeExternal) {
+            // Flip found to true if the previous result was the find cursor.
+            found = haveFoundExternalCursor && r.externalResult != _findCursor.external && r.externalResult.isVisible;
+        } else {
+            found = NSLocationInRange(pos, range);
+        }
+        if (found) {
+            found = YES;
+            wrapAroundResult = nil;
+            wrapAroundResultPosition = -1;
+            self.selectedResult = r;
+            if (r.isExternal) {
+                selectedRange = [_delegate findOnPageSelectExternalResult:r.externalResult];
+                external = r.externalResult;
+            } else {
                 selectedRange =
-                    VT100GridCoordRangeMake(r.startX,
-                                            MAX(0, r.absStartY - overflowAdjustment),
-                                            r.endX + 1,  // half-open
-                                            MAX(0, r.absEndY - overflowAdjustment));
+                    VT100GridCoordRangeMake(r.internalStartX,
+                                            MAX(0, r.internalAbsStartY - overflowAdjustment),
+                                            r.internalEndX + 1,  // half-open
+                                            MAX(0, r.internalAbsEndY - overflowAdjustment));
+                external = nil;
                 [_delegate findOnPageSelectRange:selectedRange wrapped:NO];
-            } else if (!_haveRevealedSearchResult) {
+            }
+        } else if (!_haveRevealedSearchResult) {
+            if (!r.isExternal || r.externalResult.isVisible) {  // Don't wrap around to invisible result
                 if (forward) {
                     if (wrapAroundResultPosition == -1 || pos < wrapAroundResultPosition) {
                         self.selectedResult = r;
@@ -407,19 +450,31 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     if (wrapAroundResult != nil) {
         // Wrap around
         found = YES;
-        selectedRange =
-            VT100GridCoordRangeMake(wrapAroundResult.startX,
-                                    MAX(0, wrapAroundResult.absStartY - overflowAdjustment),
-                                    wrapAroundResult.endX + 1,  // half-open
-                                    MAX(0, wrapAroundResult.absEndY - overflowAdjustment));
-        [_delegate findOnPageSelectRange:selectedRange wrapped:YES];
+        if (wrapAroundResult.isExternal) {
+            selectedRange = [_delegate findOnPageSelectExternalResult:wrapAroundResult.externalResult];
+            external = wrapAroundResult.externalResult;
+        } else {
+            selectedRange =
+                VT100GridCoordRangeMake(wrapAroundResult.internalStartX,
+                                        MAX(0, wrapAroundResult.internalAbsStartY - overflowAdjustment),
+                                        wrapAroundResult.internalEndX + 1,  // half-open
+                                        MAX(0, wrapAroundResult.internalAbsEndY - overflowAdjustment));
+            external = nil;
+            [_delegate findOnPageSelectRange:selectedRange wrapped:YES];
+        }
         [_delegate findOnPageDidWrapForwards:forward];
     }
 
     if (found) {
-        [_delegate findOnPageRevealRange:selectedRange];
-        _findCursor = VT100GridAbsCoordMake(selectedRange.start.x,
-                                            (long long)selectedRange.start.y + overflowAdjustment);
+        if (!external) {  // selectedRange is approximate and scrolling happens w/ selection
+            [_delegate findOnPageRevealRange:selectedRange];
+            _findCursor.type = FindCursorTypeCoord;
+            _findCursor.coord = VT100GridAbsCoordMake(selectedRange.start.x,
+                                                      (long long)selectedRange.start.y + overflowAdjustment);
+        } else {
+            _findCursor.type = FindCursorTypeExternal;
+            _findCursor.external = external;
+        }
         _haveRevealedSearchResult = YES;
     }
 
@@ -438,18 +493,18 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (NSInteger)smallestIndexOfLastSearchResultWithYLessThan:(NSInteger)query {
-    SearchResult *querySearchResult = [[[SearchResult alloc] init] autorelease];
-    querySearchResult.absStartY = query;
+    SearchResult *querySearchResult = [[SearchResult alloc] init];
+    querySearchResult.internalAbsStartY = query;
     NSInteger index = [_searchResults indexOfObject:querySearchResult
                                       inSortedRange:NSMakeRange(0, _searchResults.count)
                                             options:(NSBinarySearchingInsertionIndex | NSBinarySearchingFirstEqual)
                                     usingComparator:^NSComparisonResult(SearchResult * _Nonnull obj1, SearchResult * _Nonnull obj2) {
-                                        return [@(obj2.absStartY) compare:@(obj1.absStartY)];
+                                        return [@(obj2.safeAbsStartY) compare:@(obj1.safeAbsStartY)];
                                     }];
     if (index == _searchResults.count) {
         index--;
     }
-    while (_searchResults[index].absStartY >= query) {
+    while (_searchResults[index].safeAbsStartY >= query) {
         if (index + 1 == _searchResults.count) {
             return NSNotFound;
         }
@@ -459,18 +514,18 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (NSInteger)largestIndexOfSearchResultWithYGreaterThanOrEqualTo:(NSInteger)query {
-    SearchResult *querySearchResult = [[[SearchResult alloc] init] autorelease];
-    querySearchResult.absStartY = query;
+    SearchResult *querySearchResult = [[SearchResult alloc] init];
+    querySearchResult.internalAbsStartY = query;
     NSInteger index = [_searchResults indexOfObject:querySearchResult
                                       inSortedRange:NSMakeRange(0, _searchResults.count)
                                             options:(NSBinarySearchingInsertionIndex | NSBinarySearchingLastEqual)
                                     usingComparator:^NSComparisonResult(SearchResult * _Nonnull obj1, SearchResult * _Nonnull obj2) {
-                                        return [@(obj2.absStartY) compare:@(obj1.absStartY)];
+                                        return [@(obj2.safeAbsStartY) compare:@(obj1.safeAbsStartY)];
                                     }];
     if (index == _searchResults.count) {
         index--;
     }
-    while (_searchResults[index].absStartY < query) {
+    while (_searchResults[index].safeAbsStartY < query) {
         if (index == 0) {
             return NSNotFound;
         }
@@ -495,12 +550,29 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     }
 }
 
+- (void)enumerateSearchResultsInRangeOfLines:(NSRange)range
+                                       block:(void (^ NS_NOESCAPE)(SearchResult *result))block {
+    if (_searchResults.count == 0) {
+        return;
+    }
+    const NSInteger headIndex = [self smallestIndexOfLastSearchResultWithYLessThan:NSMaxRange(range)];
+    for (NSInteger i = headIndex; i < _searchResults.count; i++) {
+        SearchResult *result = _searchResults[i];
+        if (result.internalAbsStartY < range.location) {
+            continue;
+        }
+        if (result.isExternal) {
+            // External search results aren't supported yet.
+            continue;
+        }
+        block(result);
+    }
+}
+
 - (void)removeAllSearchResults {
     [_searchResults removeAllObjects];
-    if (@available(macOS 10.14, *)) {
-        [_locations removeAllIndexes];
-        [self locationsDidChange];
-    }
+    [_locations removeAllIndexes];
+    [self locationsDidChange];
     _cachedCounts.valid = NO;
 }
 
@@ -508,24 +580,15 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     NSRange objectRange = [self rangeOfSearchResultsInRangeOfLines:range];
     if (objectRange.location != NSNotFound && objectRange.length > 0) {
         [_searchResults removeObjectsInRange:objectRange];
-        if (@available(macOS 10.14, *)) {
-            [_locations removeIndexesInRange:range];
-            [self locationsDidChange];
-        }
+        [_locations removeIndexesInRange:range];
+        [self locationsDidChange];
         _cachedCounts.valid = NO;
     }
 }
 
 - (void)setStartPoint:(VT100GridAbsCoord)startPoint {
-    _findCursor = startPoint;
-}
-
-- (BOOL)haveFindCursor {
-    return _findCursor.y != -1;
-}
-
-- (VT100GridAbsCoord)findCursorAbsCoord {
-    return _findCursor;
+    _findCursor.coord = startPoint;
+    _findCursor.type = FindCursorTypeCoord;
 }
 
 - (NSInteger)currentIndex {
@@ -547,7 +610,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 
 - (void)updateCachedCountsIfNeeded {
     const long long overflowAdjustment = [self.delegate findOnPageOverflowAdjustment];
-    if (self.selectedResult.absEndY < overflowAdjustment) {
+    if (self.selectedResult.safeAbsEndY < overflowAdjustment) {
         self.selectedResult = nil;
     }
     if (self.selectedResult == nil) {
@@ -576,7 +639,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
         return;
     }
 
-    if (_searchResults.lastObject.absEndY >= _cachedCounts.overflowAdjustment) {
+    if (_searchResults.lastObject.safeAbsEndY >= _cachedCounts.overflowAdjustment) {
         // All search results are valid.
         _cachedCounts.count = _searchResults.count;
     } else {
@@ -584,7 +647,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
         // valid ones end. Because search results are sorted descending, a prefix of _searchResults
         // will contain the valid ones.
         const NSInteger index = [_searchResults indexOfObject:temp inSortedRange:NSMakeRange(0, _searchResults.count) options:NSBinarySearchingInsertionIndex usingComparator:^NSComparisonResult(SearchResult *_Nonnull obj1, SearchResult *_Nonnull obj2) {
-            return [@(-obj1.absEndY) compare:@(-obj2.absEndY)];
+            return [@(-obj1.safeAbsEndY) compare:@(-obj2.safeAbsEndY)];
         }];
         if (index == NSNotFound) {
             _cachedCounts.count = 0;

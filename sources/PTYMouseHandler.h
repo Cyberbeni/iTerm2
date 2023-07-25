@@ -37,7 +37,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)mouseHandlerReportingAllowed:(PTYMouseHandler *)handler;
 - (void)mouseHandlerDidSingleClick:(PTYMouseHandler *)handler;
 - (iTermSelection *)mouseHandlerCurrentSelection:(PTYMouseHandler *)handler;
-- (iTermImageInfo *)mouseHandler:(PTYMouseHandler *)handler imageAt:(VT100GridCoord)coord;
+- (id<iTermImageInfoReading>)mouseHandler:(PTYMouseHandler *)handler imageAt:(VT100GridCoord)coord;
 - (void)mouseHandlerLockScrolling:(PTYMouseHandler *)handler;
 - (void)mouseHandlerUnlockScrolling:(PTYMouseHandler *)handler;
 - (void)mouseHandlerDidMutateState:(PTYMouseHandler *)handler;
@@ -70,7 +70,7 @@ NS_ASSUME_NONNULL_BEGIN
           coordinate:(VT100GridCoord)coord
                point:(NSPoint)point
                event:(NSEvent *)event
-              deltaY:(CGFloat)deltaY
+               delta:(CGSize)delta
 allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
             testOnly:(BOOL)testOnly;
 - (BOOL)mouseHandler:(PTYMouseHandler *)handler viewCoordIsReportable:(NSPoint)coord;
@@ -79,7 +79,7 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
 - (BOOL)mouseHandlerShouldReportClicksAndDrags:(PTYMouseHandler *)mouseHandler;
 - (BOOL)mouseHandlerShouldReportScroll:(PTYMouseHandler *)mouseHandler;
 - (void)mouseHandlerJiggle:(PTYMouseHandler *)mouseHandler;
-- (CGFloat)mouseHandler:(PTYMouseHandler *)mouseHandler accumulateVerticalScrollFromEvent:(NSEvent *)event;
+- (CGFloat)mouseHandler:(PTYMouseHandler *)mouseHandler accumulateScrollFromEvent:(NSEvent *)event;
 - (void)mouseHandler:(PTYMouseHandler *)handler
           sendString:(NSString *)string
               latin1:(BOOL)forceLatin1;
@@ -88,14 +88,15 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
 - (BOOL)mouseHandler:(PTYMouseHandler *)mouseHandler moveSelectionToGridCoord:(VT100GridCoord)coord
            viewCoord:(NSPoint)locationInTextView;
 - (NSString *)mouseHandler:(PTYMouseHandler *)mouseHandler
-               stringForUp:(BOOL)up  // if NO, then down
+        stringForUpOrRight:(BOOL)upOrRight  // if NO, then down/left
+                  vertical:(BOOL)vertical
                      flags:(NSEventModifierFlags)flags
                     latin1:(out BOOL *)forceLatin1;
 - (BOOL)mouseHandlerShowingAlternateScreen:(PTYMouseHandler *)mouseHandler;
 - (void)mouseHandlerWillDrag:(PTYMouseHandler *)mouseHandler;
 
 - (void)mouseHandler:(PTYMouseHandler *)mouseHandler
-           dragImage:(iTermImageInfo *)image
+           dragImage:(id<iTermImageInfoReading>)image
             forEvent:(NSEvent *)event;
 
 - (NSString *)mouseHandlerSelectedText:(PTYMouseHandler *)mouseHandler;
@@ -110,7 +111,7 @@ dragSemanticHistoryWithEvent:(NSEvent *)event
 - (void)mouseHandlerMakeKeyAndOrderFrontAndMakeFirstResponderAndActivateApp:(PTYMouseHandler *)sender;
 
 - (id<iTermSwipeHandler>)mouseHandlerSwipeHandler:(PTYMouseHandler *)sender;
-- (CGFloat)mouseHandlerAccumulatedDeltaY:(PTYMouseHandler *)sender forEvent:(NSEvent *)event;
+- (CGSize)mouseHandlerAccumulatedDelta:(PTYMouseHandler *)sender forEvent:(NSEvent *)event;
 - (long long)mouseHandlerTotalScrollbackOverflow:(PTYMouseHandler *)sender;
 - (void)mouseHandlerSetClickCoord:(VT100GridCoord)coord
                            button:(NSInteger)button

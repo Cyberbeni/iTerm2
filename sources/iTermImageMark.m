@@ -11,10 +11,17 @@
 #import "DebugLogging.h"
 #import "ScreenChar.h"
 
-@implementation iTermImageMark
+@implementation iTermImageMark {
+    iTermImageMark *_doppelganger;
+    __weak iTermImageMark *_progenitor;
+    BOOL _isDoppelganger;
+}
 
-- (instancetype)init {
+- (instancetype)initWithImageCode:(NSNumber *)imageCode {
     self = [super init];
+    if (self) {
+        _imageCode = imageCode;
+    }
     DLog(@"New mage mark %@ created", self);
     return self;
 }
@@ -25,18 +32,19 @@
 }
 
 - (NSString *)description {
-    return [NSString stringWithFormat:@"<%@: %p %@>", self.class, self, self.imageCode];
+    return [NSString stringWithFormat:@"<%@: %p imageCode=%@ %@>",
+            NSStringFromClass(self.class),
+            self,
+            self.imageCode,
+            _isDoppelganger ? @"IsDop" : @"NotDop"];
 }
 
 - (instancetype)initWithDictionary:(NSDictionary *)dict {
-    self = [super init];
-    if (self) {
-        _imageCode = dict[@"imageCode"];
-        if (!_imageCode) {
-            return nil;
-        }
+    NSNumber *imageCode = dict[@"imageCode"];
+    if (!imageCode) {
+        return nil;
     }
-    return self;
+    return [self initWithImageCode:imageCode];
 }
 
 - (NSDictionary *)dictionaryValue {
@@ -51,6 +59,30 @@
     DLog(@"Deallocing %@", self);
     if (_imageCode) {
         ReleaseImage(_imageCode.integerValue);
+    }
+}
+
+- (id<IntervalTreeObject>)doppelganger {
+    @synchronized ([iTermImageMark class]) {
+        assert(!_isDoppelganger);
+        if (!_doppelganger) {
+            _doppelganger = [[iTermImageMark alloc] init];
+            _doppelganger->_imageCode = _imageCode;
+            _doppelganger->_isDoppelganger = YES;
+            _doppelganger->_progenitor = self;
+        }
+        assert(_doppelganger);
+        return _doppelganger;
+    }
+}
+
+- (NSString *)shortDebugDescription {
+    return [NSString stringWithFormat:@"[Image %@]", _imageCode];
+}
+
+- (id<iTermMark>)progenitor {
+    @synchronized ([iTermImageMark class]) {
+        return _progenitor;
     }
 }
 

@@ -12,14 +12,24 @@
 #import "VT100GridTypes.h"
 #import "iTermMetadata.h"
 
-@interface VT100LineInfo : NSObject <NSCopying, DVREncodable>
+@protocol VT100LineInfoReading<NSObject>
+@property(nonatomic, readonly) iTermImmutableMetadata immutableMetadata;
+
+- (BOOL)isDirtyAtOffset:(int)x;
+- (BOOL)anyCharIsDirty;
+- (VT100GridRange)dirtyRange;
+- (NSIndexSet *)dirtyIndexes;
+- (NSArray *)encodedMetadata;
+@end
+
+@interface VT100LineInfo : NSObject <NSCopying, DVREncodable, VT100LineInfoReading>
 
 // Prefer to use this class's APIs to change metadata. Assignment requires reasoning about manual memory management.
 @property(nonatomic) iTermMetadata metadata;
-@property(nonatomic, readonly) NSInteger generation;
 
 - (instancetype)initWithWidth:(int)width;
-- (void)setDirty:(BOOL)dirty inRange:(VT100GridRange)range updateTimestamp:(BOOL)updateTimestamp;
+// Does nothing if now=0. This was super-hot when profiling spam.cc so make it direct. Good luck future me.
+- (void)setDirty:(BOOL)dirty inRange:(VT100GridRange)range updateTimestampTo:(NSTimeInterval)now __attribute__((objc_direct));
 - (BOOL)isDirtyAtOffset:(int)x;
 - (BOOL)anyCharIsDirty;
 - (VT100GridRange)dirtyRange;
@@ -30,5 +40,6 @@
 - (NSArray *)encodedMetadata;
 - (iTermExternalAttributeIndex *)externalAttributesCreatingIfNeeded:(BOOL)create;
 - (void)setExternalAttributeIndex:(iTermExternalAttributeIndex *)eaIndex;
+- (void)setMetadataFromImmutable:(iTermImmutableMetadata)metadata;
 
 @end

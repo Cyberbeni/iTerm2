@@ -11,6 +11,7 @@
 #import "DebugLogging.h"
 #import "ITAddressBookMgr.h"
 #import "NSColor+iTerm.h"
+#import "iTerm2SharedARC-Swift.h"
 #import <simd/simd.h>
 
 const int kColorMapForeground = 0;
@@ -39,15 +40,17 @@ const int kColorMapAnsiCyan = kColorMap8bitBase + 6;
 const int kColorMapAnsiWhite = kColorMap8bitBase + 7;
 const int kColorMapAnsiBrightModifier = 8;
 
+@interface iTermColorMapSanitizingAdapter: NSProxy<iTermColorMapReading>
+- (instancetype)initWithSource:(iTermColorMap *)source;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 @interface iTermColorMap ()
 @property(nonatomic, strong) NSMutableDictionary *map;
 @end
 
 @implementation iTermColorMap {
     double _backgroundBrightness;
-    CGFloat _backgroundRed;
-    CGFloat _backgroundGreen;
-    CGFloat _backgroundBlue;
 
     // Memoized colors and components
     // Only 3 components are used here, but I'm paranoid screwing up and overflowing.
@@ -59,7 +62,10 @@ const int kColorMapAnsiBrightModifier = 8;
     NSColor *_lastBackgroundColor;
 
     NSMutableDictionary<NSNumber *, NSData *> *_fastMap;
+    id<iTermColorMapReading> _sanitizingAdapter;
 }
+
+@synthesize generation = _generation;
 
 + (iTermColorMapKey)keyFor8bitRed:(int)red
                             green:(int)green
@@ -72,44 +78,46 @@ const int kColorMapAnsiBrightModifier = 8;
     if (self) {
         _map = [[NSMutableDictionary alloc] init];
         _fastMap = [[NSMutableDictionary alloc] init];
+        _faintTextAlpha = 0.5;
     }
     return self;
 }
 
 - (void)setDimmingAmount:(double)dimmingAmount {
+    _generation += 1;
     _dimmingAmount = dimmingAmount;
-    [_delegate colorMap:self dimmingAmountDidChangeTo:dimmingAmount];
+    [self.delegate colorMap:self dimmingAmountDidChangeTo:dimmingAmount];
 }
 
 - (void)setMutingAmount:(double)mutingAmount {
+    if (_mutingAmount == mutingAmount) {
+        return;
+    }
+    _generation += 1;
     _mutingAmount = mutingAmount;
-    [_delegate colorMap:self mutingAmountDidChangeTo:mutingAmount];
+    [self.delegate colorMap:self mutingAmountDidChangeTo:mutingAmount];
 }
 
-- (void)setColor:(NSColor *)theColor forKey:(iTermColorMapKey)theKey {
-    if (theKey >= kColorMap24bitBase)
+- (void)setColor:(NSColor *)colorInArbitrarySpace forKey:(iTermColorMapKey)theKey {
+    if (theKey >= kColorMap24bitBase) {
         return;
+    }
+    _generation += 1;
 
-    if (!theColor) {
+    if (!colorInArbitrarySpace) {
         [_map removeObjectForKey:@(theKey)];
         [_fastMap removeObjectForKey:@(theKey)];
         return;
     }
 
-    if (theColor == _map[@(theKey)] ||
-        [theColor isEqual:_map[@(theKey)]]) {
-        return;
+    NSColor *theColor = [colorInArbitrarySpace colorUsingColorSpace:[NSColorSpace it_defaultColorSpace]];
+    NSColor *oldColor = _map[@(theKey)];
+    {
+        if (theColor == oldColor || [theColor isEqual:oldColor]) {
+            DLog(@"Color with key %@ unchanged (%@)", @(theKey), oldColor);
+            return;
+        }
     }
-
-    CGFloat components[4];
-    [theColor getComponents:components];
-    if (theKey == kColorMapBackground) {
-        _backgroundRed = [theColor redComponent];
-        _backgroundGreen = [theColor greenComponent];
-        _backgroundBlue = [theColor blueComponent];
-    }
-
-    theColor = [theColor colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
 
     if (theKey == kColorMapBackground) {
         _backgroundBrightness = [theColor perceivedBrightness];
@@ -117,7 +125,8 @@ const int kColorMapAnsiBrightModifier = 8;
 
     _map[@(theKey)] = theColor;
 
-    // Get components again, now in SRGB (possibly it was already SRGB)
+    // Get components again, now in the default color space (which might be the same)
+    CGFloat components[4];
     [theColor getComponents:components];
     vector_float4 value = {
         (float)components[0],
@@ -126,7 +135,7 @@ const int kColorMapAnsiBrightModifier = 8;
         (float)components[3]
    };
     _fastMap[@(theKey)] = [NSData dataWithBytes:&value length:sizeof(value)];
-    [_delegate colorMap:self didChangeColorForKey:theKey];
+    [self.delegate colorMap:self didChangeColorForKey:theKey from:oldColor to:theColor];
 }
 
 - (NSColor *)colorForKey:(iTermColorMapKey)theKey {
@@ -164,8 +173,27 @@ const int kColorMapAnsiBrightModifier = 8;
 }
 
 - (void)setDimOnlyText:(BOOL)dimOnlyText {
+    if (dimOnlyText == _dimOnlyText) {
+        return;
+    }
+    _generation += 1;
     _dimOnlyText = dimOnlyText;
-    [_delegate colorMap:self dimmingAmountDidChangeTo:_dimmingAmount];
+    [self.delegate colorMap:self dimmingAmountDidChangeTo:_dimmingAmount];
+}
+
+- (void)setDarkMode:(BOOL)darkMode {
+    _darkMode = darkMode;
+    _generation += 1;
+}
+
+- (void)setUseSeparateColorsForLightAndDarkMode:(BOOL)useSeparateColorsForLightAndDarkMode {
+    _useSeparateColorsForLightAndDarkMode = useSeparateColorsForLightAndDarkMode;
+    _generation += 1;
+}
+
+- (void)setMinimumContrast:(double)minimumContrast {
+    _minimumContrast = minimumContrast;
+    _generation += 1;
 }
 
 // There is an issue where where the passed-in color can be in a different color space than the
@@ -432,6 +460,10 @@ const int kColorMapAnsiBrightModifier = 8;
 
 - (NSString *)profileKeyForColorMapKey:(int)theKey {
     NSString *baseKey = [self baseProfileKeyForColorMapKey:theKey];
+    return [self profileKeyForBaseKey:baseKey];
+}
+
+- (NSString *)profileKeyForBaseKey:(NSString *)baseKey {
     if (!self.useSeparateColorsForLightAndDarkMode) {
         return baseKey;
     }
@@ -480,6 +512,34 @@ const int kColorMapAnsiBrightModifier = 8;
     return dict;
 }
 
+- (NSColor *)colorForCode:(int)theIndex
+                    green:(int)green
+                     blue:(int)blue
+                colorMode:(ColorMode)theMode
+                     bold:(BOOL)isBold
+                    faint:(BOOL)isFaint
+             isBackground:(BOOL)isBackground
+       useCustomBoldColor:(BOOL)useCustomBoldColor
+             brightenBold:(BOOL)brightenBold {
+    iTermColorMapKey key = [self keyForColor:theIndex
+                                       green:green
+                                        blue:blue
+                                   colorMode:theMode
+                                        bold:isBold
+                                isBackground:isBackground
+                          useCustomBoldColor:useCustomBoldColor
+                                brightenBold:brightenBold];
+    NSColor *color  = [self colorForKey:key];;
+    if (!isBackground && isFaint) {
+        color = [color colorWithAlphaComponent:0.5];
+    }
+    return color;
+}
+
+- (iTermColorMap *)copy {
+    return [self copyWithZone:nil];
+}
+
 - (id)copyWithZone:(NSZone *)zone {
     iTermColorMap *other = [[iTermColorMap alloc] init];
     if (!other) {
@@ -487,9 +547,6 @@ const int kColorMapAnsiBrightModifier = 8;
     }
 
     other->_backgroundBrightness = _backgroundBrightness;
-    other->_backgroundRed = _backgroundRed;
-    other->_backgroundGreen = _backgroundGreen;
-    other->_backgroundBlue = _backgroundBlue;
 
     memmove(other->_lastTextComponents, _lastTextComponents, sizeof(_lastTextComponents));
     other->_lastTextColor = _lastTextColor;
@@ -504,14 +561,15 @@ const int kColorMapAnsiBrightModifier = 8;
 
     other->_minimumContrast = _minimumContrast;
 
-    other->_delegate = _delegate;
+    other->_delegate = self.delegate;
 
     other->_map = [_map mutableCopy];
 
     other->_fastMap = [_fastMap mutableCopy];
     other->_useSeparateColorsForLightAndDarkMode = _useSeparateColorsForLightAndDarkMode;
     other->_darkMode = _darkMode;
-    
+    other->_faintTextAlpha = _faintTextAlpha;
+
     return other;
 }
 
@@ -587,4 +645,98 @@ const int kColorMapAnsiBrightModifier = 8;
     return kColorMapInvalid;
 }
 
+- (id<iTermColorMapReading>)sanitizingAdapter {
+    if (!_sanitizingAdapter) {
+        _sanitizingAdapter = [[iTermColorMapSanitizingAdapter alloc] initWithSource:self];
+    }
+    return _sanitizingAdapter;
+}
+
+- (VT100SavedColorsSlot *)savedColorsSlot {
+    DLog(@"begin");
+    return [[VT100SavedColorsSlot alloc] initWithTextColor:[self colorForKey:kColorMapForeground]
+                                            backgroundColor:[self colorForKey:kColorMapBackground]
+                                         selectionTextColor:[self colorForKey:kColorMapSelectedText]
+                                   selectionBackgroundColor:[self colorForKey:kColorMapSelection]
+                                       indexedColorProvider:^NSColor *(NSInteger index) {
+        return [self colorForKey:kColorMap8bitBase + index] ?: [NSColor clearColor];
+    }];
+}
+
 @end
+
+@interface iTermColorMapSanitizingAdapterImpl: NSObject
+@end
+
+@implementation iTermColorMapSanitizingAdapterImpl {
+    __weak id<iTermColorMapDelegate> _delegate;
+    __weak iTermColorMap *_source;
+}
+
+- (instancetype)initWithSource:(iTermColorMap *)source {
+    self = [super init];
+    if (self) {
+        _source = source;
+    }
+    return self;
+}
+
+- (id<iTermColorMapDelegate>)delegate {
+    return _delegate;
+}
+
+- (void)setDelegate:(id<iTermColorMapDelegate>)delegate {
+    _delegate = delegate;
+}
+
+- (id)copyWithZone:(NSZone *)zone {
+    return [_source copyWithZone:zone];
+}
+
+@end
+
+// Proxies calls to iTermColorMap but maintains a separate delegate. This is
+// useful while main & mutation queues are joined.
+@implementation iTermColorMapSanitizingAdapter {
+    iTermColorMapSanitizingAdapterImpl *_impl;
+    __weak iTermColorMap *_source;
+}
+
+@dynamic dimOnlyText;
+@dynamic dimmingAmount;
+@dynamic faintTextAlpha;
+@dynamic mutingAmount;
+@dynamic minimumContrast;
+@dynamic useSeparateColorsForLightAndDarkMode;
+@dynamic darkMode;
+@dynamic generation;
+
+- (instancetype)initWithSource:(iTermColorMap *)source {
+    _impl = [[iTermColorMapSanitizingAdapterImpl alloc] initWithSource:source];
+    _impl.delegate = source.delegate;
+    _source = source;
+    return self;
+}
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    if ([_impl respondsToSelector:aSelector]) {
+        return _impl;
+    }
+    return _source;
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    return [_impl respondsToSelector:aSelector] || [_source respondsToSelector:aSelector];
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    return [_source methodSignatureForSelector:aSelector];
+}
+
+- (void)forwardInvocation:(NSInvocation *)anInvocation {
+    anInvocation.target = [_impl respondsToSelector:anInvocation.selector] ? _impl : _source;
+    [anInvocation invoke];
+}
+
+@end
+

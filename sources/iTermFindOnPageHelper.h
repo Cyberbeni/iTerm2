@@ -12,6 +12,7 @@
 #import "VT100GridTypes.h"
 
 @class FindContext;
+@class iTermExternalSearchResult;
 @class iTermSubSelection;
 @class SearchResult;
 
@@ -32,10 +33,13 @@
 
 // Find more, fill in results.
 - (BOOL)continueFindAllResults:(NSMutableArray *)results
-                     inContext:(FindContext*)context;
+                      rangeOut:(NSRange *)rangePtr
+                     inContext:(FindContext *)context
+                 rangeSearched:(VT100GridAbsCoordRange *)rangeSearched;
 
 // Select a range.
 - (void)findOnPageSelectRange:(VT100GridCoordRange)range wrapped:(BOOL)wrapped;
+- (VT100GridCoordRange)findOnPageSelectExternalResult:(iTermExternalSearchResult *)result;
 
 // Show that the search wrapped.
 - (void)findOnPageDidWrapForwards:(BOOL)directionIsForwards;
@@ -51,6 +55,23 @@
 - (void)findOnPageLocationsDidChange;
 - (void)findOnPageSelectedResultDidChange;
 
+// Call -addExternalResults:width:
+- (void)findOnPageHelperSearchExternallyFor:(NSString *)query
+                                       mode:(iTermFindMode)mode;
+- (void)findOnPageHelperRemoveExternalHighlights;
+
+@end
+
+typedef NS_ENUM(NSUInteger, FindCursorType) {
+    FindCursorTypeInvalid,
+    FindCursorTypeCoord,
+    FindCursorTypeExternal
+};
+
+@interface FindCursor: NSObject
+@property (nonatomic, readonly) FindCursorType type;
+@property (nonatomic, readonly) VT100GridAbsCoord coord;
+@property (nonatomic, strong, readonly) iTermExternalSearchResult *external;
 @end
 
 @interface iTermFindOnPageHelper : NSObject<iTermSearchResultsMinimapViewDelegate>
@@ -58,12 +79,13 @@
 @property(nonatomic, readonly) BOOL findInProgress;
 @property(nonatomic, assign) NSView<iTermFindOnPageHelperDelegate> *delegate;
 @property(nonatomic, readonly) NSDictionary *highlightMap;
-@property(nonatomic, readonly) BOOL haveFindCursor;
-@property(nonatomic, readonly) VT100GridAbsCoord findCursorAbsCoord;
 @property(nonatomic, readonly) FindContext *copiedContext;
 @property(nonatomic, readonly) NSOrderedSet<SearchResult *> *searchResults;
 @property(nonatomic, readonly) NSInteger numberOfSearchResults;
 @property(nonatomic, readonly) NSInteger currentIndex;
+// This is used to select which search result should be highlighted. If searching forward, it'll
+// be after the find cursor; if searching backward it will be before the find cursor.
+@property(nonatomic, readonly) FindCursor *findCursor;
 
 // Begin a new search.
 //
@@ -101,6 +123,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 // Search the next block (calling out to the delegate to do the real work) and update highlights and
 // search results.
 - (BOOL)continueFind:(double *)progress
+            rangeOut:(NSRange *)rangePtr
              context:(FindContext *)context
                width:(int)width
        numberOfLines:(int)numberOfLines
@@ -115,6 +138,10 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 - (void)setStartPoint:(VT100GridAbsCoord)startPoint;
 
 - (NSRange)rangeOfSearchResultsInRangeOfLines:(NSRange)range;
+- (void)enumerateSearchResultsInRangeOfLines:(NSRange)range
+                                       block:(void (^ NS_NOESCAPE)(SearchResult *result))block;
 - (void)overflowAdjustmentDidChange;
+- (void)addExternalResults:(NSArray<iTermExternalSearchResult *> *)externalResults
+                     width:(int)width;
 
 @end

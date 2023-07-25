@@ -81,4 +81,14 @@ static const NSTimeInterval kDefaultMaxTime = 0.1;
     substring_ = [substring copy];
 }
 
+- (id)copyWithZone:(NSZone *)zone {
+    FindContext *copy = [[FindContext alloc] init];
+    [copy copyFromFindContext:self];
+    return copy;
+}
+
+- (FindContext *)copy {
+    return [self copyWithZone:nil];
+}
+
 @end

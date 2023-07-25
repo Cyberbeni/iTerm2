@@ -35,6 +35,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) Profile *profileForComputingCommand;
 @property (nonatomic, readonly) Profile *profile;
 @property (nonatomic, readonly, copy) NSString *computedCommand;
+@property (nonatomic, readonly) BOOL ssh;
 @property (nullable, nonatomic, readonly) NSString *name;
 @property (nullable, nonatomic, readonly) NSString *workingDirectory;
 @end
@@ -139,8 +140,9 @@ NS_ASSUME_NONNULL_BEGIN
     [ITAddressBookMgr computeCommandForProfile:self.profileForComputingCommand
                                     objectType:self.objectType
                                          scope:self.session.variablesScope
-                                    completion:^(NSString *command) {
+                                    completion:^(NSString *command, BOOL ssh) {
         self->_computedCommand = command;
+        self->_ssh = ssh;
         completion();
     }];
 }
@@ -166,6 +168,11 @@ NS_ASSUME_NONNULL_BEGIN
     DLog(@"  create initial directory object");
     iTermInitialDirectory *initialDirectory = [iTermInitialDirectory initialDirectoryFromProfile:self.profile
                                                                                       objectType:self.objectType];
+    if (initialDirectory.mode == iTermInitialDirectoryModeHome && self.ssh) {
+        DLog(@"Not setting env[PWD] because we want home directory over ssh.");
+        completion();
+        return;
+    }
     // Keep the initial directory alive
     void *key = (void *)"iTermSessionFactory.initialDirectory";
     [self.session it_setAssociatedObject:initialDirectory forKey:key];
@@ -292,6 +299,11 @@ NS_ASSUME_NONNULL_BEGIN
             pwd = self.oldCWD;
             DLog(@"pwd was empty. Use oldCWD of %@", pwd);
         } else {
+            if (!suggestion.length && self.ssh) {
+                DLog(@"Not setting env[PWD] to home directory in ssh mode");
+                _workingDirectory = nil;
+                return;
+            }
             pwd = NSHomeDirectory();
             DLog(@"pwd was empty. Use home directory of %@", pwd);
         }
@@ -321,9 +333,9 @@ NS_ASSUME_NONNULL_BEGIN
     // Initialize a new session
     aSession = [[PTYSession alloc] initSynthetic:NO];
 
-    [[aSession screen] setUnlimitedScrollback:[profile[KEY_UNLIMITED_SCROLLBACK] boolValue]];
-    [[aSession screen] setMaxScrollbackLines:[profile[KEY_SCROLLBACK_LINES] intValue]];
-
+    if ([[NSNumber castFrom:profile[KEY_SHORT_LIVED_SINGLE_USE]] boolValue]) {
+        aSession.shortLivedSingleUse = YES;
+    }
     // set our preferences
     [aSession setProfile:profile];
     if (parent) {
@@ -389,11 +401,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)startProgramForRequest:(iTermSessionAttachOrLaunchRequest *)request
                     completion:(void (^)(BOOL))completion {
     [request.session startProgram:request.computedCommand
+                              ssh:request.ssh
                       environment:request.environment
                       customShell:request.customShell
                            isUTF8:request.isUTF8
                     substitutions:request.substitutions
                       arrangement:request.arrangementName
+                  fromArrangement:request.fromArrangement
                        completion:^(BOOL ok) {
         [request.windowController setWindowTitle];
         if (completion) {

@@ -32,12 +32,16 @@
 #import "BackgroundThread.h"
 #import "DebugLogging.h"
 #import "iTermAdvancedSettingsModel.h"
+#import "LineBlock+SwiftInterop.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermLineBlockArray.h"
 #import "iTermMalloc.h"
 #import "iTermOrderedDictionary.h"
 #import "LineBlock.h"
+#import "LineBufferSorting.h"
 #import "NSArray+iTerm.h"
 #import "NSData+iTerm.h"
+#import "NSSet+iTerm.h"
 #import "RegexKitLite.h"
 
 static NSString *const kLineBufferVersionKey = @"Version";
@@ -54,6 +58,24 @@ static NSString *const kLineBufferBlockWrapperKey = @"Block Wrapper";
 
 static const int kLineBufferVersion = 1;
 static const NSInteger kUnicodeVersion = 9;
+
+// The way in which LineBuffer objects are shared is kinda complicated. Each LineBuffer is meant
+// to be used by one dispatch queue. Each LineBuffer has its own private LineBlockArray. Each
+// LineBlockArray has its own unique LineBlock objects. LineBlocks have pointers to CharacterBuffer
+// objects, which *are* shared across dispatch queues. This is done to avoid copying big chunks of
+// memory when making a copy. LineBlocks use a copy-on-write scheme for CharacterBuffers. Here is
+// an object graph where the second block was modified in one of the line buffers after copying.
+//
+// [LineBuffer]               .----[clients: [Index 0]]------------.          [LineBuffer]
+//      |                    |                                     |               |
+//      V                    |    .----------owner---------------, |               V
+// [LineBlockArray]          |    V                              | V          [LineBlockArray]
+// [Index 0       ] --> [LineBlock] --> [CharacterBuffer] <-- [LineBlock] <-- [Index 0       ]
+// [Index 1       ] --> [LineBlock]                           [LineBlock] <-- [Index 1       ]
+//                           |                                     |
+//                           V                                     V
+//                    [CharacterBuffer]                     [CharacterBuffer]
+//
 
 @implementation LineBuffer {
     // An array of LineBlock*s.
@@ -83,12 +105,19 @@ static const NSInteger kUnicodeVersion = 9;
     long long droppedChars;
 }
 
+@synthesize mayHaveDoubleWidthCharacter = _mayHaveDoubleWidthCharacter;
+@synthesize delegate = _delegate;
+
 // Append a block
-- (LineBlock*)_addBlockOfSize:(int)size {
-    LineBlock* block = [[LineBlock alloc] initWithRawBufferSize: size];
+- (LineBlock *)_addBlockOfSize:(int)size {
+    self.dirty = YES;
+    // Immediately shrink it so that it can compress down to the smallest
+    // possible size. The compression code has no way of knowing how big these
+    // buffers are.
+    [_lineBlocks.lastBlock shrinkToFit];
+    LineBlock* block = [[LineBlock alloc] initWithRawBufferSize:size absoluteBlockNumber:num_dropped_blocks + _lineBlocks.count];
     block.mayHaveDoubleWidthCharacter = self.mayHaveDoubleWidthCharacter;
     [_lineBlocks addBlock:block];
-    [block release];
     return block;
 }
 
@@ -128,7 +157,6 @@ static const NSInteger kUnicodeVersion = 9;
     if (self) {
         [self commonInit];
         if ([dictionary[kLineBufferVersionKey] intValue] != kLineBufferVersion) {
-            [self autorelease];
             return [[LineBuffer alloc] init];
         }
         _mayHaveDoubleWidthCharacter = [dictionary[kLineBufferMayHaveDWCKey] boolValue];
@@ -143,20 +171,16 @@ static const NSInteger kUnicodeVersion = 9;
             if (maybeWrapper[kLineBufferBlockWrapperKey]) {
                 blockDictionary = maybeWrapper[kLineBufferBlockWrapperKey];
             }
-            LineBlock *block = [LineBlock blockWithDictionary:blockDictionary];
+            LineBlock *block = [LineBlock blockWithDictionary:blockDictionary
+                                          absoluteBlockNumber:num_dropped_blocks + _lineBlocks.count];
             if (!block) {
-                [self autorelease];
                 return [[LineBuffer alloc] init];
             }
             [_lineBlocks addBlock:block];
         }
+        [_lineBlocks findUncompressedBlocks];
     }
     return self;
-}
-
-- (void)dealloc {
-    [_lineBlocks release];
-    [super dealloc];
 }
 
 - (void)setMayHaveDoubleWidthCharacter:(BOOL)mayHaveDoubleWidthCharacter {
@@ -181,17 +205,29 @@ static int RawNumLines(LineBuffer* buffer, int width) {
 }
 
 
-- (void) setMaxLines: (int) maxLines
-{
+- (int)maxLines {
+    return max_lines;
+}
+
+- (void)setMaxLines:(int)maxLines {
+    self.dirty = YES;
     max_lines = maxLines;
     num_wrapped_lines_width = -1;
 }
 
 
-- (int)dropExcessLinesWithWidth: (int) width
-{
+- (void)clear {
+    const int saved = max_lines;
+    [self setMaxLines:0];
+    [self dropExcessLinesWithWidth:num_wrapped_lines_width > 0 ? num_wrapped_lines_width : 80];
+    [self setMaxLines:saved];
+}
+
+- (int)dropExcessLinesWithWidth:(int)width {
+    self.dirty = YES;
     int nl = RawNumLines(self, width);
     int totalDropped = 0;
+    int totalRawLinesDropped = 0;
     if (max_lines != -1 && nl > max_lines) {
         LineBlock *block = _lineBlocks[0];
         int total_lines = nl;
@@ -207,8 +243,12 @@ static int RawNumLines(LineBuffer* buffer, int width) {
                 toDrop = extra_lines;
             }
             int charsDropped;
+            const int numRawLinesBefore = block.numRawLines;
             int dropped = [block dropLines:toDrop withWidth:width chars:&charsDropped];
             totalDropped += dropped;
+            const int numRawLinesAfter = block.numRawLines;
+            assert(numRawLinesAfter <= numRawLinesBefore);
+            totalRawLinesDropped += (numRawLinesBefore - numRawLinesAfter);
             droppedChars += charsDropped;
             if ([block isEmpty]) {
                 [_lineBlocks removeFirstBlock];
@@ -221,10 +261,9 @@ static int RawNumLines(LineBuffer* buffer, int width) {
         }
         num_wrapped_lines_cache = total_lines;
     }
-#if ITERM_DEBUG
-    assert(totalDropped == (nl - RawNumLines(self, width)));
-#endif
+    cursor_rawline -= totalRawLinesDropped;
     [_delegate lineBufferDidDropLines:self];
+    assert(totalRawLinesDropped >= 0);
     return totalDropped;
 }
 
@@ -237,14 +276,19 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     return [s length] ? [s substringToIndex:s.length - 1] : @"";  // strip trailing newline
 }
 
-- (void) dump
-{
+- (void)dump {
     int i;
     int rawOffset = 0;
     for (i = 0; i < _lineBlocks.count; ++i) {
-        NSLog(@"Block %d:\n", i);
+        VLog(@"Block %d:\n", i);
         [_lineBlocks[i] dump:rawOffset toDebugLog:NO];
         rawOffset += [_lineBlocks[i] rawSpaceUsed];
+    }
+}
+
+- (void)dumpCompression {
+    for (LineBlock *block in _lineBlocks.blocks) {
+        [block dumpCompression];
     }
 }
 
@@ -308,17 +352,27 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     NSLog(@"%4d: %@", k++, s);
 }
 
-- (void)dumpWrappedToWidth:(int)width
-{
+- (void)dumpWrappedToWidth:(int)width {
     NSLog(@"%@", [self compactLineDumpWithWidth:width andContinuationMarks:NO]);
 }
 
-- (void)appendLine:(screen_char_t *)buffer
+- (void)appendScreenCharArray:(ScreenCharArray *)sca
+                        width:(int)width {
+    [self appendLine:sca.line
+              length:sca.length
+             partial:sca.eol != EOL_HARD
+               width:width
+            metadata:sca.metadata
+        continuation:sca.continuation];
+}
+
+- (void)appendLine:(const screen_char_t *)buffer
             length:(int)length
            partial:(BOOL)partial
              width:(int)width
-          metadata:(iTermMetadata)metadataObj
+          metadata:(iTermImmutableMetadata)metadataObj
       continuation:(screen_char_t)continuation {
+    self.dirty = YES;
 #ifdef LOG_MUTATIONS
     NSLog(@"Append: %@\n", ScreenCharArrayToStringDebug(buffer, length));
 #endif
@@ -326,7 +380,7 @@ static int RawNumLines(LineBuffer* buffer, int width) {
         [self _addBlockOfSize:block_size];
     }
 
-    LineBlock* block = _lineBlocks.lastBlock;
+    LineBlock *block = _lineBlocks.lastBlock;
 
     int beforeLines = [block getNumLinesWithWrapWidth:width];
     if (![block appendLine:buffer
@@ -339,13 +393,13 @@ static int RawNumLines(LineBuffer* buffer, int width) {
         // cache.
         num_wrapped_lines_width = -1;
         int prefix_len = 0;
-        iTermMetadata prefixMetadata = iTermMetadataDefault();
+        iTermImmutableMetadata prefixMetadata = iTermMetadataMakeImmutable(iTermMetadataDefault());
         screen_char_t* prefix = NULL;
         if ([block hasPartial]) {
             // There is a line that's too long for the current block to hold.
             // Remove its prefix from the current block and later add the
             // concatenation of prefix + buffer to a larger block.
-            screen_char_t* temp;
+            const screen_char_t *temp;
             BOOL ok = [block popLastLineInto:&temp
                                   withLength:&prefix_len
                                    upToWidth:[block rawBufferSize] + 1
@@ -383,24 +437,24 @@ static int RawNumLines(LineBuffer* buffer, int width) {
         // moving out of the last block into the new block)
         if (prefix) {
             BOOL ok __attribute__((unused)) =
-                [block appendLine:prefix
-                           length:prefix_len
-                          partial:YES
-                            width:width
-                         metadata:prefixMetadata
-                     continuation:continuation];
+            [block appendLine:prefix
+                       length:prefix_len
+                      partial:YES
+                        width:width
+                     metadata:prefixMetadata
+                 continuation:continuation];
             ITAssertWithMessage(ok, @"append can't fail here");
             free(prefix);
         }
         // Finally, append this line to the new block. We know it'll fit because we made
         // enough room for it.
         BOOL ok __attribute__((unused)) =
-            [block appendLine:buffer
-                       length:length
-                      partial:partial
-                        width:width
-                     metadata:metadataObj
-                 continuation:continuation];
+        [block appendLine:buffer
+                   length:length
+                  partial:partial
+                    width:width
+                 metadata:metadataObj
+             continuation:continuation];
         ITAssertWithMessage(ok, @"append can't fail here");
     } else if (num_wrapped_lines_width == width) {
         // Straightforward addition of a line to an existing block. Update the
@@ -413,15 +467,7 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     }
 }
 
-- (NSInteger)generationForLineNumber:(int)lineNum width:(int)width {
-    int remainder = 0;
-    LineBlock *block = [_lineBlocks blockContainingLineNumber:lineNum
-                                                        width:width
-                                                    remainder:&remainder];
-    return [block generationForLineNumber:remainder width:width];
-}
-
-- (iTermMetadata)metadataForLineNumber:(int)lineNumber width:(int)width {
+- (iTermImmutableMetadata)metadataForLineNumber:(int)lineNumber width:(int)width {
     int remainder = 0;
     LineBlock *block = [_lineBlocks blockContainingLineNumber:lineNumber
                                                         width:width
@@ -429,7 +475,7 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     return [block metadataForLineNumber:remainder width:width];
 }
 
-- (iTermMetadata)metadataForRawLineWithWrappedLineNumber:(int)lineNum width:(int)width {
+- (iTermImmutableMetadata)metadataForRawLineWithWrappedLineNumber:(int)lineNum width:(int)width {
     int remainder = 0;
     LineBlock *block = [_lineBlocks blockContainingLineNumber:lineNum width:width remainder:&remainder];
     return [block metadataForRawLineAtWrappedLineOffset:remainder width:width];
@@ -456,11 +502,11 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     int eol;
     screen_char_t continuation;
     const int requestedLine = remainder;
-    screen_char_t* p = [block getWrappedLineWithWrapWidth:width
-                                                  lineNum:&remainder
-                                               lineLength:&length
-                                        includesEndOfLine:&eol
-                                             continuation:&continuation];
+    const screen_char_t *p = [block getWrappedLineWithWrapWidth:width
+                                                        lineNum:&remainder
+                                                     lineLength:&length
+                                              includesEndOfLine:&eol
+                                                   continuation:&continuation];
     if (p == nil) {
         ITAssertWithMessage(NO, @"Nil wrapped line %@ for block with width %@", @(requestedLine), @(width));
         return NO;
@@ -470,6 +516,12 @@ static int RawNumLines(LineBuffer* buffer, int width) {
         *continuationPtr = continuation;
     }
     ITAssertWithMessage(length <= width, @"Length too long");
+    if (length > 0 && p[0].code ^ p[length - 1].code) {
+        // This is here to figure out if a segfault I see a lot of is due to reading or writing.
+        // If it crashes in the if statement's condition, it's on the read side.
+        // If it crashes in memcpy/memmove below it's on the write side.
+        DLog(@"*p");
+    }
     memcpy((char*) buffer, (char*) p, length * sizeof(screen_char_t));
     [self extendContinuation:continuation inBuffer:buffer ofLength:length toWidth:width];
 
@@ -500,20 +552,52 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     }
 }
 
-- (void)appendContentsOfLineBuffer:(LineBuffer *)other width:(int)width {
+- (int)appendContentsOfLineBuffer:(LineBuffer *)other width:(int)width includingCursor:(BOOL)cursor {
+    self.dirty = YES;
+    int offset = 0;
+    if (cursor) {
+        offset = TotalNumberOfRawLines(self);
+    }
     while (_lineBlocks.lastBlock.isEmpty) {
         [_lineBlocks removeLastBlock];
     }
     for (LineBlock *block in other->_lineBlocks.blocks) {
-        [_lineBlocks addBlock:[[block copy] autorelease]];
+        [_lineBlocks addBlock:[block copyWithAbsoluteBlockNumber:num_dropped_blocks + _lineBlocks.count]];
     }
+    if (cursor) {
+        cursor_rawline = other->cursor_rawline + offset;
+        cursor_x = other->cursor_x;
+    }
+
     num_wrapped_lines_width = -1;
-    [self dropExcessLinesWithWidth:width];
+    return [self dropExcessLinesWithWidth:width];
+}
+
+- (ScreenCharArray *)screenCharArrayForLine:(int)line
+                                      width:(int)width
+                                   paddedTo:(int)paddedSize
+                             eligibleForDWC:(BOOL)eligibleForDWC {
+    int remainder = 0;
+    LineBlock *block = [_lineBlocks blockContainingLineNumber:line width:width remainder:&remainder];
+    if (!block) {
+        ITAssertWithMessage(NO, @"Failed to find line %@ with width %@. Cache is: %@", @(line), @(width),
+                            [[[[_lineBlocks dumpForCrashlog] dataUsingEncoding:NSUTF8StringEncoding] it_compressedData] it_hexEncoded]);
+        return nil;
+    }
+    return [block screenCharArrayForWrappedLineWithWrapWidth:width
+                                                     lineNum:remainder
+                                                    paddedTo:paddedSize
+                                              eligibleForDWC:eligibleForDWC];
+}
+
+- (ScreenCharArray *)wrappedLineAtIndex:(int)lineNum
+                                  width:(int)width {
+    return [self wrappedLineAtIndex:lineNum width:width continuation:NULL];
 }
 
 - (ScreenCharArray *)wrappedLineAtIndex:(int)lineNum
                                   width:(int)width
-                           continuation:(screen_char_t *)continuation {
+                           continuation:(screen_char_t *)continuationPtr {
     int remainder = 0;
     LineBlock *block = [_lineBlocks blockContainingLineNumber:lineNum width:width remainder:&remainder];
     if (!block) {
@@ -523,22 +607,25 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     }
 
     int length, eol;
-    ScreenCharArray *result = [[[ScreenCharArray alloc] init] autorelease];
-    result.line = [block getWrappedLineWithWrapWidth:width
-                                             lineNum:&remainder
-                                          lineLength:&length
-                                   includesEndOfLine:&eol
-                                        continuation:continuation];
-    if (result.line) {
-        result.length = length;
-        result.eol = eol;
-        ITAssertWithMessage(result.length <= width, @"Length too long");
-        return result;
+    screen_char_t continuation;
+    const screen_char_t *line = [block getWrappedLineWithWrapWidth:width
+                                                           lineNum:&remainder
+                                                        lineLength:&length
+                                                 includesEndOfLine:&eol
+                                                      continuation:&continuation];
+    if (continuationPtr) {
+        *continuationPtr = continuation;
     }
-
-    NSLog(@"Couldn't find line %d", lineNum);
-    ITAssertWithMessage(NO, @"Tried to get non-existent line");
-    return nil;
+    if (!line) {
+        NSLog(@"Couldn't find line %d", lineNum);
+        ITAssertWithMessage(NO, @"Tried to get non-existent line");
+        return nil;
+    }
+    ScreenCharArray *result = [[ScreenCharArray alloc] initWithLine:line
+                                                             length:length
+                                                       continuation:continuation];
+    ITAssertWithMessage(result.length <= width, @"Length too long");
+    return result;
 }
 
 - (ScreenCharArray * _Nonnull)rawLineAtWrappedLine:(int)lineNum width:(int)width {
@@ -555,17 +642,15 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     NSMutableArray<ScreenCharArray *> *arrays = [NSMutableArray array];
     [_lineBlocks enumerateLinesInRange:NSMakeRange(lineNum, count)
                                  width:width
-                                 block:^(screen_char_t * _Nonnull chars,
+                                 block:^(const screen_char_t * _Nonnull chars,
                                          int length,
                                          int eol,
                                          screen_char_t continuation,
-                                         iTermMetadata metadata,
+                                         iTermImmutableMetadata metadata,
                                          BOOL * _Nonnull stop) {
-        ScreenCharArray *lineResult = [[[ScreenCharArray alloc] init] autorelease];
-        lineResult.line = chars;
-        lineResult.continuation = continuation;
-        lineResult.length = length;
-        lineResult.eol = eol;
+        ScreenCharArray *lineResult = [[ScreenCharArray alloc] initWithLine:chars
+                                                                     length:length
+                                                               continuation:continuation];
         [arrays addObject:lineResult];
     }];
     return arrays;
@@ -573,19 +658,22 @@ static int RawNumLines(LineBuffer* buffer, int width) {
 
 - (void)enumerateLinesInRange:(NSRange)range
                         width:(int)width
-                        block:(void (^)(int, ScreenCharArray *, iTermMetadata, BOOL *))block {
+                        block:(void (^)(int, ScreenCharArray *, iTermImmutableMetadata, BOOL *))block {
     __block int count = range.location;
     [_lineBlocks enumerateLinesInRange:range
                                  width:width
                                  block:
-     ^(screen_char_t * _Nonnull chars, int length, int eol, screen_char_t continuation, iTermMetadata metadata, BOOL * _Nonnull stop) {
-        ScreenCharArray *array = [[[ScreenCharArray alloc] init] autorelease];
-        array.line = chars;
-        array.continuation = continuation;
-        array.length = length;
-        array.eol = eol;
+     ^(const screen_char_t * _Nonnull chars,
+       int length,
+       int eol,
+       screen_char_t continuation,
+       iTermImmutableMetadata metadata,
+       BOOL * _Nonnull stop) {
+        ScreenCharArray *array = [[ScreenCharArray alloc] initWithLine:chars
+                                                                length:length
+                                                          continuation:continuation];
         block(count++, array, metadata, stop);
-     }];
+    }];
 }
 
 - (int)numLinesWithWidth:(int)width {
@@ -596,6 +684,7 @@ static int RawNumLines(LineBuffer* buffer, int width) {
 }
 
 - (void)removeLastRawLine {
+    self.dirty = YES;
     [_lineBlocks.lastBlock removeLastRawLine];
     if (_lineBlocks.lastBlock.numRawLines == 0 && _lineBlocks.count > 1) {
         [_lineBlocks removeLastBlock];
@@ -606,6 +695,7 @@ static int RawNumLines(LineBuffer* buffer, int width) {
 
 - (void)removeLastWrappedLines:(int)numberOfLinesToRemove
                          width:(int)width {
+    self.dirty = YES;
     // Invalidate the cache
     num_wrapped_lines_width = -1;
 
@@ -624,15 +714,44 @@ static int RawNumLines(LineBuffer* buffer, int width) {
     }
 }
 
+- (ScreenCharArray * _Nullable)popLastLineWithWidth:(int)width {
+    screen_char_t *buffer = iTermCalloc(width, sizeof(screen_char_t));
+    int eol = 0;
+    iTermImmutableMetadata metadata;
+    screen_char_t continuation;
+    const BOOL ok = [self popAndCopyLastLineInto:buffer
+                                           width:width
+                               includesEndOfLine:&eol
+                                        metadata:&metadata
+                                    continuation:&continuation];
+    if (!ok) {
+        free(buffer);
+        return nil;
+    }
+    return [[ScreenCharArray alloc] initWithLine:buffer
+                                          length:width
+                                        metadata:metadata
+                                    continuation:continuation
+                                   freeOnRelease:YES];
+}
+
+- (void)removeTrailingEmptyBlocks {
+    while (_lineBlocks.count && _lineBlocks.lastBlock.isEmpty) {
+        [_lineBlocks removeLastBlock];
+        num_wrapped_lines_width = -1;
+    }
+}
+
 - (BOOL)popAndCopyLastLineInto:(screen_char_t*)ptr
                          width:(int)width
              includesEndOfLine:(int*)includesEndOfLine
-                      metadata:(out iTermMetadata *)metadataPtr
-                  continuation:(screen_char_t *)continuationPtr
-{
-    if ([self numLinesWithWidth: width] == 0) {
+                      metadata:(out iTermImmutableMetadata *)metadataPtr
+                  continuation:(screen_char_t *)continuationPtr {
+    if ([self numLinesWithWidth:width] == 0) {
         return NO;
     }
+    [self removeTrailingEmptyBlocks];
+    self.dirty = YES;
     num_wrapped_lines_width = -1;
 
     LineBlock* block = _lineBlocks.lastBlock;
@@ -643,14 +762,14 @@ static int RawNumLines(LineBuffer* buffer, int width) {
 
     // Pop the last up-to-width chars off the last line.
     int length;
-    screen_char_t* temp;
+    const screen_char_t *temp;
     screen_char_t continuation;
     BOOL ok __attribute__((unused)) =
-        [block popLastLineInto:&temp
-                    withLength:&length
-                     upToWidth:width
-                      metadata:metadataPtr
-                  continuation:&continuation];
+    [block popLastLineInto:&temp
+                withLength:&length
+                 upToWidth:width
+                  metadata:metadataPtr
+              continuation:&continuation];
     if (continuationPtr) {
         *continuationPtr = continuation;
     }
@@ -679,6 +798,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
 }
 
 - (void)setCursor:(int)x {
+    self.dirty = YES;
     LineBlock *block = _lineBlocks.lastBlock;
     if ([block hasPartial]) {
         int last_line_length = [block getRawLineLength: [block numEntries]-1];
@@ -698,15 +818,8 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
         // The cursor is on the last line in the buffer.
         LineBlock* block = _lineBlocks.lastBlock;
         int last_line_length = [block getRawLineLength: ([block numEntries]-1)];
-        screen_char_t* lastRawLine = [block rawLine: ([block numEntries]-1)];
+        const screen_char_t *lastRawLine = [block rawLine: ([block numEntries]-1)];
         int num_overflow_lines = [block numberOfFullLinesFromBuffer:lastRawLine length:last_line_length width:width];
-#if BETA
-        const int legacy_num_overflow_lines = iTermLineBlockNumberOfFullLinesImpl(lastRawLine,
-                                                                                  last_line_length,
-                                                                                  width,
-                                                                                  _mayHaveDoubleWidthCharacter);
-        assert(num_overflow_lines == legacy_num_overflow_lines);
-#endif
 
         int min_x = OffsetOfWrappedLine(lastRawLine,
                                         num_overflow_lines,
@@ -726,6 +839,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
 
 - (BOOL)_findPosition:(LineBufferPosition *)start inBlock:(int*)block_num inOffset:(int*)offset {
     LineBlock *block = [_lineBlocks blockContainingPosition:start.absolutePosition - droppedChars
+                                                    yOffset:start.yOffset
                                                       width:-1
                                                   remainder:offset
                                                 blockOffset:NULL
@@ -831,7 +945,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
                  results:context.results
          multipleResults:((context.options & FindMultipleResults) != 0)
  includesPartialLastLine:&includesPartialLastLine];
-    context.includesPartialLastLine = includesPartialLastLine;
+    context.includesPartialLastLine = includesPartialLastLine && (blockIndex + 1 == numBlocks);
     NSMutableArray* filtered = [NSMutableArray arrayWithCapacity:[context.results count]];
     BOOL haveOutOfRangeResults = NO;
     int blockPosition = [self _blockPosition:context.absBlockNum - num_dropped_blocks];
@@ -863,30 +977,23 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
 }
 
 // Returns an array of XRange values
-- (NSArray*)convertPositions:(NSArray *)resultRanges withWidth:(int)width {
+- (NSArray *)convertPositions:(NSArray *)resultRanges withWidth:(int)width {
     if (width <= 0) {
         return nil;
     }
-    // Create sorted array of all positions to convert.
-    NSMutableArray* unsortedPositions = [NSMutableArray arrayWithCapacity:[resultRanges count] * 2];
-    for (ResultRange* rr in resultRanges) {
-        [unsortedPositions addObject:[NSNumber numberWithInt:rr->position]];
-        [unsortedPositions addObject:[NSNumber numberWithInt:rr->position + rr->length - 1]];
-    }
-
-    // Walk blocks and positions in parallel, converting each position in order. Store in
-    // intermediate dict, mapping position->NSPoint(x,y)
-    NSArray *positionsArray = [unsortedPositions sortedArrayUsingSelector:@selector(compare:)];
+    int *sortedPositions = SortedPositionsFromResultRanges(resultRanges);
     int i = 0;
     int yoffset = 0;
     int numBlocks = _lineBlocks.count;
     int passed = 0;
     LineBlock *block = _lineBlocks[0];
     int used = [block rawSpaceUsed];
-    NSMutableDictionary* intermediate = [NSMutableDictionary dictionaryWithCapacity:[resultRanges count] * 2];
+
+    LineBufferSearchIntermediateMap *intermediate = [[LineBufferSearchIntermediateMap alloc] initWithCapacity:resultRanges.count * 2];
     int prev = -1;
-    for (NSNumber* positionNum in positionsArray) {
-        int position = [positionNum intValue];
+    const int numPositions = resultRanges.count * 2;
+    for (int j = 0; j < numPositions; j++) {
+        const int position = sortedPositions[j];
         if (position == prev) {
             continue;
         }
@@ -915,8 +1022,8 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
             assert(x < 2000);
             if (isOk) {
                 y += yoffset;
-                [intermediate setObject:[NSValue valueWithPoint:NSMakePoint(x, y)]
-                                 forKey:positionNum];
+                [intermediate addCoordinate:VT100GridCoordMake(x, y)
+                                forPosition:position];
             } else {
                 assert(false);
             }
@@ -924,42 +1031,52 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     }
 
     // Walk the positions array and populate results by looking up points in intermediate dict.
-    NSMutableArray* result = [NSMutableArray arrayWithCapacity:[resultRanges count]];
-    for (ResultRange* rr in resultRanges) {
-        NSValue *start = [intermediate objectForKey:[NSNumber numberWithInt:rr->position]];
-        NSValue *end = [intermediate objectForKey:[NSNumber numberWithInt:rr->position + rr->length - 1]];
-        if (start && end) {
-            XYRange *xyrange = [[[XYRange alloc] init] autorelease];
-            NSPoint startPoint = [start pointValue];
-            NSPoint endPoint = [end pointValue];
-            xyrange->xStart = startPoint.x;
-            xyrange->yStart = startPoint.y;
-            xyrange->xEnd = endPoint.x;
-            xyrange->yEnd = endPoint.y;
-            [result addObject:xyrange];
-        }
-    }
-
+    NSMutableArray* result = [NSMutableArray arrayWithCapacity:[resultRanges count] * 2];
+    [intermediate enumerateCoordPairsForRanges:resultRanges block:^(VT100GridCoord start, VT100GridCoord end) {
+        XYRange *xyrange = [[XYRange alloc] init];
+        xyrange->xStart = start.x;
+        xyrange->yStart = start.y;
+        xyrange->xEnd = end.x;
+        xyrange->yEnd = end.y;
+        [result addObject:xyrange];
+    }];
+    free(sortedPositions);
     return result;
+}
+
+- (LineBufferPosition *)positionOfFindContext:(FindContext *)context width:(int)width {
+    if (context.absBlockNum > num_dropped_blocks) {
+        // Before beginning
+        return [self firstPosition];
+    }
+    int blockNumber = context.absBlockNum - num_dropped_blocks;
+    LineBufferPosition *position = [LineBufferPosition position];
+    const long long precedingBlocksLength = [_lineBlocks rawSpaceUsedInRangeOfBlocks:NSMakeRange(0, blockNumber)];
+    position.absolutePosition = precedingBlocksLength + context.offset;
+    position.yOffset = 0;
+    position.extendsToEndOfLine = NO;
+    return position;
 }
 
 - (LineBufferPosition *)positionForCoordinate:(VT100GridCoord)coord
                                         width:(int)width
                                        offset:(int)offset {
+    VLog(@"positionForCoord:%@ width:%@ offset:%@", VT100GridCoordDescription(coord), @(width), @(offset));
+    
     int x = coord.x;
     int y = coord.y;
-
     int line = y;
     NSInteger index = [_lineBlocks indexOfBlockContainingLineNumber:y width:width remainder:&line];
     if (index == NSNotFound) {
+        VLog(@"positionForCoord returning nil because indexOfBlockCOntainingLineNumber returned NSNotFound");
         return nil;
     }
 
     LineBlock *block = _lineBlocks[index];
     long long absolutePosition = droppedChars + [_lineBlocks rawSpaceUsedInRangeOfBlocks:NSMakeRange(0, index)];
-
+    VLog(@"positionForCoord: Absolute position of block %@ is %@", @(index), @(absolutePosition));
     int pos;
-    int yOffset = 0;
+    int yOffset = 0;  // Number of lines from start of block to coord
     BOOL extends = NO;
     pos = [block getPositionOfLine:&line
                                atX:x
@@ -967,6 +1084,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
                            yOffset:&yOffset
                            extends:&extends];
     if (pos < 0) {
+        VLog(@"positionForCoordinate: returning nil because getPositionOfLine returned a negative value");
         DLog(@"failed to get position of line %@", @(line));
         return nil;
     }
@@ -976,25 +1094,58 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     result.absolutePosition = absolutePosition;
     result.yOffset = yOffset;
     result.extendsToEndOfLine = extends;
+    VLog(@"positionForCoord: Initialize result %@", result);
 
     // Make sure position is valid (might not be because of offset).
     BOOL ok;
+    const VT100GridCoord resultingCoord =
     [self coordinateForPosition:result
                           width:width
                    extendsRight:YES  // doesn't matter for deciding if the result is valid
                              ok:&ok];
-    if (ok) {
-        return result;
-    } else {
+    if (!ok) {
+        VLog(@"positionForCoord: failed to calculate the resulting coord");
         return nil;
     }
+    VLog(@"positionForCoord: The resulting coord is %@ (want %@)", VT100GridCoordDescription(resultingCoord),
+         VT100GridCoordDescription(coord));
+
+    const int residual = coord.y - resultingCoord.y;
+    VLog(@"positionForCoord: residual is %@", @(residual));
+
+    if (residual > 0) {
+        // This can happen if you want the position for a coord that is preceded by empty lines.
+        //
+        // Block 0
+        //     abc
+        //
+        // Block 1
+        //     (empty)
+        //     (empty)      [want a position at the start of this line]
+        //     xyz
+
+        // Given coord x=0,y=2 `result` (prior to the next line) will be pos=3,yOffset=1. That has the block-relative
+        // yOffset, but that's insufficient to find the right position since you'll need to traverse
+        // empty lines between pos=3 and the start of this block (in this case 1, but empty blocks or
+        // trailing empty lines in block 0 could cause it to be more).
+        // The resultingCoord, therefore, will be x=0,y=1. The correct yOffset is found by adding the
+        // missing lines back (in this case, 1 to go from y=1 to the y=2 that we want).
+        result.yOffset += residual;
+        VLog(@"positionForCoord: Advance result by %d", residual);
+    }
+    VLog(@"positionForCoordinate: returning %@", result);
+    return result;
 }
 
+// Note this function returns a closed interval on end.x
 - (VT100GridCoord)coordinateForPosition:(LineBufferPosition *)position
                                   width:(int)width
                            extendsRight:(BOOL)extendsRight
                                      ok:(BOOL *)ok {
+    VLog(@"coordinateForPosition:%@ width:%@ extendsRight:%@", position, @(width), @(extendsRight));
+
     if (position.absolutePosition == self.lastPosition.absolutePosition) {
+        VLog(@"coordinateForPosition: is last position");
         VT100GridCoord result;
         // If the absolute position is equal to the last position, then
         // numLinesWithWidth: will give the wrapped line number after all
@@ -1008,59 +1159,75 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
         result.x = lastLine.length;
         if (position.yOffset > 0) {
             result.x = 0;
-            result.y += position.yOffset + 1;
+            result.y += position.yOffset;
         } else {
             result.x = lastLine.length;
         }
         if (position.extendsToEndOfLine) {
             if (extendsRight) {
-                result.x = width - 1;
+                result.x = width - 1;  // closed interval
             }
         }
         if (ok) {
             *ok = YES;
         }
+        VLog(@"coordinateForPosition: return %@", VT100GridCoordDescription(result));
         return result;
     }
 
     int p;
     int yoffset;
+    VLog(@"coordinateForPosition: find block with position %@, yoffset=%@",
+         @(position.absolutePosition - droppedChars), @(position.yOffset));
     LineBlock *block = [_lineBlocks blockContainingPosition:position.absolutePosition - droppedChars
+                                                    yOffset:position.yOffset
                                                       width:width
                                                   remainder:&p
                                                 blockOffset:&yoffset
                                                       index:NULL];
     if (!block) {
+        VLog(@"coordinateForPosition: failed, returning error");
         if (ok) {
             *ok = NO;
         }
         return VT100GridCoordMake(0, 0);
     }
+    VLog(@"coordinateForPosition: p=%@ yoffset=%@", @(p), @(yoffset));
 
     int y;
     int x;
+    VLog(@"coordinateForPosition: calling convertPosition:%@ withWidth:%@", @(p), @(width));
     BOOL positionIsValid = [block convertPosition:p
                                         withWidth:width
                                         wrapOnEOL:NO  //  using extendsRight here is wrong because extension happens below
                                               toX:&x
                                               toY:&y];
     if (ok) {
+        VLog(@"coordinateForPosition: got a valid reslut. x=%d, y=%d", x, y);
         *ok = positionIsValid;
+    } else {
+        VLog(@"coordinateForPosition: failed to convert position");
     }
     if (position.yOffset > 0) {
         if (!position.extendsToEndOfLine) {
+            VLog(@"coordinateForPosition: wrap x to next line");
             x = 0;
         }
         y += position.yOffset;
+        VLog(@"coordinateForPosition: advance y by %d to %d", position.yOffset, y);
     }
     if (position.extendsToEndOfLine) {
         if (extendsRight) {
+            VLog(@"coordinateForPosition: extends right is true, set x to last column");
             x = width - 1;
         } else {
+            VLog(@"coordinateForPosition: extends right is false, set x to 0");
             x = 0;
         }
     }
-    return VT100GridCoordMake(x, y + yoffset);
+    VT100GridCoord coord = VT100GridCoordMake(x, y + yoffset);
+    VLog(@"coordinateForPosition: return %@", VT100GridCoordDescription(coord));
+    return coord;
 }
 
 - (LineBufferPosition *)firstPosition {
@@ -1075,6 +1242,13 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     position.absolutePosition = droppedChars + [_lineBlocks rawSpaceUsed];
 
     return position;
+}
+
+- (LineBufferPosition *)penultimatePosition {
+    if (_lineBlocks.rawSpaceUsed == 0) {
+        return [self lastPosition];
+    }
+    return [[self lastPosition] predecessor];
 }
 
 - (LineBufferPosition *)positionForStartOfLastLine {
@@ -1119,6 +1293,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
 - (int)absBlockNumberOfAbsPos:(long long)absPos {
     int index;
     LineBlock *block = [_lineBlocks blockContainingPosition:absPos - droppedChars
+                                                    yOffset:0
                                                       width:0
                                                   remainder:NULL
                                                 blockOffset:NULL
@@ -1142,27 +1317,6 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     context.absBlockNum = [self absBlockNumberOfAbsPos:absPos];
     long long absOffset = [self absPositionOfAbsBlock:context.absBlockNum];
     context.offset = MAX(0, absPos - absOffset);
-}
-
-- (LineBuffer *)newAppendOnlyCopy {
-    LineBuffer *theCopy = [[LineBuffer alloc] init];
-    [theCopy->_lineBlocks release];
-    theCopy->_lineBlocks = [_lineBlocks copy];
-    LineBlock *lastBlock = _lineBlocks.lastBlock;
-    if (lastBlock) {
-        [theCopy->_lineBlocks replaceLastBlockWithCopy];
-    }
-    theCopy->block_size = block_size;
-    theCopy->cursor_x = cursor_x;
-    theCopy->cursor_rawline = cursor_rawline;
-    theCopy->max_lines = max_lines;
-    theCopy->num_dropped_blocks = num_dropped_blocks;
-    theCopy->num_wrapped_lines_cache = num_wrapped_lines_cache;
-    theCopy->num_wrapped_lines_width = num_wrapped_lines_width;
-    theCopy->droppedChars = droppedChars;
-    theCopy.mayHaveDoubleWidthCharacter = _mayHaveDoubleWidthCharacter;
-
-    return theCopy;
 }
 
 - (int)numberOfDroppedBlocks {
@@ -1201,7 +1355,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
                                           block:^BOOL(id<iTermEncoderAdapter>  _Nonnull encoder) {
             assert(!truncated);
             DLog(@"Really encode block %p with guid %@", block, block.stringUniqueIdentifier);
-            [encoder mergeDictionary:block.dictionary]; 
+            [encoder mergeDictionary:block.dictionary];
             // This caps the amount of data at a reasonable but arbitrary size.
             numLines += [block getNumLinesWithWrapWidth:80];
             if (numLines >= maxLines) {
@@ -1243,35 +1397,83 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     fg.backgroundColorMode = ColorModeAlternate;
     bg.backgroundColor = ALTSEM_SYSTEM_MESSAGE;
     bg.backgroundColorMode = ColorModeAlternate;
-    StringToScreenChars(message, buffer, fg, bg, &len, NO, NULL, NULL, NO, kUnicodeVersion);
+    StringToScreenChars(message, buffer, fg, bg, &len, NO, NULL, NULL, NO, kUnicodeVersion, NO);
     [self appendLine:buffer
               length:0
              partial:NO
                width:num_wrapped_lines_width > 0 ?: 80
-            metadata:iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate])
+            metadata:iTermMetadataMakeImmutable(iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate]))
         continuation:defaultBg];
 
     [self appendLine:buffer
               length:len
              partial:NO
                width:num_wrapped_lines_width > 0 ?: 80
-            metadata:iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate])
+            metadata:iTermMetadataMakeImmutable(iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate]))
         continuation:bg];
 
     [self appendLine:buffer
               length:0
              partial:NO
                width:num_wrapped_lines_width > 0 ?: 80
-            metadata:iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate])
+            metadata:iTermMetadataMakeImmutable(iTermMetadataTemporaryWithTimestamp([NSDate timeIntervalSinceReferenceDate]))
         continuation:defaultBg];
 }
 
+// Note that the current implementation restores appends but not other kinds of
+// changes like deleting from the start or end.
+- (void)performBlockWithTemporaryChanges:(void (^ NS_NOESCAPE)(void))block {
+    if (gDebugLogging) {
+        [_lineBlocks sanityCheck];
+    }
+
+    LineBlock *lastBlock = [_lineBlocks.blocks.lastObject cowCopy];
+    const int savedMaxLines = max_lines;
+    const int savedNumLines = num_wrapped_lines_cache;
+    const int savedNumLinesWidth = num_wrapped_lines_width;
+    const int savedCursorRawline = cursor_rawline;
+    const int savedDroppedChars = droppedChars;
+    const int savedNumDroppedBlocks = num_dropped_blocks;
+    const int savedCursorX = cursor_x;
+
+    // Don't try to restore _mayHaveDoubleWidthCharacter because setting it also modifies the line
+    // blocks. It has to be a monotonic transition and is OK to leave because it's merely a
+    // heuristic.
+
+    const NSInteger numberOfBlocks = _lineBlocks.blocks.count;
+
+    max_lines = -1;
+    block();
+    max_lines = savedMaxLines;
+    num_wrapped_lines_cache = savedNumLines;
+    num_wrapped_lines_width = savedNumLinesWidth;
+    cursor_rawline = savedCursorRawline;
+    droppedChars = savedDroppedChars;
+    num_dropped_blocks = savedNumDroppedBlocks;
+    cursor_x = savedCursorX;
+
+    while (_lineBlocks.blocks.count > numberOfBlocks) {
+        [_lineBlocks removeLastBlock];
+    }
+    if (lastBlock) {
+        [_lineBlocks removeLastBlock];
+        [_lineBlocks addBlock:lastBlock];
+    }
+    
+    if (gDebugLogging) {
+        [_lineBlocks sanityCheck];
+    }
+}
+
+
 #pragma mark - NSCopying
+
+- (LineBlock *)copy {
+    return [self copyWithZone:nil];
+}
 
 - (id)copyWithZone:(NSZone *)zone {
     LineBuffer *theCopy = [[LineBuffer alloc] initWithBlockSize:block_size];
-
-    [theCopy->_lineBlocks release];
     theCopy->_lineBlocks = [_lineBlocks copy];
     theCopy->cursor_x = cursor_x;
     theCopy->cursor_rawline = cursor_rawline;
@@ -1280,6 +1482,7 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     theCopy->num_wrapped_lines_cache = num_wrapped_lines_cache;
     theCopy->num_wrapped_lines_width = num_wrapped_lines_width;
     theCopy->droppedChars = droppedChars;
+    theCopy->_mayHaveDoubleWidthCharacter = _mayHaveDoubleWidthCharacter;
 
     return theCopy;
 }
@@ -1306,14 +1509,14 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     return n;
 }
 
-- (LineBuffer *)appendOnlyCopyWithMinimumLines:(int)minLines atWidth:(int)width {
+- (LineBuffer *)copyWithMinimumLines:(int)minLines atWidth:(int)width {
     // Calculate how many blocks to keep.
     const int numBlocks = [self numBlocksAtEndToGetMinimumLines:minLines width:width];
     const int totalBlocks = _lineBlocks.count;
     const int numDroppedBlocks = totalBlocks - numBlocks;
 
     // Make a copy of the whole thing (cheap)
-    LineBuffer *theCopy = [[self newAppendOnlyCopy] autorelease];
+    LineBuffer *theCopy = [self copy];
 
     // Remove the blocks we don't need.
     [theCopy->_lineBlocks removeFirstBlocks:numDroppedBlocks];
@@ -1330,27 +1533,326 @@ NS_INLINE int TotalNumberOfRawLines(LineBuffer *self) {
     return [_lineBlocks numberOfWrappedLinesForWidth:width];
 }
 
+- (int)numberOfWrappedLinesWithWidth:(int)width upToAbsoluteBlockNumber:(int)absBlock {
+    if (absBlock <= num_dropped_blocks) {
+        return 0;
+    }
+    return [_lineBlocks numberOfWrappedLinesForWidth:width upToBlockAtIndex:absBlock - num_dropped_blocks];
+}
+
 - (void)beginResizing {
     assert(!_lineBlocks.resizing);
     _lineBlocks.resizing = YES;
-
-    // Just a sanity check, not a real limitation.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        assert(!_lineBlocks.resizing);
-    });
+    self.dirty = YES;
 }
 
 - (void)endResizing {
     assert(_lineBlocks.resizing);
     _lineBlocks.resizing = NO;
+    self.dirty = YES;
 }
 
 - (void)setPartial:(BOOL)partial {
+    self.dirty = YES;
     [_lineBlocks.lastBlock setPartial:partial];
 }
 
-- (LineBlock *)internalBlockAtIndex:(int)i {
+- (LineBlock *)testOnlyBlockAtIndex:(int)i {
     return _lineBlocks[i];
+}
+
+- (unsigned int)numberOfUnwrappedLines {
+    unsigned int sum = 0;
+    for (LineBlock *block in _lineBlocks.blocks) {
+        sum += [block numRawLines];
+    }
+    return sum;
+}
+
+- (void)seal {
+    if (_lineBlocks.lastBlock.hasPartial) {
+        // Can't have an interior block that is partial.
+        return;
+    }
+    self.dirty = YES;
+    if (_lineBlocks.lastBlock.isEmpty) {
+        return;
+    }
+    [self _addBlockOfSize:block_size];
+}
+
+- (void)forceMergeFrom:(LineBuffer *)source {
+    source.dirty = YES;
+    [self mergeFrom:source];
+}
+
+- (void)mergeFrom:(LineBuffer *)source {
+    // State used when debugging
+    NSSet<NSNumber *> *commonWidths = nil;
+    NSString *before = nil;
+    NSString *stage1 = nil;
+    NSString *stage2 = nil;
+    NSString *stage3 = nil;
+    NSString *stage4 = nil;
+
+    [self purgeDecompressedIfNeeded];
+    [source purgeDecompressedIfNeeded];
+
+    if (gDebugLogging) {
+        DLog(@"merge");
+        [_lineBlocks sanityCheck];
+        [source->_lineBlocks sanityCheck];
+        commonWidths = [[_lineBlocks cachedWidths] setByIntersectingWithSet:source->_lineBlocks.cachedWidths];
+        before = [_lineBlocks dumpWidths:commonWidths];
+    }
+
+    assert(source != nil);
+    if (!source.dirty) {
+        return;
+    }
+    source.dirty = NO;
+
+    cursor_x = source->cursor_x;
+    cursor_rawline = source->cursor_rawline;
+    max_lines = source->max_lines;
+    num_wrapped_lines_cache = source->num_wrapped_lines_cache;
+    num_wrapped_lines_width = source->num_wrapped_lines_width;
+    droppedChars = source->droppedChars;
+    _mayHaveDoubleWidthCharacter = source->_mayHaveDoubleWidthCharacter;
+
+    // Drop initial blocks
+    while (_lineBlocks.firstBlock != nil &&
+           _lineBlocks.firstBlock.progenitor != source->_lineBlocks.firstBlock) {
+        DLog(@"Drop initial");
+        [_lineBlocks removeFirstBlock];
+        ++num_dropped_blocks;
+    }
+    if (gDebugLogging) {
+        stage1 = [_lineBlocks dumpWidths:commonWidths];
+    }
+
+    // Drop blocks from the end until we get to one that is in sync.
+    // Note that if the first block has experienced drops but not appends then it will still have
+    // its progenitor as its owner and be considered "synchronized".
+    while (_lineBlocks.count > 0 && ![_lineBlocks.lastBlock isSynchronizedWithProgenitor]) {
+        DLog(@"remove last");
+        [_lineBlocks removeLastBlock];
+    }
+    if (gDebugLogging) {
+        stage2 = [_lineBlocks dumpWidths:commonWidths];
+    }
+
+    if (_lineBlocks.count > 0) {
+        DLog(@"mirror first");
+        [_lineBlocks.firstBlock dropMirroringProgenitor:source->_lineBlocks.firstBlock];
+    }
+    if (gDebugLogging) {
+        stage3 = [_lineBlocks dumpWidths:commonWidths];
+    }
+
+    // Add copies of terminal blocks.
+    while (_lineBlocks.count < source->_lineBlocks.count) {
+        DLog(@"append");
+        LineBlock *sourceBlock = source->_lineBlocks[_lineBlocks.count];
+        LineBlock *theCopy = [sourceBlock cowCopy];
+        [_lineBlocks addBlock:theCopy];
+        if (gDebugLogging) {
+            [_lineBlocks sanityCheck];
+        }
+    }
+
+    num_dropped_blocks = source->num_dropped_blocks;
+    //assert([self isEqual:source]);
+
+    if (gDebugLogging) {
+        stage4 = [_lineBlocks dumpWidths:commonWidths];
+
+        if (![[_lineBlocks dumpWidths:commonWidths] isEqual:[source->_lineBlocks dumpWidths:commonWidths]]) {
+            DLog(@"Before:\n%@\nAfter:\n%@\nExpected:\n%@",
+                 before,
+                 [_lineBlocks dumpWidths:commonWidths],
+                 [source->_lineBlocks dumpWidths:commonWidths]);
+            DLog(@"Stage 1:\n%@", stage1);
+            DLog(@"Stage 2:\n%@", stage2);
+            DLog(@"Stage 3:\n%@", stage3);
+            DLog(@"Stage 4:\n%@", stage4);
+        }
+    }
+}
+
+- (BOOL)isEqual:(LineBuffer *)other {
+    if (![other isKindOfClass:[LineBuffer class]]) {
+        return NO;
+    }
+    if (block_size != other->block_size) {
+        return NO;
+    }
+    if (cursor_x != other->cursor_x) {
+        return NO;
+    }
+    if (cursor_rawline != other->cursor_rawline) {
+        return NO;
+    }
+    if (max_lines != other->max_lines) {
+        return NO;
+    }
+    if (num_dropped_blocks != other->num_dropped_blocks) {
+        return NO;
+    }
+    if (droppedChars != other->droppedChars) {
+        return NO;
+    }
+
+    return [_lineBlocks isEqual:other->_lineBlocks];
+}
+
+// We compress blocks at the head or tail. The idea is that you may have a
+// sequence of decompressed blocks at the ends but they are rare in the middle.
+// This makes it easy to stop trying to compress when there is nothing left to
+// do because we only need to examine a hopefully small subset of all blocks.
+- (BOOL)compress {
+    if ([NSProcessInfo ownCPUUsage] >= 0.5) {
+        return NO;
+    }
+
+    iTermDeadlineMonitor *monitor = [[iTermDeadlineMonitor alloc] initWithDuration:0.01];
+    const NSUInteger count = _lineBlocks.count;
+    if (count < 2) {
+        return YES;
+    }
+
+    if (_lineBlocks.lastUncompressedHeadBlock == nil &&
+        _lineBlocks.firstUncompressedTailBlock == nil) {
+        return YES;
+    }
+
+    BOOL didWork = NO;
+
+    if (_lineBlocks.lastUncompressedHeadBlock) {
+        const long long abs = _lineBlocks.lastUncompressedHeadBlock.longLongValue;
+        DLog(@"Compressible head blocks in %@…%@", @(num_dropped_blocks), @(abs));
+        _lineBlocks.lastUncompressedHeadBlock = [self compressStartingAt:[self safeAbsoluteBlockNumber:abs]
+                                                                  stride:-1
+                                                                   limit:num_dropped_blocks - 1
+                                                                 monitor:monitor
+                                                                 didWork:&didWork];
+    }
+    if (_lineBlocks.firstUncompressedTailBlock) {
+        const long long abs = _lineBlocks.firstUncompressedTailBlock.longLongValue;
+        DLog(@"Compressible tail blocks in %@…%@", @(abs), @(num_dropped_blocks + _lineBlocks.count - 1));
+        _lineBlocks.firstUncompressedTailBlock = [self compressStartingAt:[self safeAbsoluteBlockNumber:abs]
+                                                                   stride:1
+                                                                    limit:num_dropped_blocks + _lineBlocks.count
+                                                                  monitor:monitor
+                                                                  didWork:&didWork];
+    }
+
+    // Return NO to be rescheduled again soon.
+    if (!monitor.pending) {
+        // If we ran out of time try to keep going right away.
+        return NO;
+    }
+    // There was time left.
+    if (!didWork) {
+        // If we did nothing at all then we're just waiting for idle time to pass and we don't want
+        // to run again right away.
+        return YES;
+    }
+    // We worked and had time left. It is safe to infer that we finished everything.
+    return NO;
+}
+
+- (long long)safeAbsoluteBlockNumber:(long long)unsafe {
+    assert(_lineBlocks.count > 0);
+
+    if (unsafe < num_dropped_blocks) {
+        return num_dropped_blocks;
+    }
+    const long long limit = num_dropped_blocks + _lineBlocks.count;
+    if (unsafe >= limit) {
+        return limit - 1;
+    }
+    return unsafe;
+}
+
+// `limit` is the first absolute block number *not* to compress and it may be out of bounds.
+- (NSNumber *)compressStartingAt:(long long)start
+                          stride:(int)stride
+                           limit:(long long)limit
+                         monitor:(iTermDeadlineMonitor *)monitor
+                         didWork:(out BOOL *)didWork {
+    if (stride > 0) {
+        assert(limit > start);
+    } else {
+        assert(limit < start);
+    }
+    long long i = start;
+    while (monitor.pending && i != limit) {
+        LineBlock *block = _lineBlocks.blocks[i - num_dropped_blocks];
+        const BOOL neededCompression = block.isOnlyUncompressed;
+        const BOOL considerFinished = [block compressIfNeeded];
+        if (!considerFinished) {
+            DLog(@"Try again later for %@/%@", @(i), @(num_dropped_blocks + _lineBlocks.count - 1));
+            break;
+        }
+        if (neededCompression) {
+            DLog(@"Compressed %@/%@", @(i), @(num_dropped_blocks + _lineBlocks.count - 1));
+        } else {
+            DLog(@"Skipping already-compressed block %@/%@", @(i), @(num_dropped_blocks + _lineBlocks.count - 1));
+        }
+        *didWork = YES;
+        i += stride;
+    }
+    if (i == limit) {
+        return nil;
+    }
+    return @(i);
+}
+
+- (void)purgeDecompressedIfNeeded {
+    if (!_lineBlocks.needsPurge) {
+        return;
+    }
+    _lineBlocks.needsPurge = NO;
+    for (LineBlock *block in _lineBlocks.blocks) {
+        [block purgeDecompressed];
+    }
+}
+
+- (NSInteger)numberOfCellsUsedInWrappedLineRange:(VT100GridRange)wrappedLineRange
+                                           width:(int)width {
+    if (wrappedLineRange.length <= 0) {
+        return 0;
+    }
+    const int y1 = wrappedLineRange.location;
+    const int y2 = VT100GridRangeMax(wrappedLineRange);
+    
+    int startLine = y1;
+    const NSInteger firstBlockIndex = [_lineBlocks indexOfBlockContainingLineNumber:y1
+                                                                              width:width
+                                                                          remainder:&startLine];
+    if (firstBlockIndex == NSNotFound) {
+        return 0;
+    }
+
+    int lastLine = y2;
+    const NSInteger lastBlockIndex = [_lineBlocks indexOfBlockContainingLineNumber:y2
+                                                                             width:width
+                                                                         remainder:&lastLine];
+    if (lastBlockIndex == NSNotFound) {
+        return 0;
+    }
+
+    NSInteger sum = 0;
+    for (NSInteger i = firstBlockIndex; i <= lastBlockIndex; i++) {
+        NSInteger size = [_lineBlocks[i] sizeFromLine:startLine width:width];
+        startLine = 0;
+        if (i == lastBlockIndex) {
+            size -= [_lineBlocks[i] sizeFromLine:lastLine width:width];
+        }
+        sum += size;
+    }
+    return sum;
 }
 
 @end

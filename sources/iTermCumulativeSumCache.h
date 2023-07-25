@@ -17,13 +17,16 @@ NS_ASSUME_NONNULL_BEGIN
 // - Sum a subrange of values
 @interface iTermCumulativeSumCache : NSObject<NSCopying>
 
+// The offset is added to entries in _sums to get the *actual* sum.
 @property (nonatomic) NSInteger offset;
 @property (nonatomic, readonly) NSInteger sumOfAllValues;
 @property (nonatomic, readonly) NSInteger count;
 
 // Returns NSNotFound if the value is largest than the maximum
 // Runs in O(log(N)) time for N=number of buckets.
-- (NSInteger)indexContainingValue:(NSInteger)value;
+// If *roundUp is YES then return the successor if the value equals the last value of a bucket.
+// Regardless, *roundUp gets set to whether rounding up did/would happen.
+- (NSInteger)indexContainingValue:(NSInteger)value roundUp:(BOOL *)roundUp;
 
 // Debug version of the above
 - (NSInteger)verboseIndexContainingValue:(NSInteger)value;

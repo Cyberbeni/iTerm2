@@ -8,6 +8,7 @@
 
 #import "ToolCapturedOutputView.h"
 
+#import "iTerm2SharedARC-Swift.h"
 #import "CapturedOutput.h"
 #import "CaptureTrigger.h"
 #import "iTermCapturedOutputMark.h"
@@ -15,9 +16,11 @@
 #import "iTermSearchField.h"
 #import "iTermToolbeltView.h"
 #import "iTermToolWrapper.h"
+#import "NSArray+iTerm.h"
 #import "NSFont+iTerm.h"
 #import "NSImage+iTerm.h"
 #import "NSTableColumn+iTerm.h"
+#import "NSTableView+iTerm.h"
 #import "NSTextField+iTerm.h"
 #import "PseudoTerminal.h"
 #import "PTYSession.h"
@@ -40,13 +43,15 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
     BOOL shutdown_;
     NSArray *allCapturedOutput_;
     NSTableCellView *_measuringCellView;
-    VT100ScreenMark *mark_;  // Mark from which captured output came
+    id<VT100ScreenMarkReading> mark_;  // Mark from which captured output came
     NSInteger _clearCount;
     iTermSearchField *searchField_;
     NSButton *help_;
     NSButton *_clearButton;
     NSArray *filteredEntries_;
     BOOL _ignoreClick;
+    NSString *_clearedMark;
+    long long _clearedAbsLineNumber;
 }
 
 @synthesize tableView = tableView_;
@@ -95,36 +100,9 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
         ITERM_IGNORE_PARTIAL_END
         [self addSubview:searchField_];
 
-        scrollView_ = [[NSScrollView alloc] initWithFrame:CGRectZero];
-        [scrollView_ setHasVerticalScroller:YES];
-        [scrollView_ setHasHorizontalScroller:NO];
-        if (@available(macOS 10.16, *)) {
-            [scrollView_ setBorderType:NSLineBorder];
-            scrollView_.scrollerStyle = NSScrollerStyleOverlay;
-        } else {
-            [scrollView_ setBorderType:NSBezelBorder];
-        }
-        NSSize contentSize = [scrollView_ contentSize];
-        [scrollView_ setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-        scrollView_.drawsBackground = NO;
-
-        tableView_ = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, contentSize.width, contentSize.height)];
-#ifdef MAC_OS_X_VERSION_10_16
-        if (@available(macOS 10.16, *)) {
-            tableView_.style = NSTableViewStyleInset;
-        }
-#endif
-        NSTableColumn *col;
-        col = [[NSTableColumn alloc] initWithIdentifier:@"contents"];
-        [col setEditable:NO];
-        [tableView_ addTableColumn:col];
-        [[col headerCell] setStringValue:@"Contents"];
-        NSFont *theFont = [NSFont it_toolbeltFont];
-        [[col dataCell] setFont:theFont];
-        tableView_.rowHeight = col.suggestedRowHeight;
-        [tableView_ setHeaderView:nil];
-        [tableView_ setDataSource:self];
-        [tableView_ setDelegate:self];
+        scrollView_ = [NSScrollView scrollViewWithTableViewForToolbeltWithContainer:self
+                                                                             insets:NSEdgeInsetsZero];
+        tableView_ = scrollView_.documentView;
         if (@available(macOS 10.16, *)) { } else {
             NSSize spacing = tableView_.intercellSpacing;
             spacing.height += 5;
@@ -132,27 +110,19 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
         }
 
         [tableView_ setDoubleAction:@selector(doubleClickOnTableView:)];
-        [tableView_ setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         tableView_.target = self;
         tableView_.action = @selector(didClick:);
 
         tableView_.menu = [[NSMenu alloc] init];
         tableView_.menu.delegate = self;
+        tableView_.intercellSpacing = NSMakeSize(0, 2);
         NSMenuItem *item;
         item = [[NSMenuItem alloc] initWithTitle:@"Toggle Checkmark"
                                           action:@selector(toggleCheckmark:)
                                    keyEquivalent:@""];
         [tableView_.menu addItem:item];
-        if (@available(macOS 10.14, *)) {
-            tableView_.backgroundColor = [NSColor clearColor];
-        }
 
         [searchField_ setArrowHandler:tableView_];
-
-        [scrollView_ setDocumentView:tableView_];
-        [self addSubview:scrollView_];
-
-        [tableView_ setColumnAutoresizingStyle:NSTableViewSequentialColumnAutoresizingStyle];
 
         [self relayout];
 
@@ -175,7 +145,7 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
     iTermToolWrapper *wrapper = self.toolWrapper;
     ToolCommandHistoryView *commandHistoryView = [wrapper.delegate commandHistoryView];
     iTermCommandHistoryCommandUseMO *commandUse = [commandHistoryView selectedCommandUse];
-    VT100ScreenMark *mark;
+    id<VT100ScreenMarkReading> mark;
     NSArray *theArray;
     if (commandUse) {
         mark = commandUse.mark;
@@ -183,6 +153,14 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
         mark = [wrapper.delegate.delegate toolbeltLastCommandMark];
     }
     theArray = mark.capturedOutput;
+    if ([_clearedMark isEqualToString:mark.guid]) {
+        theArray = [theArray filteredArrayUsingBlock:^BOOL(id<CapturedOutputReading> co) {
+            return co.absoluteLineNumber > _clearedAbsLineNumber;
+        }];
+    } else {
+        _clearedMark = nil;
+        _clearedAbsLineNumber = 0;
+    }
     if (mark != mark_) {
         [tableView_ selectRowIndexes:[NSIndexSet indexSet] byExtendingSelection:NO];
         mark_ = mark;
@@ -279,6 +257,8 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
 }
 
 - (void)clear:(id)sender {
+    _clearedAbsLineNumber = mark_.capturedOutput.lastObject.absoluteLineNumber;
+    _clearedMark = mark_.guid;
     allCapturedOutput_ = [[NSMutableArray alloc] init];
     filteredEntries_ = [[NSMutableArray alloc] init];
 
@@ -293,39 +273,25 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
     return filteredEntries_.count;
 }
 
-- (NSTableCellView *)newTextField {
-    NSTableCellView *cellView = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
-    NSTextField *textField = [NSTextField it_textFieldForTableViewWithIdentifier:iTermCapturedOutputToolTableViewCellIdentifier];;
+- (NSTableCellView *)newCellViewWithString:(NSString *)string {
+    NSTableCellView *cell = [tableView_ newTableCellViewWithTextFieldUsingIdentifier:iTermCapturedOutputToolTableViewCellIdentifier
+                                                                                font:[NSFont it_toolbeltFont]
+                                                                              string:string];
+    NSTextField *textField = cell.textField;
     textField.maximumNumberOfLines = 0;
     textField.lineBreakMode = NSLineBreakByCharWrapping;
     textField.usesSingleLineMode = NO;
     textField.font = [NSFont it_toolbeltFont];
-    cellView.textField = textField;
-    [cellView addSubview:textField];
-    textField.translatesAutoresizingMaskIntoConstraints = NO;
-    NSDictionary *views = NSDictionaryOfVariableBindings(textField);
-    [cellView addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[textField]-0-|"
-                                                                     options:0
-                                                                     metrics:nil
-                                                                       views:views]];
-    [cellView addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|-0-[textField]-0-|"
-                                                                     options:0
-                                                                     metrics:nil
-                                                                       views:views]];
-    return cellView;
+    return cell;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
-    NSTableCellView *result = [tableView makeViewWithIdentifier:iTermCapturedOutputToolTableViewCellIdentifier owner:self];
-    if (result == nil) {
-        result = [self newTextField];
-    }
-
     CapturedOutput *capturedOutput = filteredEntries_[row];
     NSString *value = [self labelForCapturedOutput:capturedOutput];
-    result.textField.stringValue = value;
+    NSTableCellView *result = [self newCellViewWithString:value];
+    result.textField.maximumNumberOfLines = 0;
+    result.textField.lineBreakMode = NSLineBreakByCharWrapping;
     result.textField.toolTip = value;
-
     return result;
 }
 
@@ -343,7 +309,7 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
     CapturedOutput *capturedOutput = filteredEntries_[rowIndex];
     NSString *label = [self labelForCapturedOutput:capturedOutput];
     if (!_measuringCellView) {
-        _measuringCellView = [self newTextField];
+        _measuringCellView = [self newCellViewWithString:label];
     }
     // https://stackoverflow.com/a/42853810/321984
     [_measuringCellView.textField setStringValue:label];
@@ -351,7 +317,7 @@ static NSString *const iTermCapturedOutputToolTableViewCellIdentifier = @"ToolCa
     _measuringCellView.needsLayout = YES;
     [_measuringCellView layoutSubtreeIfNeeded];
     NSSize naturalSize = [_measuringCellView fittingSize];
-    return naturalSize.height > tableView_.rowHeight ? naturalSize.height : tableView_.rowHeight;
+    return naturalSize.height;
 }
 
 - (NSCell *)tableView:(NSTableView *)tableView

@@ -17,7 +17,9 @@
 #import "iTermVariableScope.h"
 #import "iTermWarning.h"
 #import "NSImage+iTerm.h"
+#import "NSScreen+iTerm.h"
 #import "NSTextField+iTerm.h"
+#import "NSView+iTerm.h"
 #import "PreferencePanel.h"
 
 // On macOS 10.13, we see that blur over 26 can turn red (issue 6138).
@@ -67,6 +69,7 @@ CGFloat iTermMaxBlurRadius(void) {
     IBOutlet NSButton *_useCustomTabTitle;
     IBOutlet NSTextField *_customTabTitle;
     iTermFunctionCallTextFieldDelegate *_customTabTitleDelegate;
+    NSString *_lastGuid;
 }
 
 - (void)dealloc {
@@ -233,6 +236,8 @@ CGFloat iTermMaxBlurRadius(void) {
         _customWindowTitleDelegate = [[iTermFunctionCallTextFieldDelegate alloc] initWithPathSource:[iTermVariableHistory pathSourceForContext:iTermVariablesSuggestionContextWindow]
                                                                                         passthrough:self
                                                                                       functionsOnly:NO];
+        _customWindowTitleDelegate.canWarnAboutContextMistake = YES;
+        _customWindowTitleDelegate.contextMistakeText = @"This interpolated string is evaluated in the window’s context, not the session’s context. To access variables in the current session, use currentTab.currentSession.sessionVariableNameHere";
         _customWindowTitle.delegate = _customWindowTitleDelegate;
         [self defineControl:_customWindowTitle
                         key:KEY_CUSTOM_WINDOW_TITLE
@@ -254,6 +259,8 @@ CGFloat iTermMaxBlurRadius(void) {
         _customTabTitleDelegate = [[iTermFunctionCallTextFieldDelegate alloc] initWithPathSource:[iTermVariableHistory pathSourceForContext:iTermVariablesSuggestionContextTab]
                                                                                         passthrough:self
                                                                                       functionsOnly:NO];
+        _customTabTitleDelegate.canWarnAboutContextMistake = YES;
+        _customTabTitleDelegate.contextMistakeText = @"This interpolated string is evaluated in the tab’s context, not the session’s context. To access variables in the current session, use currentSession.sessionVariableNameHere";
         _customTabTitle.delegate = _customTabTitleDelegate;
         [self defineControl:_customTabTitle
                         key:KEY_CUSTOM_TAB_TITLE
@@ -308,6 +315,13 @@ CGFloat iTermMaxBlurRadius(void) {
     [self loadBackgroundImageWithFilename:[self stringForKey:KEY_BACKGROUND_IMAGE_LOCATION]];
     [self updateCustomWindowTitleEnabled];
     [self updateCustomTabTitleEnabled];
+    [_customWindowTitle it_removeWarning];
+    [_customTabTitle it_removeWarning];
+    if (![[self stringForKey:KEY_GUID] isEqual:_lastGuid]) {
+        _customTabTitleDelegate.canWarnAboutContextMistake = YES;
+        _customWindowTitleDelegate.canWarnAboutContextMistake = YES;
+        _lastGuid = [self stringForKey:KEY_GUID];
+    }
 }
 
 #pragma mark - Actions
@@ -332,6 +346,7 @@ CGFloat iTermMaxBlurRadius(void) {
     void (^completion)(NSInteger) = ^(NSInteger result) {
         if (result == NSModalResponseOK) {
             NSURL *url = [[panel URLs] objectAtIndex:0];
+            [self checkImage:url.path];
             [self loadBackgroundImageWithFilename:[url path]];
             [self setString:self.backgroundImageFilename forKey:KEY_BACKGROUND_IMAGE_LOCATION];
         } else {
@@ -350,6 +365,7 @@ CGFloat iTermMaxBlurRadius(void) {
 }
 
 - (void)imageWellDidPerformDropOperation:(iTermImageWell *)imageWell filename:(NSString *)filename {
+    [self checkImage:filename];
     [self loadBackgroundImageWithFilename:filename];
     [self setString:filename forKey:KEY_BACKGROUND_IMAGE_LOCATION];
 }
@@ -370,6 +386,42 @@ CGFloat iTermMaxBlurRadius(void) {
     }
 }
 
+- (BOOL)checkImage:(NSString *)filename {
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:filename options:0 error:&error];
+    if (!data) {
+        [iTermWarning showWarningWithTitle:error.localizedDescription
+                                   actions:@[ @"OK" ]
+                                 accessory:nil
+                                identifier:@"BackgroundImageUnreadable"
+                               silenceable:kiTermWarningTypePersistent
+                                   heading:@"Problem Loading Image"
+                                    window:self.view.window];
+        return NO;
+    }
+    if (data.length == 0) {
+        [iTermWarning showWarningWithTitle:[NSString stringWithFormat:@"The image “%@” could not be loaded because the file is empty.", filename.lastPathComponent]
+                                   actions:@[ @"OK" ]
+                                 accessory:nil
+                                identifier:@"BackgroundImageUnreadable"
+                               silenceable:kiTermWarningTypePersistent
+                                   heading:@"Problem Loading Image"
+                                    window:self.view.window];
+        return NO;
+    }
+    if (![[NSImage alloc] initWithData:data]) {
+        [iTermWarning showWarningWithTitle:[NSString stringWithFormat:@"The image “%@” could not be loaded because it is corrupt or not a supported format.", filename.lastPathComponent]
+                                   actions:@[ @"OK" ]
+                                 accessory:nil
+                                identifier:@"BackgroundImageUnreadable"
+                               silenceable:kiTermWarningTypePersistent
+                                   heading:@"Problem Loading Image"
+                                    window:self.view.window];
+        return NO;
+    }
+    return YES;
+}
+
 #pragma mark - Screen
 
 - (void)screenDidChange {
@@ -386,12 +438,14 @@ CGFloat iTermMaxBlurRadius(void) {
     [[_screen lastItem] setTag:-1];
     [_screen addItemWithTitle:@"Screen with Cursor"];
     [[_screen lastItem] setTag:-2];
-    const int numScreens = [[NSScreen screens] count];
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    [_screen.menu addItem:[NSMenuItem separatorItem]];
+    const int numScreens = [screens count];
     for (i = 0; i < numScreens; i++) {
         if (i == 0) {
             [_screen addItemWithTitle:[NSString stringWithFormat:@"Main Screen"]];
         } else {
-            [_screen addItemWithTitle:[NSString stringWithFormat:@"Screen %d", i+1]];
+            [_screen addItemWithTitle:screens[i].it_uniqueName];
         }
         [[_screen lastItem] setTag:i];
     }

@@ -18,9 +18,11 @@ from iterm2.color import Color, ColorSpace
 from iterm2.colorpresets import (
     ColorPreset, ListPresetsException, GetPresetException)
 
-from iterm2.connection import Connection, run_until_complete, run_forever
+from iterm2.connection import Connection, run_until_complete, run_forever, add_disconnect_callback
 
 from iterm2.customcontrol import CustomControlSequenceMonitor
+
+from iterm2.filepanel import OpenPanel, SavePanel
 
 from iterm2.focus import (
     FocusMonitor, FocusUpdateApplicationActive, FocusUpdateWindowChanged,

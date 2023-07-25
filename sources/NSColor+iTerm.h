@@ -23,6 +23,7 @@ extern NSString *const kEncodedColorDictionaryColorSpace;  // Optional, defaults
 // Values for kEncodedColorDictionaryColorSpace key
 extern NSString *const kEncodedColorDictionarySRGBColorSpace;
 extern NSString *const kEncodedColorDictionaryCalibratedColorSpace;
+extern NSString *const kEncodedColorDictionaryP3ColorSpace;
 
 static inline float SIMDPerceivedBrightness(vector_float4 x) {
     static const vector_float4 y = (vector_float4){ 0.30, 0.59, 0.11, 0 };
@@ -70,18 +71,15 @@ CGFloat iTermLABDistance(iTermLABColor lhs, iTermLABColor rhs);
 
 CGFloat PerceivedBrightness(CGFloat r, CGFloat g, CGFloat b);
 
+// This will return the color in the app's standard colorspace.
 + (NSColor * _Nullable)colorWithString:(NSString *)s;
-+ (NSColor *)colorWith8BitRed:(int)red
-                        green:(int)green
-                         blue:(int)blue;
+
+// This will preserve the colorspace of the encoded color.
++ (NSColor *)colorPreservingColorspaceFromString:(NSString *)s;
 
 + (NSColor *)colorWith8BitRed:(int)red
                         green:(int)green
-                         blue:(int)blue
-                       muting:(double)muting
-                backgroundRed:(CGFloat)bgRed
-              backgroundGreen:(CGFloat)bgGreen
-               backgroundBlue:(CGFloat)bgBlue;
+                         blue:(int)blue;
 
 // Modify r,g,b to have brightness t, placing the values in result which should hold 4 CGFloats.
 + (void)getComponents:(CGFloat *)result
@@ -99,6 +97,8 @@ CGFloat PerceivedBrightness(CGFloat r, CGFloat g, CGFloat b);
   withContrastAgainstComponents:(CGFloat *)otherComponents
                 minimumContrast:(CGFloat)minimumContrast;
 
++ (NSColor *)it_colorInDefaultColorSpaceWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha;
+
 - (int)nearestIndexIntoAnsi256ColorTable;
 
 - (iTermLABColor)labColor;
@@ -113,16 +113,34 @@ CGFloat PerceivedBrightness(CGFloat r, CGFloat g, CGFloat b);
 // Return the color you'd get by rendering self over background.
 - (NSColor *)colorByPremultiplyingAlphaWithColor:(NSColor *)background;
 
+// p3:#rrggbb or #rrggbb (srgb implicitly)
+// converts to the app-standard colorspace
 - (NSString *)hexString;
+
+- (NSString *)hexStringPreservingColorSpace;
+
+// #rrggbb
+- (NSString *)srgbHexString;
+
 + (instancetype _Nullable)colorFromHexString:(NSString *)hexString;
 
 - (NSColor *)it_colorByDimmingByAmount:(double)dimmingAmount;
 
 - (NSColor *)it_colorWithAppearance:(NSAppearance *)appearance;
+- (NSColor *)it_colorWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha;
+- (NSColor *)it_colorInDefaultColorSpace;
 
 // Unlike -colorSpace, this is safe to use from Swift. It does not throw an exception, but returns nil for catalog colors and such.
 @property (nonatomic, readonly) NSColorSpace * _Nullable it_colorSpace;
 
+- (BOOL)isApproximatelyEqualToColor:(NSColor *)other epsilon:(double)e;
+- (NSColor *)blendedWithColor:(NSColor *)color weight:(CGFloat)weight;
+@property (nonatomic, readonly) vector_float4 vector;
+
+@end
+
+@interface NSColorSpace(iTerm)
++ (instancetype)it_defaultColorSpace;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -1,6 +1,7 @@
 #import "iTermToolbeltView.h"
 
 #import "FutureMethods.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermApplication.h"
 #import "iTermApplicationDelegate.h"
@@ -36,6 +37,7 @@ NSString *const kNotesToolName = @"Notes";
 NSString *const kPasteHistoryToolName = @"Paste History";
 NSString *const kProfilesToolName = @"Profiles";
 NSString *const kSnippetsToolName = @"Snippets";
+NSString *const kNamedMarksToolName = @"Named Marks";
 
 NSString *const kToolbeltShouldHide = @"kToolbeltShouldHide";
 
@@ -78,6 +80,7 @@ static NSString *const kDynamicToolURL = @"URL";
     [iTermToolbeltView registerToolWithName:kActionsToolName withClass:[iTermToolActions class]];
     [iTermToolbeltView registerToolWithName:kCapturedOutputToolName withClass:[ToolCapturedOutputView class]];
     [iTermToolbeltView registerToolWithName:kCommandHistoryToolName withClass:[ToolCommandHistoryView class]];
+    [iTermToolbeltView registerToolWithName:kNamedMarksToolName withClass:[ToolNamedMarks class]];
     [iTermToolbeltView registerToolWithName:kRecentDirectoriesToolName withClass:[ToolDirectoriesView class]];
     [iTermToolbeltView registerToolWithName:kJobsToolName withClass:[ToolJobs class]];
     [iTermToolbeltView registerToolWithName:kNotesToolName withClass:[ToolNotes class]];
@@ -237,20 +240,18 @@ static NSString *const kDynamicToolURL = @"URL";
     self = [super initWithFrame:frame];
     if (self) {
         _delegate = delegate;
-        if (@available(macOS 10.14, *)) {
-            _vev = [[[iTermToolbeltVibrantVisualEffectView alloc] init] autorelease];
-            _vev.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-            _vev.material = NSVisualEffectMaterialSidebar;
-            _vev.state = NSVisualEffectStateActive;
-            _vev.frame = self.bounds;
-            _vev.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            [self addSubview:_vev];
+        _vev = [[[iTermToolbeltVibrantVisualEffectView alloc] init] autorelease];
+        _vev.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        _vev.material = NSVisualEffectMaterialSidebar;
+        _vev.state = NSVisualEffectStateActive;
+        _vev.frame = self.bounds;
+        _vev.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [self addSubview:_vev];
 
-            self.wantsLayer = YES;
-            self.layer = [[[CALayer alloc] init] autorelease];
-            self.layer.delegate = self;
-            self.layer.backgroundColor = [[self backgroundColor] CGColor];
-        }
+        self.wantsLayer = YES;
+        self.layer = [[[CALayer alloc] init] autorelease];
+        self.layer.delegate = self;
+        self.layer.backgroundColor = [[self backgroundColor] CGColor];
         
         NSArray *items = [iTermToolbeltView configuredTools];
         if (!items) {
@@ -304,8 +305,8 @@ static NSString *const kDynamicToolURL = @"URL";
 
 #pragma mark - NSView
 
-- (void)resizeWithOldSuperviewSize:(NSSize)oldSize {
-    [super resizeWithOldSuperviewSize:oldSize];
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
+    [super resizeSubviewsWithOldSize:oldSize];
     _menuButton.frame = self.menuButtonFrame;
 }
 
@@ -318,9 +319,7 @@ static NSString *const kDynamicToolURL = @"URL";
 }
 
 - (void)viewDidChangeEffectiveAppearance {
-    if (@available(macOS 10.14, *)) {
-        [self updateColors];
-    }
+    [self updateColors];
 }
 
 - (void)updateColors NS_AVAILABLE_MAC(10_14) {
@@ -340,55 +339,19 @@ static NSString *const kDynamicToolURL = @"URL";
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
-    if (@available(macOS 10.14, *)) {
-        [self updateColors];
-    }
+    [self updateColors];
 }
 
 - (NSColor *)backgroundColor {
-    if (@available(macOS 10.14, *)) {
-        if (self.effectiveAppearance.it_isDark) {
-            return [NSColor clearColor];
-        } else {
-            // See comment in updateColors
-            return [NSColor whiteColor];
-        }
+    if (self.effectiveAppearance.it_isDark) {
+        return [NSColor clearColor];
+    } else {
+        // See comment in updateColors
+        return [NSColor whiteColor];
     }
-
-    NSColor *lightColor = [NSColor colorWithCalibratedWhite:237.0/255.0 alpha:1];
-    NSColor *darkColor = [NSColor colorWithCalibratedWhite:0.12 alpha:1.00];
-    switch ([self.effectiveAppearance it_tabStyle:[iTermPreferences intForKey:kPreferenceKeyTabStyle]]) {
-        case TAB_STYLE_AUTOMATIC:
-        case TAB_STYLE_COMPACT:
-        case TAB_STYLE_MINIMAL:
-            assert(NO);
-
-        case TAB_STYLE_LIGHT:
-        case TAB_STYLE_LIGHT_HIGH_CONTRAST:
-            return lightColor;
-            break;
-
-        case TAB_STYLE_DARK:
-        case TAB_STYLE_DARK_HIGH_CONTRAST:
-            if (@available(macOS 10.14, *)) {
-                return darkColor;
-            } else if ([iTermAdvancedSettingsModel darkThemeHasBlackTitlebar]) {
-                return darkColor;
-            } else {
-                return lightColor;
-            }
-            break;
-    }
-    return lightColor;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    if (@available(macOS 10.14, *)) {
-        return;
-    }
-    [[self backgroundColor] set];
-    NSRectFill(dirtyRect);
-    [super drawRect:dirtyRect];
 }
 
 - (BOOL)isFlipped {
@@ -444,6 +407,11 @@ static NSString *const kDynamicToolURL = @"URL";
 - (ToolCapturedOutputView *)capturedOutputView {
     iTermToolWrapper *wrapper = [_tools objectForKey:kCapturedOutputToolName];
     return (ToolCapturedOutputView *)wrapper.tool;
+}
+
+- (ToolJobs *)jobsView {
+    iTermToolWrapper *wrapper = [_tools objectForKey:kJobsToolName];
+    return (ToolJobs *)wrapper.tool;
 }
 
 - (void)windowBackgroundColorDidChange {
@@ -530,7 +498,8 @@ static NSString *const kDynamicToolURL = @"URL";
                                   0,
                                   wrapper.container.frame.size.width,
                                   wrapper.container.frame.size.height);
-        if ([c instancesRespondToSelector:@selector(initWithFrame:URL:identifier:)]) {
+        ;
+        if ([self classIsDynamic:c]) {
             NSDictionary *registry = [[NSUserDefaults standardUserDefaults] objectForKey:kDynamicToolsKey];
             NSString *identifier = [registry.allKeys objectPassingTest:^BOOL(NSString *key, NSUInteger index, BOOL *stop) {
                 NSDictionary *dict = registry[key];
@@ -548,6 +517,16 @@ static NSString *const kDynamicToolURL = @"URL";
             [self addTool:theTool toWrapper:wrapper];
         }
     }
+}
+
+- (BOOL)classIsDynamic:(Class)c {
+    if (![c instancesRespondToSelector:@selector(initWithFrame:URL:identifier:)]) {
+        return NO;
+    }
+    if ([c respondsToSelector:@selector(isDynamic)]) {
+        return [c isDynamic];
+    }
+    return YES;
 }
 
 - (void)relayoutAllTools {
@@ -602,6 +581,11 @@ static NSString *const kDynamicToolURL = @"URL";
 - (ToolCommandHistoryView *)commandHistoryView {
     iTermToolWrapper *wrapper = [_tools objectForKey:kCommandHistoryToolName];
     return (ToolCommandHistoryView *)wrapper.tool;
+}
+
+- (ToolNamedMarks *)namedMarksView {
+    iTermToolWrapper *wrapper = _tools[kNamedMarksToolName];
+    return (ToolNamedMarks *)wrapper.tool;
 }
 
 #pragma mark - NSSplitViewDelegate

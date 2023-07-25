@@ -7,6 +7,7 @@
 
 #import "TmuxGateway.h"
 
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermApplicationDelegate.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "TmuxController.h"
@@ -17,6 +18,9 @@
 
 NSString * const kTmuxGatewayErrorDomain = @"kTmuxGatewayErrorDomain";;
 
+#ifdef NEWLINE
+#undef NEWLINE
+#endif
 #define NEWLINE @"\r"
 
 //#define TMUX_VERBOSE_LOGGING
@@ -139,13 +143,16 @@ static NSString *kCommandTimestamp = @"timestamp";
                           title:@"tmux Reported a Problem"];
 }
 
+// TODO: be more forgiving of errors.
 - (void)abortWithErrorMessage:(NSString *)message title:(NSString *)title {
-    // TODO: be more forgiving of errors.
-    NSAlert *alert = [[[NSAlert alloc] init] autorelease];
-    alert.messageText = title;
-    alert.informativeText = message;
-    [alert addButtonWithTitle:@"OK"];
-    [alert runModal];
+    // This can run in a side-effect and it's not safe to start a runloop in a side effect.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+        alert.messageText = title;
+        alert.informativeText = message;
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
+    });
     [self detach];
     [delegate_ tmuxHostDisconnected:[[_dcsID copy] autorelease]];  // Force the client to quit
 }
@@ -306,7 +313,7 @@ error:
     [self abortWithErrorMessage:[NSString stringWithFormat:@"Malformed command (expected %%num data): \"%s\"", command]];
 }
 
-- (NSNumber *)layoutIsZoomed:(NSString *)args {
+- (NSNumber *)layoutIsZoomedInLayoutChange:(NSString *)args {
     // window-layout window-visible-layout window-flags
     NSArray<NSString *> *components = [args componentsSeparatedByString:@" "];
     if (components.count < 3) {
@@ -316,20 +323,39 @@ error:
     return @([windowFlags containsString:@"Z"]);
 }
 
+- (NSString *)regularLayoutFromLayoutChange:(NSString *)args {
+    NSArray<NSString *> *components = [args componentsSeparatedByString:@" "];
+    if (components.count < 1) {
+        return nil;
+    }
+    return components[0];
+}
+
+- (NSString *)visibleLayoutFromLayoutChange:(NSString *)args {
+    NSArray<NSString *> *components = [args componentsSeparatedByString:@" "];
+    if (components.count < 2) {
+        return nil;
+    }
+    return components[1];
+}
+
 - (void)parseLayoutChangeCommand:(NSString *)command
 {
-    // %layout-change <window> <layout>
+    // %layout-change <window> <layout> [window_visible_layout window_flags]
+    DLog(@"TmuxGateway: received layout change %@", command);
     NSArray *components = [command captureComponentsMatchedByRegex:@"^%layout-change @([0-9]+) (.*)"];
     if (components.count != 3) {
-        [self abortWithErrorMessage:[NSString stringWithFormat:@"Malformed command (expected %%layout-change <window> <layout>): \"%@\"",
+        [self abortWithErrorMessage:[NSString stringWithFormat:@"Malformed command (expected %%layout-change <window> <layout> [<window_visible_layout> <window_flags>]): \"%@\"",
                                      command]];
         return;
     }
     int window = [[components objectAtIndex:1] intValue];
-    NSString *layout = [components objectAtIndex:2];
+    NSString *rest = [components objectAtIndex:2];
+
     [delegate_ tmuxUpdateLayoutForWindow:window
-                                  layout:layout
-                                  zoomed:[self layoutIsZoomed:layout]
+                                  layout:[self regularLayoutFromLayoutChange:rest]
+                           visibleLayout:[self visibleLayoutFromLayoutChange:rest]
+                                  zoomed:[self layoutIsZoomedInLayoutChange:rest]
                                     only:YES];
 }
 
@@ -423,6 +449,18 @@ error:
         return;
     }
     [delegate_ tmuxSessionWindowDidChangeTo:[components[2] intValue]];
+}
+
+// %paste-buffer-changed buffer1
+- (void)parsePasedChangedCommand:(NSString *)command {
+    // For security purposes we restrict the accepted buffer names since we will output this buffer name to fetch its contents.
+    // It's an instance of attacker-controlled values that we then output which could be used as user input.
+    NSArray<NSString *> *components = [command captureComponentsMatchedByRegex:@"^%paste-buffer-changed (buffer[0-9]+)"];
+    if (components.count != 2) {
+        DLog(@"Unexpected syntax: %@", command);
+        return;
+    }
+    [delegate_ tmuxSessionPasteDidChange:components[1]];
 }
 
 - (void)parsePauseCommand:(NSString *)command {
@@ -562,7 +600,8 @@ error:
         return;
     }
     _initialized = YES;
-    if (withError) {
+    const BOOL shouldTolerateError = !!([self currentCommandFlags] & kTmuxGatewayCommandShouldTolerateErrors);
+    if (withError && !shouldTolerateError) {
         [delegate_ tmuxInitialCommandDidFailWithError:currentCommandResponse_];
     } else {
         [delegate_ tmuxInitialCommandDidCompleteSuccessfully];
@@ -760,6 +799,8 @@ error:
                [command hasPrefix:@"%pane-mode-changed"]) {  // copy mode, etc
         // New in tmux 2.5. Don't care.
         TmuxLog(@"Ignore %@", command);
+    } else if ([command hasPrefix:@"%paste-buffer-changed "]) {
+        if (acceptNotifications_) [self parsePasedChangedCommand:command];
     } else if ([command hasPrefix:@"%exit "] ||
                [command isEqualToString:@"%exit"]) {
         TmuxLog(@"tmux exit message: %@", command);
@@ -855,15 +896,32 @@ error:
         }
     }
 
-    // Send multiple small send-keys commands because commands longer than 1024 bytes crash tmux 1.8.
+    // Configure max lengths. Commands larger than 1024 bytes crash tmux 1.8.
+    const NSUInteger maxLiteralCharacters = 1000;
+    const NSUInteger maxHexCharacters = maxLiteralCharacters / 8;  // len(' C-Space') = 8
+    NSDictionary<NSNumber *, NSNumber *> *maxLengths = @{
+        @YES: @(maxLiteralCharacters),
+        @NO: @(maxHexCharacters)
+    };
+
     NSMutableArray *commands = [NSMutableArray array];
-    const NSUInteger stride = 80;
-    for (NSUInteger start = 0; start < codePoints.count; start += stride) {
-        NSUInteger length = MIN(stride, codePoints.count - start);
-        NSRange range = NSMakeRange(start, length);
-        NSArray *subarray = [codePoints subarrayWithRange:range];
-        [commands addObject:[self dictionaryForSendKeysCommandWithCodePoints:subarray windowPane:windowPane]];
-    }
+    void (^emitter)(NSArray<NSNumber *> * _Nonnull,
+              NSNumber * _Nonnull) =
+    ^(NSArray<NSNumber *> * _Nonnull codePoints,
+      NSNumber * _Nonnull literal) {
+        [commands addObject:[self dictionaryForSendKeysCommandWithCodePoints:codePoints
+                                                                  windowPane:windowPane
+                                                         asLiteralCharacters:literal.boolValue]];
+    };
+    NSNumber * _Nonnull(^classifier)(NSNumber * _Nonnull number) =
+    ^NSNumber * _Nonnull(NSNumber * _Nonnull number) {
+        return @([self canSendAsLiteralCharacter:number]);
+    };
+
+    [iTermRunLengthEncoder encodeArray:codePoints
+                            maxLengths:maxLengths
+                               emitter:emitter
+                            classifier:classifier];
 
     [delegate_ tmuxSetSecureLogging:YES];
     [self sendCommandList:commands];
@@ -884,21 +942,38 @@ error:
     return !([self.minimumServerVersion isEqual:version2_2] && [self.maximumServerVersion isEqual:version2_2]);
 }
 
+- (BOOL)canSendAsLiteralCharacter:(NSNumber *)codePoint {
+    const unichar c = codePoint.unsignedShortValue;
+    if (c == '+' || c == '/' || c == ')' || c == ':' || c == ',' || c == '_') {
+        return YES;
+    }
+    return isascii(c) && isalnum(c);
+}
+
+- (NSString *)numbersAsLiteralCharacters:(NSArray<NSNumber *> *)codePoints {
+    NSMutableString *result = [NSMutableString stringWithCapacity:codePoints.count];
+    for (NSNumber *number in codePoints) {
+        [result appendFormat:@"%c", number.intValue];
+    }
+    return result;
+}
+
 - (NSDictionary *)dictionaryForSendKeysCommandWithCodePoints:(NSArray<NSNumber *> *)codePoints
-                                                  windowPane:(int)windowPane {
+                                                  windowPane:(int)windowPane
+                                         asLiteralCharacters:(BOOL)asLiteralCharacters {
     NSString *value;
-    if ([codePoints isEqual:@[ @0 ]]) {
-        value = @"C-Space";
+    if (asLiteralCharacters) {
+        value = [self numbersAsLiteralCharacters:codePoints];
     } else {
         value = [codePoints numbersAsHexStrings];
     }
-    NSString *command = [NSString stringWithFormat:@"send-keys -t \"%%%d\" %@",
-                         windowPane, value];
+    NSString *command = [NSString stringWithFormat:@"send %@ %%%d %@",
+                         asLiteralCharacters ? @"-lt" : @"-t", windowPane, value];
     NSDictionary *dict = [self dictionaryForCommand:command
                                      responseTarget:self
                                    responseSelector:@selector(noopResponseSelector:)
                                      responseObject:nil
-                                              flags:0];
+                                              flags:kTmuxGatewayCommandShouldTolerateErrors];
     return dict;
 }
 

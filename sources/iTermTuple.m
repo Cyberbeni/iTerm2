@@ -14,6 +14,10 @@ static NSString *const iTermTupleValueKey = @"value";
 
 @implementation iTermTuple
 
++ (BOOL)supportsSecureCoding {
+    return YES;
+}
+
 + (instancetype)tupleWithObject:(id)firstObject andObject:(id)secondObject {
     iTermTuple *tuple = [[self alloc] init];
     tuple.firstObject = firstObject;
@@ -27,6 +31,15 @@ static NSString *const iTermTupleValueKey = @"value";
     NSDictionary *secondDict = [array uncheckedObjectAtIndex:1] ?: @{};
     return [iTermTuple tupleWithObject:firstDict[iTermTupleValueKey]
                              andObject:secondDict[iTermTupleValueKey]];
+}
+
++ (NSArray<iTermTuple *> *)cartesianProductOfArray:(NSArray *)a1
+                                              with:(NSArray *)a2 {
+    return [a1 flatMapWithBlock:^NSArray *(id v1) {
+        return [a2 mapWithBlock:^id(id v2) {
+            return [iTermTuple tupleWithObject:v1 andObject:v2];
+        }];
+    }];
 }
 
 - (instancetype)initWithCoder:(NSCoder *)aDecoder {
@@ -88,9 +101,25 @@ static NSString *const iTermTupleValueKey = @"value";
     return [self.secondObject compare:other.secondObject];
 }
 
+- (NSString *)jsonEncoded {
+    NSDictionary *dict = @{ @"first": self.firstObject ?: [NSNull null],
+                            @"second": self.secondObject ?: [NSNull null] };
+    return [dict jsonEncoded];
+}
+
++ (instancetype)fromJsonEncodedString:(NSString *)string {
+    NSDictionary *dict = [NSDictionary fromJsonEncodedString:string];
+    return [iTermTuple tupleWithObject:dict[@"first"] andObject:dict[@"second"]];
+}
+
+
 @end
 
 @implementation iTermTriple
+
++ (BOOL)supportsSecureCoding {
+    return YES;
+}
 
 + (instancetype)tripleWithObject:(id)firstObject andObject:(id)secondObject object:(id)thirdObject {
     iTermTriple *triple = [super tupleWithObject:firstObject andObject:secondObject];
@@ -172,5 +201,19 @@ static NSString *const iTermTupleValueKey = @"value";
     }
     return [self.thirdObject compare:other.thirdObject];
 }
+
+- (NSString *)jsonEncoded {
+    NSDictionary *dict = @{ @"first": self.firstObject ?: [NSNull null],
+                            @"second": self.secondObject ?: [NSNull null],
+                            @"third": self.thirdObject ?: [NSNull null],
+    };
+    return [dict jsonEncoded];
+}
+
++ (instancetype)fromJsonEncodedString:(NSString *)string {
+    NSDictionary *dict = [NSDictionary fromJsonEncodedString:string];
+    return [iTermTriple tripleWithObject:dict[@"first"] andObject:dict[@"second"] object:dict[@"third"]];
+}
+
 
 @end

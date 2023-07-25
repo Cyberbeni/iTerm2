@@ -30,6 +30,8 @@
 
 @property(nonatomic, weak) id<CPKColorWellViewDelegate> delegate;
 
+@property (nonatomic, strong) NSColorSpace *colorSpace;
+
 @end
 
 @interface CPKColorWellView() <NSDraggingDestination, NSDraggingSource, NSPopoverDelegate>
@@ -231,7 +233,10 @@
     NSButton *button = [[NSButton alloc] initWithFrame:frame];
     button.bordered = NO;
     button.image = image;
-    button.imagePosition = NSImageOnly;
+    button.title = @"Default Picker";
+    button.imagePosition = NSImageAbove;
+    [button sizeToFit];
+    frame = button.frame;
     [button setTarget:self];
     [button setAction:@selector(useColorPicker:)];
 
@@ -243,7 +248,9 @@
         image = [self cpk_imageNamed:@"NoColor"];
         button.bordered = NO;
         button.image = image;
-        button.imagePosition = NSImageOnly;
+        button.imagePosition = NSImageAbove;
+        button.title = @"No Color";
+        [button sizeToFit];
         [button setTarget:self];
         [button setAction:@selector(noColorChosenInSystemColorPicker:)];
         [container addSubview:button];
@@ -283,6 +290,7 @@
                                    ofView:presentingView
                             preferredEdge:NSRectEdgeMinY
                              initialColor:self.color
+                               colorSpace:self.colorSpace
                                   options:options
                        selectionDidChange:^(NSColor *color) {
                            weakSelf.selectedColor = color;
@@ -338,18 +346,38 @@
 
 @end
 
+static NSColorSpace *gDefaultColorSpace;
+
 @implementation CPKColorWell {
   CPKColorWellView *_view;
   BOOL _continuous;
 }
 
++ (NSColorSpace *)defaultColorSpace {
+    return gDefaultColorSpace ?: [NSColorSpace sRGBColorSpace];
+}
+
++ (void)setDefaultColorSpace:(NSColorSpace *)defaultColorSpace {
+    gDefaultColorSpace = defaultColorSpace;
+}
+
 // This is the path taken when created programatically.
-- (instancetype)initWithFrame:(NSRect)frameRect {
-  self = [super initWithFrame:frameRect];
-  if (self) {
-    [self load];
-  }
-  return self;
+- (instancetype)initWithFrame:(NSRect)frameRect colorSpace:(NSColorSpace *)colorSpace {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        _colorSpace = colorSpace;
+        [self load];
+    }
+    return self;
+}
+
+// This is called before applicationWillFinishLaunching  so the color space is wrong :(
+- (instancetype)initWithCoder:(NSCoder *)coder {
+    self = [super initWithCoder:coder];
+    if (self) {
+        _colorSpace = [CPKColorWell defaultColorSpace] ?: [NSColorSpace sRGBColorSpace];
+    }
+    return self;
 }
 
 // This is the path taken when loaded from a nib.
@@ -366,6 +394,7 @@
     [self setCell:[[NSActionCell alloc] init]];
     _continuous = YES;
     _view = [[CPKColorWellView alloc] initWithFrame:self.bounds];
+    _view.colorSpace = self.colorSpace;
     _view.delegate = self;
     [self addSubview:_view];
     _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -386,28 +415,33 @@
     };
 }
 
+- (void)setColorSpace:(NSColorSpace *)colorSpace {
+    _colorSpace = colorSpace;
+    self.view.colorSpace = colorSpace;
+}
+
 - (NSColor *)color {
-  return _view.selectedColor;
+  return self.view.selectedColor;
 }
 
 - (void)setColor:(NSColor *)color {
-    _view.color = color;
-    _view.selectedColor = color;
+    self.view.color = color;
+    self.view.selectedColor = color;
 }
 
 - (void)setAlphaAllowed:(BOOL)alphaAllowed {
     _alphaAllowed = alphaAllowed;
-    _view.alphaAllowed = alphaAllowed;
+    self.view.alphaAllowed = alphaAllowed;
 }
 
 - (void)setNoColorAllowed:(BOOL)noColorAllowed {
     _noColorAllowed = noColorAllowed;
-    _view.noColorAllowed = noColorAllowed;
+    self.view.noColorAllowed = noColorAllowed;
 }
 
 - (void)setEnabled:(BOOL)enabled {
   [super setEnabled:enabled];
-  _view.disabled = !enabled;
+    self.view.disabled = !enabled;
 }
 
 - (void)setContinuous:(BOOL)continuous {
@@ -429,6 +463,11 @@
 - (void)colorChangedByDrag:(NSColor *)color {
     [self setColor:color];
     [self sendAction:self.action to:self.target];
+}
+
+- (CPKColorWellView *)view {
+    [self load];
+    return _view;
 }
 
 @end

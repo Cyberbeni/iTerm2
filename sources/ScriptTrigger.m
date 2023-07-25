@@ -10,7 +10,6 @@
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermBackgroundCommandRunner.h"
 #import "iTermCommandRunnerPool.h"
-#import "PTYSession.h"
 #import "RegexKitLite.h"
 #import "NSStringITerm.h"
 #include <sys/types.h>
@@ -42,35 +41,31 @@
 }
 
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *command) {
-        if (!command) {
-            return;
-        }
-        [self runCommand:command session:aSession];
+    // Need to stop the world to get scope, provided it is needed. Running a command is so slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull command) {
+        [scheduler scheduleTriggerCallback:^{
+            [self runCommand:command session:aSession];
+        }];
     }];
     return YES;
 }
 
-- (void)runCommand:(NSString *)command session:(PTYSession *)session {
+- (void)runCommand:(NSString *)command session:(id<iTermTriggerSession>)session {
     DLog(@"Invoking command %@", command);
-    iTermBackgroundCommandRunner *runner = [[ScriptTrigger commandRunnerPool] requestBackgroundCommandRunnerWithTerminationBlock:nil];
-    runner.command = command;
-    runner.shell = session.userShell;
-    runner.title = @"Run Command Trigger";
-    runner.notificationTitle = @"Run Command Trigger Failed";
-    [runner run];
+
+    [session triggerSession:self runCommand:command withRunnerPool:[ScriptTrigger commandRunnerPool]];
 }
 
 @end

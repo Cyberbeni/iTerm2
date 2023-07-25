@@ -55,6 +55,7 @@
 const int kNumberOfColors = 8;
 const int kColorAreaOffsetX_PreBigSur = 20;
 const int kColorAreaOffsetX_BigSur = 24;
+const int kColorAreaOffsetX_BigSur_NoneChecked = 10;
 const int kColorAreaOffsetY = 10;
 const int kColorAreaDistanceX = 18;
 const int kColorAreaDimension = 12;
@@ -65,6 +66,7 @@ const int kDefaultColorStokeWidth = 2;
 const int kMenuFontSize = 14;
 const int kMenuLabelOffsetX_PreBigSur = 20;
 const int kMenuLabelOffsetX_BigSur = 24;
+const int kMenuLabelOffsetX_BigSur_NoneChecked = 10;
 const int kMenuLabelOffsetY = 32;
 
 const CGFloat iTermColorsMenuItemViewDisabledAlpha = 0.3;
@@ -137,7 +139,10 @@ const CGFloat iTermColorsMenuItemViewDisabledAlpha = 0.3;
 
 - (CGFloat)colorXOffset {
     if (@available(macOS 10.16, *)) {
-        return kColorAreaOffsetX_BigSur;
+        if ([self anySiblingIsChecked]) {
+            return kColorAreaOffsetX_BigSur;
+        }
+        return kColorAreaOffsetX_BigSur_NoneChecked;
     }
     return kColorAreaOffsetX_PreBigSur;
 }
@@ -218,7 +223,8 @@ const CGFloat iTermColorsMenuItemViewDisabledAlpha = 0.3;
         if (_mouseDown && _selectedIndex != NSNotFound) {
             showCheck = highlighted;
         } else {
-            showCheck = [self.currentColor isEqual:[self colorAtIndex:i enabled:YES]];
+            // Use an approximate check so it can round-trip through tmux.
+            showCheck = [self.currentColor isApproximatelyEqualToColor:[self colorAtIndex:i enabled:YES] epsilon:1/65535.0];
             if (_mouseDown) {
                 showCheck = NO;
             }
@@ -258,12 +264,22 @@ const CGFloat iTermColorsMenuItemViewDisabledAlpha = 0.3;
     NSString *labelTitle = @"Tab Color:";
     CGFloat x;
     if (@available(macOS 10.16, *)) {
-        x = kMenuLabelOffsetX_BigSur;
+        if ([self anySiblingIsChecked]) {
+            x = kMenuLabelOffsetX_BigSur;
+        } else {
+            x = kMenuLabelOffsetX_BigSur_NoneChecked;
+        }
     } else {
         x = kMenuLabelOffsetX_PreBigSur;
     }
     [labelTitle drawAtPoint:NSMakePoint(x, kMenuLabelOffsetY) withAttributes:attributes];
     [NSBezierPath setDefaultLineWidth:savedWidth];
+}
+
+- (BOOL)anySiblingIsChecked {
+    return [self.enclosingMenuItem.parentItem.submenu.itemArray anyWithBlock:^BOOL(NSMenuItem *item) {
+        return item.state != NSControlStateValueOff;
+    }];
 }
 
 - (NSColor *)colorAtIndex:(NSUInteger)index enabled:(BOOL)enabled {
@@ -281,13 +297,13 @@ const CGFloat iTermColorsMenuItemViewDisabledAlpha = 0.3;
     if (result.count == 0) {
         // Fallback for if the string is totally broken.
         return @[
-            [NSColor colorWithSRGBRed:251.0/255.0 green:107.0/255.0 blue:98.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:246.0/255.0 green:172.0/255.0 blue:71.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:240.0/255.0 green:220.0/255.0 blue:79.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:181.0/255.0 green:215.0/255.0 blue:73.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:95.0/255.0 green:163.0/255.0 blue:248.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:193.0/255.0 green:142.0/255.0 blue:217.0/255.0 alpha:1],
-            [NSColor colorWithSRGBRed:120.0/255.0 green:120.0/255.0 blue:120.0/255.0 alpha:1],
+            [[NSColor colorWithSRGBRed:251.0/255.0 green:107.0/255.0 blue:98.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:246.0/255.0 green:172.0/255.0 blue:71.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:240.0/255.0 green:220.0/255.0 blue:79.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:181.0/255.0 green:215.0/255.0 blue:73.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:95.0/255.0 green:163.0/255.0 blue:248.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:193.0/255.0 green:142.0/255.0 blue:217.0/255.0 alpha:1] it_colorInDefaultColorSpace],
+            [[NSColor colorWithSRGBRed:120.0/255.0 green:120.0/255.0 blue:120.0/255.0 alpha:1] it_colorInDefaultColorSpace],
         ];
     }
     return result;

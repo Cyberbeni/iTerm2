@@ -22,7 +22,7 @@ const CGFloat iTermStatusBarViewControllerIconWidth = 17;
 
 NS_ASSUME_NONNULL_BEGIN
 
-const CGFloat iTermGetStatusBarHeight() {
+const CGFloat iTermGetStatusBarHeight(void) {
     static CGFloat height;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -47,9 +47,7 @@ const CGFloat iTermGetStatusBarHeight() {
     self = [super initWithFrame:NSMakeRect(0, 0, preferredWidth, iTermGetStatusBarHeight())];
     if (self) {
         self.wantsLayer = YES;
-        if (@available(macOS 10.14, *)) {
-            self.layer.masksToBounds = NO;
-        }
+        self.layer.masksToBounds = NO;
         _component = component;
         _backgroundColor = [component.configuration[iTermStatusBarComponentConfigurationKeyKnobValues][iTermStatusBarSharedBackgroundColorKey] colorValue];
         _view = component.statusBarComponentView;
@@ -72,6 +70,24 @@ const CGFloat iTermGetStatusBarHeight() {
         [self updateIconIfNeeded];
         _unreadCountView = [[iTermUnreadCountView alloc] init];
         [self addSubview:_unreadCountView];
+
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidBecomeMain:)
+                                                     name:NSWindowDidBecomeMainNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidResignMain:)
+                                                     name:NSWindowDidResignMainNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationDidBecomeActive:)
+                                                     name:NSApplicationDidBecomeActiveNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationDidResignActive:)
+                                                     name:NSApplicationDidResignActiveNotification
+                                                   object:nil];
+
     }
     return self;
 }
@@ -102,6 +118,16 @@ const CGFloat iTermGetStatusBarHeight() {
         frame.origin.y = (area.size.height - frame.size.height) / 2.0;
         _iconImageView.frame = frame;
     }
+}
+
+- (void)updateColors {
+    NSColor *tintColor = [self.component statusBarTextColor] ?: [self.component.delegate statusBarComponentDefaultTextColor];
+    [_iconImageView it_setTintColor:tintColor];
+    [_component statusBarDefaultTextColorDidChange];
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+    [self updateColors];
 }
 
 - (void)setUnreadCount:(NSInteger)count {
@@ -190,9 +216,6 @@ const CGFloat iTermGetStatusBarHeight() {
                              [self retinaRoundUp:self.preferredWidthForComponentView],
                              [self retinaRoundUp:viewHeight]);
     CGFloat margin = -2;
-    if (@available(macOS 10.14, *)) { } else {
-        margin = 0;
-    }
     _unreadCountView.frame = NSMakeRect(NSMaxX(self.bounds) - NSWidth(_unreadCountView.frame) - margin,
                                         [self retinaRound:NSMidY(self.bounds) - NSHeight(_unreadCountView.frame) / 2.0],
                                         NSWidth(_unreadCountView.frame),
@@ -200,15 +223,12 @@ const CGFloat iTermGetStatusBarHeight() {
 }
 
 - (BOOL)wantsDefaultClipping {
-    if (@available(macOS 10.14, *)) {
-        return NO;
-    } else {
-        return [super wantsDefaultClipping];
-    }
+    return NO;
 }
 
 - (void)viewDidMoveToWindow {
     [_component statusBarComponentDidMoveToWindow];
+    [self updateColors];
 }
 
 - (nullable NSView *)hitTest:(NSPoint)point {
@@ -332,6 +352,30 @@ const CGFloat iTermGetStatusBarHeight() {
     NSNumber *number = [NSNumber castFrom:knobValues[key]];
     knobValues[key] = @(!number.boolValue);
     [self.component statusBarComponentSetKnobValues:knobValues];
+}
+
+#pragma mark - Notifications
+
+- (void)windowDidBecomeMain:(NSNotification *)notification {
+    if (notification.object != self.window) {
+        return;
+    }
+    [self updateColors];
+}
+
+- (void)windowDidResignMain:(NSNotification *)notification {
+    if (notification.object != self.window) {
+        return;
+    }
+    [self updateColors];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    [self updateColors];
+}
+
+- (void)applicationDidResignActive:(NSNotification *)notification {
+    [self updateColors];
 }
 
 @end

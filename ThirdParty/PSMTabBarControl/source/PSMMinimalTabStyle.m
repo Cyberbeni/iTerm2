@@ -87,7 +87,9 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
     return pow(baseValue, 1 / legibility);
 }
 
-- (NSColor *)textColorDefaultSelected:(BOOL)selected backgroundColor:(NSColor *)backgroundColor windowIsMainAndAppIsActive:(BOOL)mainAndActive {
+- (NSColor *)textColorDefaultSelected:(BOOL)selected
+                      backgroundColor:(NSColor *)backgroundColor
+           windowIsMainAndAppIsActive:(BOOL)mainAndActive {
     const CGFloat backgroundBrightness =
     (backgroundColor ?
      backgroundColor.it_hspBrightness :
@@ -111,6 +113,13 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
         // Push value toward an extreme (black or white) as transparency increases.
         const CGFloat transparencyAlpha = [[self.tabBar.delegate tabView:self.tabBar
                                                            valueOfOption:PSMTabBarControlOptionMinimalBackgroundAlphaValue] doubleValue];
+        if (transparencyAlpha == 1 && backgroundColor == nil) {
+            NSColor *color = [self.tabBar.delegate tabView:self.tabBar valueOfOption:PSMTabBarControlOptionTextColor];
+            if (selected) {
+                return color;
+            }
+            return [color colorWithAlphaComponent:0.5];
+        }
         value = PSMWeightedAverage(value, extremity, pow(1 - transparencyAlpha, 0.5));
 
         CGFloat minAlpha;  // For opaque windows
@@ -166,16 +175,15 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
     return weight + (1 - weight) * base;
 }
 
-// Only for non-selected tabs.
 - (CGFloat)backgroundAlphaValue:(BOOL)selected {
     const CGFloat base = [[self.tabBar.delegate tabView:self.tabBar valueOfOption:PSMTabBarControlOptionMinimalBackgroundAlphaValue] doubleValue];
-    if (!selected) {
+    if (selected) {
         return base;
     }
     if (base == 1) {
         return base;
     }
-    return [self alphaValue:base opacifiedBy:0.3];
+    return base * 0.9;
 }
 
 - (NSColor *)nonSelectedTabColor {
@@ -379,7 +387,10 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
         return;
     }
 
-    [super drawBackgroundInRect:rect color:[self nonSelectedTabColor] horizontal:horizontal];
+    PSMTabBarCell *selectedCell = [self selectedCellInTabBarControl:self.tabBar];
+    const CGFloat highlightAmount = [selectedCell highlightAmount];
+    [[self backgroundColorSelected:YES highlightAmount:highlightAmount] set];
+    NSRectFillUsingOperation(rect, NSCompositingOperationSourceOver);
 
     [self drawStartInset];
     [self drawEndInset];
@@ -540,6 +551,7 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
         horizontal:(BOOL)horizontal
       withOverflow:(BOOL)withOverflow {
     [super drawTabBar:bar inRect:rect clipRect:clipRect horizontal:horizontal withOverflow:withOverflow];
+
     const BOOL horizontalOrientation = bar.orientation == PSMTabBarHorizontalOrientation;
 
     const NSInteger selectedIndex = [self selectedIndex:bar];
@@ -576,8 +588,20 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
     }
 }
 
-- (BOOL)supportsMultiLineLabels {
-    return YES;
+- (void)drawDividerBetweenTabBarAndContent:(NSRect)rect bar:(PSMTabBarControl *)bar {
+}
+
+- (BOOL)shouldDrawTopLineSelected:(BOOL)selected
+                         attached:(BOOL)attached
+                         position:(PSMTabPosition)position NS_AVAILABLE_MAC(10_16) {
+    switch (position) {
+        case PSMTab_BottomTab:
+            return NO;
+
+        case PSMTab_LeftTab:
+        case PSMTab_TopTab:
+            return [super shouldDrawTopLineSelected:selected attached:attached position:position];
+    }
 }
 
 - (BOOL)willDrawSubtitle:(PSMCachedTitle *)subtitle {
@@ -736,7 +760,7 @@ static CGFloat PSMWeightedAverage(CGFloat l, CGFloat u, CGFloat w) {
     if (!self.treatLeftInsetAsPartOfFirstTab) {
         [self drawOutlineAboveSelectedTabInVerticalTabBar:bar];
     }
-    [self drawOutlineAroundVerticalTabBarWithFirstTabSelected:bar];
+    [self drawOutlineUnderSelectedTabInVerticalTabBar:bar];
 }
 
 - (void)drawOutlineAroundVerticalTabBarWithFirstTabSelected:(PSMTabBarControl *)bar {

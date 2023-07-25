@@ -41,6 +41,38 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)handleAutoEnteringEvent:(NSEvent *)event;
 - (BOOL)wouldHandleEvent:(NSEvent *)event;
 - (BOOL)shouldAutoEnterWithEvent:(NSEvent *)event;
+- (void)setEnabledWithoutCleverness:(BOOL)copyMode;
+
+@end
+
+@protocol iTermShortcutNavigationModeHandlerDelegate<NSObject>
+- (void (^)(void))shortcutNavigationActionForKeyEquivalent:(NSString *)characters;
+- (void)shortcutNavigationDidComplete;
+- (void)shortcutNavigationDidBegin;
+@end
+
+@interface iTermShortcutNavigationModeHandler: NSObject
+@property (nonatomic, weak) id<iTermShortcutNavigationModeHandlerDelegate> delegate;
+@end
+
+typedef NS_ENUM(NSUInteger, iTermSessionMode) {
+    iTermSessionModeDefault,
+    iTermSessionModeCopy,
+    iTermSessionModeShortcutNavigation
+};
+
+@interface iTermSessionModeHandler: NSObject
+@property (nonatomic, weak) id<iTermCopyModeHandlerDelegate, iTermShortcutNavigationModeHandlerDelegate> delegate;
+@property (nonatomic) iTermSessionMode mode;
+- (iTermCopyModeHandler *)copyModeHandler NOT_COPY_FAMILY;
+@property (nonatomic, readonly) iTermShortcutNavigationModeHandler *shortcutNavigationModeHandler;
+
+- (BOOL)wouldHandleEvent:(NSEvent *)event;
+- (void)enterCopyModeWithoutCleverness;
+- (BOOL)handleEvent:(NSEvent *)event;
+- (BOOL)shouldAutoEnterWithEvent:(NSEvent *)event;
+- (BOOL)previousMark;
+- (BOOL)nextMark;
 
 @end
 

@@ -38,16 +38,18 @@ extern NSString *const PTYSessionCreatedNotification;
 extern NSString *const PTYSessionTerminatedNotification;
 extern NSString *const PTYSessionRevivedNotification;
 extern NSString *const iTermSessionWillTerminateNotification;
+extern NSString *const PTYSessionDidResizeNotification;
 
 @class CapturedOutput;
+@protocol ExternalSearchResultsController;
 @class FakeWindow;
 @class iTermAction;
 @class iTermAnnouncementViewController;
 @protocol iTermContentSubscriber;
 @class iTermEchoProbe;
-@class iTermExpect;
 @class iTermImageWrapper;
 @class iTermKeyBindingAction;
+@class iTermSSHReconnectionInfo;
 @class iTermScriptHistoryEntry;
 @class iTermStatusBarViewController;
 @class iTermSwiftyStringGraph;
@@ -59,8 +61,10 @@ extern NSString *const iTermSessionWillTerminateNotification;
 @class PTYTextView;
 @class PasteContext;
 @class PreferencePanel;
+@protocol ProcessInfoProvider;
 @class PTYSession;
-@class VT100RemoteHost;
+@class SSHIdentity;
+@protocol VT100RemoteHostReading;
 @class VT100Screen;
 @class VT100Terminal;
 @class iTermColorMap;
@@ -177,10 +181,9 @@ typedef enum {
 - (void)unmaximize;
 
 // Tmux window number (a tmux window is like a tab).
-- (void)setTmuxFont:(NSFont *)font
-       nonAsciiFont:(NSFont *)nonAsciiFont
-           hSpacing:(double)horizontalSpacing
-           vSpacing:(double)verticalSpacing;
+- (void)setTmuxFontTable:(iTermFontTable *)fontTable
+                hSpacing:(double)horizontalSpacing
+                vSpacing:(double)verticalSpacing;
 
 // The tmux window title changed.
 - (void)sessionDidChangeTmuxWindowNameTo:(NSString *)newName;
@@ -197,7 +200,10 @@ typedef enum {
 - (BOOL)session:(PTYSession *)session shouldAllowDrag:(id<NSDraggingInfo>)sender;
 - (BOOL)session:(PTYSession *)session performDragOperation:(id<NSDraggingInfo>)sender;
 
-// Indicates if the splits are currently being dragged. Affects how resizing works for tmux tabs.
+// Indicates if the splits in a tmux tab are currently being dragged. Affects how resizing works for tmux tabs.
+- (BOOL)sessionBelongsToTmuxTabWhoseSplitsAreBeingDragged;
+
+// As above but for all tabs, not just tmux.
 - (BOOL)sessionBelongsToTabWhoseSplitsAreBeingDragged;
 
 // User double clicked on title bar
@@ -214,6 +220,7 @@ typedef enum {
 - (void)sessionCurrentDirectoryDidChange:(PTYSession *)session;
 - (void)sessionCurrentHostDidChange:(PTYSession *)session;
 - (void)sessionProxyIconDidChange:(PTYSession *)session;
+- (void)sessionDidRestart:(PTYSession *)session;
 
 // Remove a session from the tab, even if it's the only one.
 - (void)sessionRemoveSession:(PTYSession *)session;
@@ -274,7 +281,10 @@ backgroundColor:(NSColor *)backgroundColor;
 
 - (void)session:(PTYSession *)session setFilter:(NSString *)filter;
 - (PTYSession *)sessionSyntheticSessionFor:(PTYSession *)live;
-
+- (void)sessionClose:(PTYSession *)session;
+- (void)sessionProcessInfoProviderDidChange:(PTYSession *)session;
+- (void)sessionSwapWithSessionInDirection:(int)direction;
+- (BOOL)sessionBelongsToHotkeyWindow:(PTYSession *)session;
 @end
 
 @class SessionView;
@@ -300,6 +310,8 @@ backgroundColor:(NSColor *)backgroundColor;
 @property(nonatomic, assign) BOOL active;
 
 @property(nonatomic, assign) BOOL alertOnNextMark;
+// This comes from prefs and is kept up to date.
+@property(nonatomic, readonly) BOOL alertOnMarksinOffscreenSessions;
 @property(nonatomic, copy) NSColor *tabColor;
 
 @property(nonatomic, readonly) DVR *dvr;
@@ -348,8 +360,6 @@ backgroundColor:(NSColor *)backgroundColor;
 // Shell wraps the underlying file descriptor pair.
 @property(nonatomic, retain) PTYTask *shell;
 
-@property(nonatomic, readonly) VT100Terminal *terminal;
-
 // The value of the $TERM environment var.
 @property(nonatomic, copy) NSString *termVariable;
 
@@ -366,7 +376,7 @@ backgroundColor:(NSColor *)backgroundColor;
 // This is the one and only subview of the document view of -scrollview.
 @property(nonatomic, retain) PTYTextView *textview;
 
-@property(nonatomic, assign) NSStringEncoding encoding;
+@property(nonatomic, readonly) NSStringEncoding encoding;
 
 // Send a character periodically.
 @property(nonatomic, assign) BOOL antiIdle;
@@ -408,7 +418,6 @@ backgroundColor:(NSColor *)backgroundColor;
 @property(nonatomic, copy) NSString *backgroundImagePath;  // Used by scripting
 @property(nonatomic, retain) iTermImageWrapper *backgroundImage;
 
-@property(nonatomic, retain) iTermColorMap *colorMap;
 @property(nonatomic, assign) float transparency;
 @property(nonatomic, assign) BOOL useBoldFont;
 @property(nonatomic, assign) iTermThinStrokesSetting thinStrokes;
@@ -458,7 +467,7 @@ backgroundColor:(NSColor *)backgroundColor;
 // Call this on tmux clients to get the session with the tmux gateway.
 @property(nonatomic, readonly) PTYSession *tmuxGatewaySession;
 
-@property(nonatomic, readonly) VT100RemoteHost *currentHost;
+@property(nonatomic, readonly) id<VT100RemoteHostReading> currentHost;
 
 @property(nonatomic, readonly) int tmuxPane;
 
@@ -484,12 +493,11 @@ backgroundColor:(NSColor *)backgroundColor;
 // Requires shell integration.
 @property(nonatomic, readonly) NSMutableArray<NSString *> *commands;  // of NSString
 @property(nonatomic, readonly) NSMutableArray<NSString *> *directories;  // of NSString
-@property(nonatomic, readonly) NSMutableArray<VT100RemoteHost *> *hosts;  // of VT100RemoteHost
+@property(nonatomic, readonly) NSMutableArray<id<VT100RemoteHostReading>> *hosts;  // of VT100RemoteHost
 
 @property (nonatomic, readonly) iTermVariables *variables;
 @property (nonatomic, readonly) iTermVariableScope<iTermSessionScope> *variablesScope;
 @property (nonatomic, readonly) iTermVariableScope *genericScope;  // Just like `variablesScope` but usable from Swift.
-@property (nonatomic, readonly) BOOL triggerParametersUseInterpolatedStrings;
 
 @property(atomic, readonly) PTYSessionTmuxMode tmuxMode;
 
@@ -507,14 +515,11 @@ backgroundColor:(NSColor *)backgroundColor;
 // shell integration is on). If that can't be done then the current local working directory with
 // symlinks resolved is returned.
 @property(nonatomic, readonly) NSString *currentLocalWorkingDirectory;
-// A more resilient version of the above. If the current directory cannot be determined it uses the initial directory. This allows the creation of session in succession with proper pwd recycling behavior.
-@property(nonatomic, readonly) NSString *currentLocalWorkingDirectoryOrInitialDirectory;
 
 // Async version of currentLocalWorkingDirectory.
 - (void)asyncCurrentLocalWorkingDirectory:(void (^)(NSString *pwd))completion;
 
-// Async version of currentLocalWorkingDirectoryOrInitialDirectory
-- (void)asyncCurrentLocalWorkingDirectoryOrInitialDirectory:(void (^)(NSString *pwd))completion;
+- (void)asyncInitialDirectoryForNewSessionBasedOnCurrentDirectory:(void (^)(NSString *pwd))completion;
 
 // Gets the local directory as URL. Weirdly, combines the remote hostname and the local path because this is really only used for the proxy icon.
 - (void)asyncGetCurrentLocationWithCompletion:(void (^)(NSURL *url))completion;
@@ -562,7 +567,6 @@ backgroundColor:(NSColor *)backgroundColor;
 @property(nonatomic, retain) NSNumber *cursorTypeOverride;
 @property(nonatomic, readonly) NSDictionary *environment;
 @property(nonatomic, readonly) BOOL hasNontrivialJob;
-@property(nonatomic, readonly) iTermExpect *expect;
 @property(nonatomic, readonly) BOOL tmuxPaused;
 @property(nonatomic, readonly) NSString *userShell;  // Something like "/bin/bash".
 @property(nonatomic, copy) NSString *filter;
@@ -573,6 +577,10 @@ backgroundColor:(NSColor *)backgroundColor;
 
 // Excludes SESSION_ARRANGEMENT_CONTENTS. Nil if session not created from arrangement.
 @property(nonatomic, copy) NSDictionary *foundingArrangement;
+@property(nonatomic, readonly) id<ExternalSearchResultsController> externalSearchResultsController;
+@property(nonatomic, readonly) SSHIdentity *sshIdentity;
+@property(nonatomic, readonly) NSArray<iTermSSHReconnectionInfo *> *sshCommandLineSequence;
+@property(nonatomic, readonly) id<ProcessInfoProvider> processInfoProvider;
 
 #pragma mark - methods
 
@@ -607,6 +615,7 @@ backgroundColor:(NSColor *)backgroundColor;
 
 // Begin showing DVR frames from some live session.
 - (void)setDvr:(DVR*)dvr liveSession:(PTYSession*)liveSession;
+- (void)clearInstantReplay;
 
 - (void)willRetireSyntheticSession:(PTYSession *)syntheticSession;
 
@@ -622,10 +631,8 @@ backgroundColor:(NSColor *)backgroundColor;
 
 // triggers
 - (void)setAllTriggersEnabled:(BOOL)enabled;
-- (void)clearTriggerLine;
 - (BOOL)anyTriggerCanBeEnabled;
 - (BOOL)anyTriggerCanBeDisabled;
-- (void)appendStringToTriggerLine:(NSString *)s;
 // (regex, enabled)
 - (NSArray<iTermTuple<NSString *, NSNumber *> *> *)triggerTuples;
 - (void)toggleTriggerEnabledAtIndex:(NSInteger)index;
@@ -652,11 +659,13 @@ backgroundColor:(NSColor *)backgroundColor;
 - (void)resizeFromArrangement:(NSDictionary *)arrangement;
 
 - (void)startProgram:(NSString *)program
+                 ssh:(BOOL)ssh
          environment:(NSDictionary *)prog_env
          customShell:(NSString *)customShell
               isUTF8:(BOOL)isUTF8
        substitutions:(NSDictionary *)substitutions
          arrangement:(NSString *)arrangement
+     fromArrangement:(BOOL)fromArrangement
           completion:(void (^)(BOOL))completion;
 
 // This is an alternative to runCommandWithOldCwd and startProgram. It attaches
@@ -664,6 +673,9 @@ backgroundColor:(NSColor *)backgroundColor;
 // is YES.
 - (void)attachToServer:(iTermGeneralServerConnection)serverConnection
             completion:(void (^)(void))completion;
+
+// Acts like the user pressing cmd-W but without confirmation.
+- (void)close;
 
 - (void)softTerminate;
 - (void)terminate;
@@ -674,7 +686,6 @@ backgroundColor:(NSColor *)backgroundColor;
 
 // Preferences
 - (void)setPreferencesFromAddressBookEntry: (NSDictionary *)aePrefs;
-- (void)loadInitialColorTable;
 - (void)loadInitialColorTableAndResetCursorGuide;
 
 // Call this after the profile changed. If not divorced, the profile and
@@ -697,9 +708,10 @@ backgroundColor:(NSColor *)backgroundColor;
 // NO for `forceEncoding` and the terminal's encoding will be used instead of `optionalEncoding`.
 - (void)writeTaskNoBroadcast:(NSString *)string
                     encoding:(NSStringEncoding)optionalEncoding
-               forceEncoding:(BOOL)forceEncoding;
+               forceEncoding:(BOOL)forceEncoding
+                   reporting:(BOOL)reporting;
 
-- (void)writeLatin1EncodedData:(NSData *)data broadcastAllowed:(BOOL)broadcast;
+- (void)writeLatin1EncodedData:(NSData *)data broadcastAllowed:(BOOL)broadcast reporting:(BOOL)reporting;
 
 - (void)updateViewBackgroundImage;
 - (void)invalidateBlend;
@@ -722,12 +734,12 @@ backgroundColor:(NSColor *)backgroundColor;
 - (void)deleteForward:(id)sender;
 - (void)setSplitSelectionMode:(SplitSelectionMode)mode move:(BOOL)move;
 - (void)setSmartCursorColor:(BOOL)value;
-- (void)setMinimumContrast:(float)value;
 
 // Returns the frame size for a scrollview that perfectly contains the contents
 // of this session based on rows/cols, and taking into account the presence of
 // a scrollbar.
 - (NSSize)idealScrollViewSizeWithStyle:(NSScrollerStyle)scrollerStyle;
+- (void)lockScroll;
 
 // Update the scrollbar's visibility and style. Returns YES if a change was made.
 // This is the one and only way that scrollbars should be changed after initialization. It ensures
@@ -761,10 +773,9 @@ backgroundColor:(NSColor *)backgroundColor;
 - (NSString*)ansiColorsMatchingForeground:(NSDictionary*)fg andBackground:(NSDictionary*)bg inBookmark:(Profile*)aDict;
 
 - (void)changeFontSizeDirection:(int)dir;
-- (void)setFont:(NSFont*)font
-    nonAsciiFont:(NSFont*)nonAsciiFont
-    horizontalSpacing:(CGFloat)horizontalSpacing
-    verticalSpacing:(CGFloat)verticalSpacing;
+- (void)setFontTable:(iTermFontTable *)fontTable
+   horizontalSpacing:(CGFloat)horizontalSpacing
+     verticalSpacing:(CGFloat)verticalSpacing;
 
 // Assigns a new GUID to the session so that changes to the bookmark will not
 // affect it. Returns the GUID of a divorced bookmark. Does nothing if already
@@ -784,9 +795,6 @@ backgroundColor:(NSColor *)backgroundColor;
 
 // Jump to the saved scroll position
 - (void)jumpToSavedScrollPosition;
-
-// Prepare to use the given string for the next search.
-- (void)useStringForFind:(NSString*)string;
 
 // Search for the selected text.
 - (void)findWithSelection;
@@ -826,13 +834,14 @@ backgroundColor:(NSColor *)backgroundColor;
 - (void)toggleTmuxPausePane;
 
 - (void)addNoteAtCursor;
-- (void)addNoteWithText:(NSString *)text inAbsoluteRange:(VT100GridAbsCoordRange)range;
 - (void)previousMark;
 - (void)nextMark;
 - (void)previousAnnotation;
 - (void)nextAnnotation;
 - (void)scrollToMark:(id<iTermMark>)mark;
-- (id<iTermMark>)markAddedAtCursorOfClass:(Class)theClass;
+- (void)scrollToMarkWithGUID:(NSString *)guid;
+- (void)saveScrollPositionWithName:(NSString *)name;
+- (void)renameMark:(id<VT100ScreenMarkReading>)mark to:(NSString *)newName;
 
 // Select this session and tab and bring window to foreground.
 - (void)reveal;
@@ -846,8 +855,6 @@ backgroundColor:(NSColor *)backgroundColor;
 
 - (void)enterPassword:(NSString *)password;
 
-- (void)addCapturedOutput:(CapturedOutput *)capturedOutput;
-
 - (void)queueAnnouncement:(iTermAnnouncementViewController *)announcement
                identifier:(NSString *)identifier;
 
@@ -855,6 +862,12 @@ backgroundColor:(NSColor *)backgroundColor;
 
 - (BOOL)encodeArrangementWithContents:(BOOL)includeContents
                               encoder:(id<iTermEncoderAdapter>)encoder;
+
+- (BOOL)encodeArrangementWithContents:(BOOL)includeContents
+                              encoder:(id<iTermEncoderAdapter>)encoder
+                   replacementProfile:(Profile *)replacementProfile
+                          saveProgram:(BOOL)saveProgram
+                         pendingJumps:(NSArray<iTermSSHReconnectionInfo *> *)pendingJumps;
 
 - (void)toggleTmuxZoom;
 - (void)forceTmuxDetach;
@@ -895,9 +908,6 @@ backgroundColor:(NSColor *)backgroundColor;
 
 - (void)setColorsFromPresetNamed:(NSString *)presetName;
 
-- (void)triggerDidDetectStartOfPromptAt:(VT100GridAbsCoord)coord;
-- (void)triggerDidDetectEndOfPromptAt:(VT100GridAbsCoord)coord;
-
 // Burys a session
 - (void)bury;
 
@@ -911,27 +921,30 @@ backgroundColor:(NSColor *)backgroundColor;
 
 - (BOOL)willEnableMetal;
 - (BOOL)metalAllowed:(out iTermMetalUnavailableReason *)reason;
-- (void)executeTokens:(const CVector *)vector bytesHandled:(int)length;
 - (void)injectData:(NSData *)data;
 
 // Call this when a session moves to a different tab or window to update the session ID.
 - (void)didMoveSession;
-- (void)triggerDidChangeNameTo:(NSString *)newName;
 - (void)didInitializeSessionWithName:(NSString *)name;
 - (void)profileNameDidChangeTo:(NSString *)name;
 - (void)profileDidChangeToProfileWithName:(NSString *)name;
 - (void)updateStatusBarStyle;
 - (BOOL)checkForCyclesInSwiftyStrings;
 - (void)applyAction:(iTermAction *)action;
-- (void)didUpdateCurrentDirectory;
-- (void)didUpdatePromptLocation;
-- (BOOL)copyModeConsumesEvent:(NSEvent *)event;
+- (BOOL)sessionModeConsumesEvent:(NSEvent *)event;
 - (Profile *)profileForSplit;
 - (void)compose;
+- (void)openComposerWithString:(NSString *)text escaping:(iTermSendTextEscaping)escaping;
 - (BOOL)closeComposer;
 - (void)didChangeScreen:(CGFloat)scaleFactor;
 - (void)addContentSubscriber:(id<iTermContentSubscriber>)contentSubscriber;
 - (void)didFinishRestoration;
+- (void)performActionForCapturedOutput:(CapturedOutput *)capturedOutput;
+- (void)userInitiatedReset;
+- (void)resetForRelaunch;
+- (void)resetMode;
+- (void)enclosingTabWillBeDeselected;
+- (void)enclosingTabDidBecomeSelected;
 
 #pragma mark - API
 
@@ -954,10 +967,6 @@ backgroundColor:(NSColor *)backgroundColor;
                      scope:(iTermVariableScope *)scope
                     origin:(NSString *)origin;
 - (void)setParentScope:(iTermVariableScope *)parentScope;
-
-#pragma mark - Testing utilities
-
-- (void)synchronousReadTask:(NSString *)string;
 
 @end
 

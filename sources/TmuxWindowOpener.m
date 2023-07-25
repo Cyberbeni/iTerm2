@@ -31,7 +31,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     TmuxGateway *gateway_;
     NSMutableDictionary *parseTree_;
     int pendingRequests_;
-    TmuxController *controller_;  // weak
+    __weak TmuxController *controller_;
     NSMutableDictionary *histories_;
     NSMutableDictionary *altHistories_;
     NSMutableDictionary *states_;
@@ -54,7 +54,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
 @synthesize ambiguousIsDoubleWidth = ambiguousIsDoubleWidth_;
 
 + (TmuxWindowOpener *)windowOpener {
-    return [[[TmuxWindowOpener alloc] init] autorelease];
+    return [[TmuxWindowOpener alloc] init];
 }
 
 - (instancetype)init {
@@ -65,27 +65,6 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
         states_ = [[NSMutableDictionary alloc] init];
     }
     return self;
-}
-
-- (void)dealloc {
-    [name_ release];
-    [layout_ release];
-    [gateway_ release];
-    [parseTree_ release];
-    [target_ release];
-    [histories_ release];
-    [altHistories_ release];
-    [states_ release];
-    [tabToUpdate_ release];
-    [_windowOptions release];
-    [_zoomed release];
-    [_tabColors release];
-    [_profile release];
-    [_completion release];
-    [_unpausingWindowPanes release];
-    [_newWindowBlock release];
-    
-    [super dealloc];
 }
 
 - (BOOL)openWindows:(BOOL)initial {
@@ -152,6 +131,12 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
         [gateway_ abortWithErrorMessage:[NSString stringWithFormat:@"Error parsing layout %@", self.layout]];
         return NO;
     }
+    if (self.visibleLayout.length > 0) {
+        self.visibleParseTree = [parser parsedLayoutFromString:self.visibleLayout];
+        if (!self.visibleParseTree) {
+            DLog(@"Failed to parse visible layout %@, soldiering on anyway", self.visibleLayout);
+        }
+    }
     NSSet *oldPanes = [NSSet setWithArray:[tab windowPanes]];
     NSMutableArray *cmdList = [NSMutableArray array];
     for (NSNumber *addedPane in [parser windowPanesInParseTree:self.parseTree]) {
@@ -161,12 +146,13 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
         }
     }
     if (cmdList.count) {
-        tabToUpdate_ = [tab retain];
+        tabToUpdate_ = tab;
         [gateway_ sendCommandList:cmdList];
         DLog(@"Sending command list before setting layout: %@", cmdList);
         return NO;
     }
     [tab setTmuxLayout:self.parseTree
+         visibleLayout:self.visibleParseTree
         tmuxController:controller_
                 zoomed:_zoomed];
     return YES;
@@ -238,7 +224,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
 - (NSDictionary *)dictForGetUserVars:(NSNumber *)wp {
     ++pendingRequests_;
     DLog(@"Increment pending requests to %d", pendingRequests_);
-    NSString *command = [NSString stringWithFormat:@"show-options -v -p -t %%%d @uservars",
+    NSString *command = [NSString stringWithFormat:@"show-options -v -q -p -t %%%d @uservars",
                          [wp intValue]];
     return [gateway_ dictionaryForCommand:command
                            responseTarget:self
@@ -289,8 +275,8 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
 
 - (void)finishErroneously {
     if (self.target) {
-        [self.target performSelector:self.selector
-                          withObject:self];
+        [self.target it_performNonObjectReturningSelector:self.selector
+                                               withObject:self];
     }
     if (self.completion) {
         self.completion(windowIndex_);
@@ -308,9 +294,11 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
 
     NSNumber *wp = [info objectAtIndex:0];
     NSNumber *alt = [info objectAtIndex:1];
+    // Lie and say it's the alternate screen because tmux doesn't support variation selector 16 yet.
     NSArray *history = [[TmuxHistoryParser sharedInstance] parseDumpHistoryResponse:response
                                                              ambiguousIsDoubleWidth:ambiguousIsDoubleWidth_
-                                                                     unicodeVersion:self.unicodeVersion];
+                                                                     unicodeVersion:self.unicodeVersion
+                                                                    alternateScreen:YES];
     if (history) {
         if ([alt boolValue]) {
             [altHistories_ setObject:history forKey:wp];
@@ -318,10 +306,12 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
             [histories_ setObject:history forKey:wp];
         }
     } else {
-        NSAlert *alert = [[[NSAlert alloc] init] autorelease];
-        alert.messageText = @"Error: malformed history line from tmux.";
-        alert.informativeText = @"See Console.app for details";
-        [alert runModal];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Error: malformed history line from tmux.";
+            alert.informativeText = @"See Console.app for details";
+            [alert runModal];
+        });
     }
     [self requestDidComplete];
 }
@@ -372,7 +362,7 @@ static int OctalValue(const char *bytes) {
         [pending appendBytes:&c length:1];
     }
 
-    NSMutableDictionary *state = [[[states_ objectForKey:wp] mutableCopy] autorelease];
+    NSMutableDictionary *state = [[states_ objectForKey:wp] mutableCopy];
     [state setObject:pending forKey:kTmuxWindowOpenerStatePendingOutput];
     [states_ setObject:state forKey:wp];
     [self requestDidComplete];
@@ -401,7 +391,8 @@ static int OctalValue(const char *bytes) {
     }
 
     NSDictionary *state = [[TmuxStateParser sharedInstance] parsedStateFromString:response
-                                                                        forPaneId:[wp intValue]];
+                                                                        forPaneId:[wp intValue]
+                                                                 workAroundTabBug:self.shouldWorkAroundTabBug];
     [states_ setObject:state forKey:wp];
     [self requestDidComplete];
 }
@@ -427,8 +418,8 @@ static int OctalValue(const char *bytes) {
         return;
     }
     if (_unpausingWindowPanes) {
-        [self.target performSelector:self.selector
-                          withObject:self];
+        [self.target it_performNonObjectReturningSelector:self.selector
+                                               withObject:self];
         return;
     }
     NSWindowController<iTermWindowController> *term = nil;
@@ -479,6 +470,15 @@ static int OctalValue(const char *bytes) {
         [gateway_ abortWithErrorMessage:[NSString stringWithFormat:@"Error parsing layout %@", self.layout]];
         return;
     }
+    NSMutableDictionary *visibleParseTree = nil;
+    if (self.visibleLayout.length > 0) {
+        visibleParseTree = [[TmuxLayoutParser sharedInstance] parsedLayoutFromString:self.visibleLayout];
+        if (visibleParseTree) {
+            [self decorateParseTree:visibleParseTree];
+        } else {
+            DLog(@"Failed to parse visible layout %@. Soldiering on anyway.", self.visibleLayout);
+        }
+    }
     DLog(@"Parse tree: %@", parseTree);
     [self decorateParseTree:parseTree];
     DLog(@"Decorated parse tree: %@", parseTree);
@@ -487,6 +487,7 @@ static int OctalValue(const char *bytes) {
     if (tabToUpdate_) {
         DLog(@"Updating existing tab");
         [tabToUpdate_ setTmuxLayout:parseTree
+                      visibleLayout:visibleParseTree
                      tmuxController:controller_
                              zoomed:@NO];
         [tabToUpdate_ setPerTabSettings:_perTabSettings[widStr]];
@@ -499,13 +500,14 @@ static int OctalValue(const char *bytes) {
             DLog(@"Calling loadTmuxLayout");
             // Safety valve: don't open an existing tmux window.
             [term loadTmuxLayout:parseTree
+                   visibleLayout:visibleParseTree
                           window:windowIndex_
                   tmuxController:controller_
                             name:name_];
 
             // Check if we know the position for the window
             NSArray *panes = [[TmuxLayoutParser sharedInstance] windowPanesInParseTree:parseTree];
-            windowPos = [[[self.controller positionForWindowWithPanes:panes windowID:windowIndex_] retain] autorelease];
+            windowPos = [self.controller positionForWindowWithPanes:panes windowID:windowIndex_];
 
             // This is to handle the case where we couldn't create a window as
             // large as we were asked to (for instance, if the gateway is full-
@@ -536,8 +538,8 @@ static int OctalValue(const char *bytes) {
         [[self.controller window:windowIndex_] setPerTabSettings:_perTabSettings[widStr]];
     }
     if (self.target) {
-        [self.target performSelector:self.selector
-                          withObject:self];
+        [self.target it_performNonObjectReturningSelector:self.selector
+                                               withObject:self];
     }
     DLog(@"useOriginalWindow=%@ initialTabs=%@ initial=%@ windowPos=%@",
          @(useOriginalWindow), @(initialTabs), @(self.initial), windowPos);
@@ -567,6 +569,9 @@ static int OctalValue(const char *bytes) {
     }
     if (self.tabIndex) {
         parseTree[kLayoutDictTabIndex] = self.tabIndex;
+    }
+    if (self.allInitialWindowsAdded) {
+        parseTree[kLayoutDictAllInitialWindowsAdded] = @YES;
     }
 }
 
@@ -599,7 +604,7 @@ static int OctalValue(const char *bytes) {
     if (self.tabColors[n]) {
         parseTree[kLayoutDictTabColorKey] = self.tabColors[n];
     }
-
+    parseTree[kLayoutDictFocusReportingKey] = @(self.focusReporting);
     return nil;
 }
 

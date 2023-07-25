@@ -9,6 +9,7 @@
 
 #import "DebugLogging.h"
 #import "NSArray+iTerm.h"
+#import "NSDate+iTerm.h"
 #import "NSObject+iTerm.h"
 #import "NSTimer+iTerm.h"
 #import "iTermAdvancedSettingsModel.h"
@@ -68,9 +69,17 @@ NSString *const iTermSwipeHandlerCancelSwipe = @"iTermSwipeHandlerCancelSwipe";
         return NO;
     }
 
+    NSMutableArray<NSString *> *log = [NSMutableArray array];
+    [log addObject:[event description]];
     DLog(@"Got event %@", iTermShortEventPhasesString(event));
+    NSTimeInterval lastEvent = [NSDate it_timeSinceBoot];
     while (1) {
         @autoreleasepool {
+            if ([self isSwipeTrackingDisabled]) {
+                DLog(@"Abort because swipe tracking was diabled");
+                [self abort];
+                break;
+            }
             DLog(@"Continue tracking.");
             if (event) {
                 [self internalHandleEvent:event];
@@ -83,6 +92,17 @@ NSString *const iTermSwipeHandlerCancelSwipe = @"iTermSwipeHandlerCancelSwipe";
                                        untilDate:[NSDate dateWithTimeIntervalSinceNow:1.0 / 60.0]
                                           inMode:NSEventTrackingRunLoopMode
                                          dequeue:YES];
+            NSLog(@"%@", event);
+            if (event) {
+                lastEvent = [NSDate it_timeSinceBoot];
+            } else {
+                if ([NSDate it_timeSinceBoot] - lastEvent > 5) {
+                    [self abort];
+                    SetPinnedDebugLogMessage(@"SwipeTracker", [log componentsJoinedByString:@"\n"]);
+                    break;
+                }
+            }
+            [log addObject:[NSString stringWithFormat:@"%f: %@", [NSDate it_timeSinceBoot], [event description]]];
             DLog(@"Got event %@", event);
         }
     }
@@ -90,10 +110,19 @@ NSString *const iTermSwipeHandlerCancelSwipe = @"iTermSwipeHandlerCancelSwipe";
     return YES;
 }
 
+- (BOOL)isSwipeTrackingDisabled {
+    // Based on the debug log in 10707 at timestamp 1666046431.466278 the osEnabled flag is changing
+    // after the swipe begins. I blame Logitech for getting overly creative.
+    const BOOL osEnabled = [NSEvent isSwipeTrackingFromScrollEventsEnabled];
+    const BOOL appEnabled = [iTermAdvancedSettingsModel allowInteractiveSwipeBetweenTabs];
+    DLog(@"osEnabled=%@ appEnabled=%@", @(osEnabled), @(appEnabled));
+    return (!osEnabled ||
+            !appEnabled);
+}
+
 - (BOOL)internalHandleEvent:(NSEvent *)event {
     DLog(@"internalHandleEvent: %@", iTermShortEventPhasesString(event));
-    if (![NSEvent isSwipeTrackingFromScrollEventsEnabled] ||
-        ![iTermAdvancedSettingsModel allowInteractiveSwipeBetweenTabs]) {
+    if ([self isSwipeTrackingDisabled]) {
         DLog(@"Swipe tracking not enabled");
         return NO;
     }
@@ -120,6 +149,13 @@ NSString *const iTermSwipeHandlerCancelSwipe = @"iTermSwipeHandlerCancelSwipe";
         return [self createStateForEventIfNeeded:event transition:transition];
     }
     return [_liveState handleEvent:event transition:transition];
+}
+
+- (void)abort {
+    if (!_liveState || _liveState.isRetired) {
+        return;
+    }
+    [_liveState retire];
 }
 
 - (BOOL)createStateForEventIfNeeded:(NSEvent *)event

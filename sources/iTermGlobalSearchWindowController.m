@@ -8,6 +8,7 @@
 #import "iTermGlobalSearchWindowController.h"
 
 #import "FindContext.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermController.h"
 #import "iTermFocusReportingTextField.h"
 #import "iTermGlobalSearchEngine.h"
@@ -96,7 +97,7 @@
 - (void)addResults:(NSArray<iTermGlobalSearchResult *> *)results
         forSession:(PTYSession *)session
           progress:(double)progress {
-    if (!session && !results) {
+    if (!session) {
         // Finished searching.
         [self setFraction:1];
         return;
@@ -113,7 +114,7 @@
     BOOL isNew = (sessionResults == nil);
     if (!sessionResults) {
         sessionResults = [NSMutableArray array];
-        _results[session.guid] = sessionResults;
+        _results[(NSString * _Nonnull)session.guid] = sessionResults;
     }
     NSIndexSet *indexes = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(sessionResults.count, results.count)];
     [sessionResults addObjectsFromArray:results];
@@ -155,11 +156,17 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
 
     [result.session reveal];
-    const VT100GridCoordRange coordRange = [result coordRange];
-    [result.session.textview selectCoordRange:coordRange];
-    [result.session.textview scrollToSelection];
-    [result highlightLines];
-    [self movePanelAwayFromResultInRange:coordRange session:result.session];
+    if (result.isExternal) {
+        [result.session.externalSearchResultsController selectExternalSearchResult:result.result.externalResult
+                                                                          multiple:NO
+                                                                            scroll:YES];
+    } else {
+        const VT100GridCoordRange coordRange = [result internalCoordRange];
+        [result.session.textview selectCoordRange:coordRange];
+        [result.session.textview scrollToSelection];
+        [result highlightLines];
+        [self movePanelAwayFromResultInRange:coordRange session:result.session];
+    }
 }
 
 - (NSRect)rectForCoordRange:(VT100GridCoordRange)coordRange session:(PTYSession *)session {

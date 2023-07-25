@@ -7,6 +7,7 @@
 //
 
 #import "VT100XtermParser.h"
+#import "DebugLogging.h"
 #import "NSData+iTerm.h"
 
 static NSString *const kXtermParserSavedStateDataKey = @"kXtermParserSavedStateDataKey";
@@ -118,7 +119,7 @@ typedef enum {
         return kXtermParserFinishedState;
     }
     if (c != VT100CC_ESC) {
-        return kXtermParserFailingState;
+        return kXtermParserFailedState;
     }
     unsigned char c2 = 0;
     if (!iTermParserTryConsume(context, &c2)) {
@@ -246,6 +247,11 @@ typedef enum {
             }
             if (append && nextState == kXtermParserParsingStringState) {
                 [data appendBytes:&c length:1];
+                const NSUInteger maxLength = 1048576;
+                if (data.length >= maxLength) {
+                    DLog(@"Truncate very long OSC");
+                    nextState = kXtermParserFinishedState;
+                }
             }
         }
     } while (nextState == kXtermParserParsingStringState);
@@ -290,6 +296,7 @@ typedef enum {
                @(117): @(XTERMCC_RESET_HIGHLIGHT_COLOR),
                @(119): @(XTERMCC_RESET_HIGHLIGHT_FOREGROUND_COLOR),
                @133: @(XTERMCC_FINAL_TERM),
+               @134: @(XTERMCC_FRAMER_WRAPPER),
                @1337: @(XTERMCC_SET_KVP),
            };
         [theMap retain];
@@ -370,6 +377,9 @@ typedef enum {
 
     iTermXtermParserState previousState = state;
 
+    if (iTermParserLength(context) + iTermParserNumberOfBytesConsumed(context) > 0x7f000000) {
+        state = kXtermParserFailedState;
+    }
     // Run the state machine.
     while (1) {
         iTermXtermParserState stateSwitchedOn = state;

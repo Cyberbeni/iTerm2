@@ -198,6 +198,10 @@ static const CGFloat kFilterHeight = 30;
     return self.viewLoaded && !self.view.isHidden;
 }
 
+- (BOOL)shouldSearchAutomatically {
+    return YES;
+}
+
 - (void)setFilter:(NSString *)filter {
     const BOOL shouldBeHidden = filter.length == 0;
     if (shouldBeHidden != _filterWrapper.isHidden) {

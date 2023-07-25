@@ -9,6 +9,7 @@
 
 #import "iTermFileDescriptorServerShared.h"
 #import "iTermGitClient.h"
+#import "iTermPathFinder.h"
 #import "pidinfo-Swift.h"
 #include <libproc.h>
 #include <mach-o/dyld.h>
@@ -207,6 +208,24 @@ static int MakeNonBlocking(int fd) {
         }
         NSNumber *result = @(exists && isDirectory);
         reply(result);
+    }];
+}
+
+- (void)statFile:(NSString *)path
+       withReply:(void (^)(struct stat statbuf, int error))reply {
+    [self performRiskyBlock:^(BOOL shouldPerform, BOOL (^ _Nullable completion)(void)) {
+        struct stat buf = { 0 };
+        if (!shouldPerform) {
+            reply(buf, -1);
+            return;
+        }
+        const int rc = stat(path.UTF8String, &buf);
+        const int error = (rc == 0) ? 0 : errno;
+        
+        if (!completion()) {
+            return;
+        }
+        reply(buf, error);
     }];
 }
 
@@ -415,6 +434,10 @@ static double TimespecToSeconds(struct timespec* ts) {
             syslog(LOG_WARNING, "pidinfo wedged while searching for completions");
             return;
         }
+        if (prefix.length == 0) {
+            reply(@[]);
+            return;
+        }
         NSMutableArray<NSString *> *combined = [NSMutableArray array];
         for (NSString *relativeDirectory in directories) {
             NSString *directory;
@@ -491,86 +514,53 @@ static const char *GetPathToSelf(void) {
             return;
         }
 
-        int pipeFDs[2];
-        const int pipeRC = pipe(pipeFDs);
-        if (pipeRC == -1) {
+        NSPipe *pipe = [NSPipe pipe];
+
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = [NSString stringWithCString:GetPathToSelf()
+                                             encoding:NSUTF8StringEncoding];
+        task.arguments = @[ @"--git-state", path, [@(timeout) stringValue] ];
+        task.standardOutput = pipe;
+        @try {
+            [task launch];
+        } @catch (NSException *exception) {
+            syslog(LOG_ERR, "Exception when launch git state fetcher: %s", exception.description.UTF8String);
             reply(nil);
             completion();
             return;
         }
 
-        const char *exe = GetPathToSelf();
-        const char *pathCString = strdup(path.UTF8String);
-        char *timeoutStr = NULL;
-        asprintf(&timeoutStr, "%d", timeout);
-        const int childPID = fork();
-        switch (childPID) {
-            case 0: {
-                // Child
-                // Make the write end of the pipe be file descriptor 0.
-                if (pipeFDs[1] != 0) {
-                  close(0);
-                  dup2(pipeFDs[1], 0);
-                }
-                // Close all file descriptors except 0.
-                const int dtableSize = getdtablesize();
-                for (int j = 1; j < dtableSize; j++) {
-                    close(j);
-                }
-                // exec because this is a multi-threaded program, and multi-threaded programs have
-                // to exec() after fork() if they want to do anything useful.
-                execl(exe, exe, "--git-state", pathCString, timeoutStr, 0);
-                _exit(0);
-            }
-            case -1:
-                // Failed to fork
-                free((void *)timeoutStr);
-                free((void *)exe);
-                free((void *)pathCString);
-                close(pipeFDs[0]);
-                close(pipeFDs[1]);
-                reply(nil);
-                completion();
-                break;
-            default: {
-                // Parent
-                free((void *)timeoutStr);
-                free((void *)exe);
-                free((void *)pathCString);
-                close(pipeFDs[1]);
-                iTermCPUGovernor *governor = [[iTermCPUGovernor alloc] initWithPID:childPID dutyCycle:0.5];
-                // Allow 100% CPU utilization for the first x seconds.
-                [governor setGracePeriodDuration:1.0];
-                const NSInteger token = [governor incr];
-                NSFileHandle *fileHandle = [[NSFileHandle alloc] initWithFileDescriptor:pipeFDs[0] closeOnDealloc:YES];
-                int stat_loc = 0;
-                int waitRC;
-                do {
-                    waitRC = waitpid(childPID, &stat_loc, 0);
-                } while (waitRC == -1 && errno == EINTR);
-                [governor decr:token];
-                if (WIFSIGNALED(stat_loc)) {
-                    // If it timed out don't even try to read because it could be incomplete.
-                    reply(nil);
-                    completion();
-                    break;
-                }
-                NSData *data = [fileHandle readDataToEndOfFile];
-                NSError *error = nil;
-                NSKeyedUnarchiver *decoder = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:&error];
-                if (!decoder) {
-                    reply(nil);
-                    completion();
-                    break;
-                }
-                
-                iTermGitState *state = [decoder decodeTopLevelObjectOfClass:[iTermGitState class]
-                                                                     forKey:@"state"
-                                                                      error:nil];
-                reply(state);
-                completion();
-            }
+        const pid_t childPID = task.processIdentifier;
+        iTermCPUGovernor *governor = [[iTermCPUGovernor alloc] initWithPID:childPID
+                                                                 dutyCycle:0.5];
+        // Allow 100% CPU utilization for the first x seconds.
+        [governor setGracePeriodDuration:1.0];
+        const NSInteger token = [governor incr];
+        NSFileHandle *fileHandle = [[NSFileHandle alloc] initWithFileDescriptor:pipe.fileHandleForReading.fileDescriptor
+                                                                 closeOnDealloc:YES];
+        [task waitUntilExit];
+        [governor decr:token];
+        if (task.terminationReason == NSTaskTerminationReasonUncaughtSignal) {
+            // If it timed out don't even try to read because it could be incomplete.
+            reply(nil);
+            completion();
+            return;
         }
+
+        NSData *data = [fileHandle readDataToEndOfFile];
+        NSError *error = nil;
+        NSKeyedUnarchiver *decoder = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:&error];
+        if (!decoder) {
+            reply(nil);
+            completion();
+            return;
+        }
+                
+        iTermGitState *state = [decoder decodeTopLevelObjectOfClass:[iTermGitState class]
+                                                             forKey:@"state"
+                                                              error:nil];
+        reply(state);
+        completion();
     }];
 }
 
@@ -624,6 +614,113 @@ static const char *GetPathToSelf(void) {
         }
     }
     return results;
+}
+
+void iTermMutatePathFindersDict(void (^NS_NOESCAPE block)(NSMutableDictionary<NSNumber *, iTermPathFinder *> *dict)) {
+    static NSMutableDictionary<NSNumber *, iTermPathFinder *> *instance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [NSMutableDictionary dictionary];
+    });
+    @synchronized (instance) {
+        block(instance);
+    }
+}
+
+- (void)findExistingFileWithPrefix:(NSString *)prefix
+                            suffix:(NSString *)suffix
+                  workingDirectory:(NSString *)workingDirectory
+                    trimWhitespace:(BOOL)trimWhitespace
+                     pathsToIgnore:(NSString *)pathsToIgnore
+                allowNetworkMounts:(BOOL)allowNetworkMounts
+                             reqid:(int)reqid
+                             reply:(void (^)(NSString *path, int prefixChars, int suffixChars, BOOL workingDirectoryIsLocal))reply {
+    [self performRiskyBlock:^(BOOL shouldPerform, BOOL (^completion)(void)) {
+        if (!shouldPerform) {
+            reply(nil, 0, 0, NO);
+            syslog(LOG_WARNING, "pidinfo wedged in findExistingFile %d. count=%d", reqid, self->_numWedged);
+            return;
+        }
+
+        iTermPathFinder *pathfinder = [[iTermPathFinder alloc] initWithPrefix:prefix
+                                                                       suffix:suffix
+                                                             workingDirectory:workingDirectory
+                                                               trimWhitespace:trimWhitespace
+                                                                       ignore:pathsToIgnore
+                                                           allowNetworkMounts:allowNetworkMounts];
+        pathfinder.reqid = reqid;
+        iTermMutatePathFindersDict(^(NSMutableDictionary<NSNumber *, iTermPathFinder *> *dict) {
+            dict[@(reqid)] = pathfinder;
+        });
+        pathfinder.fileManager = [NSFileManager defaultManager];
+        __weak __typeof(pathfinder) weakPathfinder = pathfinder;
+        DLog(@"[%d] Start %@ + %@", reqid,
+             [prefix substringFromIndex:MAX(10, prefix.length) - 10],
+             [suffix substringToIndex:MIN(suffix.length, 10)]);
+        [pathfinder searchSynchronously];
+        if (!completion()) {
+            syslog(LOG_INFO, "findExistingFile %d finished after timing out.", reqid);
+        }
+        DLog(@"[%d] Finish with result %@", reqid, weakPathfinder.path);
+        reply(weakPathfinder.path,
+              weakPathfinder.prefixChars,
+              weakPathfinder.suffixChars,
+              weakPathfinder.workingDirectoryIsLocal);
+    }];
+}
+
+- (void)cancelFindExistingFileRequest:(int)reqid reply:(void (^)(void))reply {
+    __block iTermPathFinder *pathFinder;
+    DLog(@"[%d] Cancel", reqid);
+    iTermMutatePathFindersDict(^(NSMutableDictionary<NSNumber *, iTermPathFinder *> *dict) {
+        pathFinder = dict[@(reqid)];
+        dict[@(reqid)] = nil;
+    });
+    [pathFinder cancel];
+    reply();
+}
+
+- (void)executeShellCommand:(NSString *)command
+                       args:(NSArray<NSString *> *)args
+                        dir:(NSString *)dir
+                        env:(NSDictionary<NSString *, NSString *> *)env
+                      reply:(void (^)(NSData *stdout,
+                                      NSData *stderr,
+                                      uint8_t status,
+                                      NSTaskTerminationReason reason))reply {
+    [self performRiskyBlock:^(BOOL shouldPerform, BOOL (^completion)(void)) {
+        if (!shouldPerform) {
+            reply(nil, 0, 0, NO);
+            syslog(LOG_WARNING, "pidinfo wedged in executeShellCommand. count=%d",
+                   self->_numWedged);
+            return;
+        }
+
+        NSPipe *stdoutPipe = [NSPipe pipe];
+        NSPipe *stderrPipe = [NSPipe pipe];
+        NSPipe *stdinPipe = [NSPipe pipe];
+
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = command;
+        task.arguments = args;
+        task.standardInput = stdinPipe;
+        task.standardOutput = stdoutPipe;
+        task.standardError = stderrPipe;
+
+        [task launch];
+
+        [stdinPipe.fileHandleForWriting closeFile];
+        NSData *stdout = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+        NSData *stderr = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+
+        [task waitUntilExit];
+
+        if (!completion()) {
+            syslog(LOG_INFO, "executeShellCommand finished after timing out.");
+        }
+        DLog(@"Finished with stdout %@", stdout);
+        reply(stdout, stderr, task.terminationStatus, task.terminationReason);
+    }];
 }
 
 @end

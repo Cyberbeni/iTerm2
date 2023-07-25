@@ -8,19 +8,29 @@
 
 #import "ContextMenuActionPrefsController.h"
 #import "FutureMethods.h"
+#import "NSArray+iTerm.h"
 #import "NSStringITerm.h"
 #import "NSURL+iTerm.h"
 #import "VT100RemoteHost.h"
+#import "iTerm2SharedARC-Swift.h"
+#import "iTermVariableScope+Session.h"
 
 static NSString* kTitleKey = @"title";
 static NSString* kActionKey = @"action";
 static NSString* kParameterKey = @"parameter";
+
+NSString *iTermSmartSelectionActionContextKeyAction = @"action";
+NSString *iTermSmartSelectionActionContextKeyComponents = @"components";
+NSString *iTermSmartSelectionActionContextKeyWorkingDirectory = @"workingDirectory";
+NSString *iTermSmartSelectionActionContextKeyRemoteHost = @"remoteHost";
 
 @implementation ContextMenuActionPrefsController {
     IBOutlet NSTableView *_tableView;
     IBOutlet NSTableColumn *_titleColumn;
     IBOutlet NSTableColumn *_actionColumn;
     IBOutlet NSTableColumn *_parameterColumn;
+    IBOutlet NSButton *_useInterpolatedStringsButton;
+    IBOutlet NSTextField *_parameterInfoTextField;
     NSMutableArray *_model;
 }
 
@@ -40,8 +50,7 @@ static NSString* kParameterKey = @"parameter";
 + (NSString *)titleForActionDict:(NSDictionary *)dict
            withCaptureComponents:(NSArray *)components
                 workingDirectory:(NSString *)workingDirectory
-                      remoteHost:(VT100RemoteHost *)remoteHost
-{
+                      remoteHost:(id<VT100RemoteHostReading>)remoteHost {
     NSString *title = [dict objectForKey:kTitleKey];
     for (int i = 0; i < 9; i++) {
         NSString *repl = @"";
@@ -68,6 +77,8 @@ static NSString* kParameterKey = @"parameter";
             return [parameter stringWithBackslashEscapedShellCharactersIncludingNewlines:NO];
         case kOpenFileContextMenuAction:
             return parameter;
+        case kCopyContextMenuAction:
+            return parameter;
         case kOpenUrlContextMenuAction: {
             return [NSURL URLWithUserSuppliedString:parameter].absoluteString;
         }
@@ -78,13 +89,29 @@ static NSString* kParameterKey = @"parameter";
     return nil;
 }
 
-+ (NSString *)parameterForActionDict:(NSDictionary *)dict
-               withCaptureComponents:(NSArray *)components
-                    workingDirectory:(NSString *)workingDirectory
-                          remoteHost:(VT100RemoteHost *)remoteHost
-{
++ (void)computeParameterForActionDict:(NSDictionary *)dict
+                withCaptureComponents:(NSArray *)components
+                     useInterpolation:(BOOL)useInterpolation
+                                scope:(iTermVariableScope *)scope
+                                owner:(id<iTermObject>)owner
+                           completion:(void (^)(NSString *parameter))completion {
     NSString *parameter = [dict objectForKey:kParameterKey];
     ContextMenuActions action = (ContextMenuActions) [[dict objectForKey:kActionKey] intValue];
+    if (useInterpolation) {
+        iTermSwiftyStringWithBackreferencesEvaluator *evaluator = [[iTermSwiftyStringWithBackreferencesEvaluator alloc] initWithExpression:parameter];
+        NSArray *encodedCaptures = [components mapWithBlock:^id(id anObject) {
+            return [self parameterValue:anObject encodedForAction:action];
+        }];
+        [evaluator evaluateWithAdditionalContext:@{ @"matches": encodedCaptures }
+                                           scope:scope
+                                           owner:owner
+                                      completion:^(NSString * _Nullable value,
+                                                   NSError * _Nullable error) {
+            DLog(@"value=%@, error=%@", value, error);
+            completion(value);
+        }];
+        return;
+    }
     for (int i = 0; i < 9; i++) {
         NSString *repl = @"";
         if (i < components.count) {
@@ -94,18 +121,48 @@ static NSString* kParameterKey = @"parameter";
         parameter = [parameter stringByReplacingBackreference:i withString:repl ?: @""];
     }
 
+    NSString *workingDirectory = [scope path];
+    NSString *hostname = [scope hostname];
+    NSString *username = [scope username];
+
     parameter = [parameter stringByReplacingEscapedChar:'d' withString:workingDirectory ?: @"."];
-    parameter = [parameter stringByReplacingEscapedChar:'h' withString:remoteHost.hostname];
-    parameter = [parameter stringByReplacingEscapedChar:'u' withString:remoteHost.username];
+    parameter = [parameter stringByReplacingEscapedChar:'h' withString:hostname];
+    parameter = [parameter stringByReplacingEscapedChar:'u' withString:username];
     parameter = [parameter stringByReplacingEscapedChar:'n' withString:@"\n"];
     parameter = [parameter stringByReplacingEscapedChar:'\\' withString:@"\\"];
 
-    return parameter;
+    completion(parameter);
+}
+
+- (IBAction)help:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://iterm2.com/documentation-smart-selection.html"]];
+}
+
+- (IBAction)didToggleUseInterpolatedStrings:(id)sender {
+    [self updateHelpText];
+}
+
+- (void)setUseInterpolatedStrings:(BOOL)useInterpolatedStrings {
+    _useInterpolatedStringsButton.state = useInterpolatedStrings ? NSControlStateValueOn : NSControlStateValueOff;
+    [self updateHelpText];
+}
+
+- (void)updateHelpText {
+    if (_useInterpolatedStringsButton.state == NSControlStateValueOn) {
+        _parameterInfoTextField.stringValue = @"In “parameter,” use \\(matches[i]) where i=0 for the entire match and i>0 for capture groups.";
+    } else {
+        _parameterInfoTextField.stringValue = @"In “parameter,” use \\0 for match, \\1…\\9 for match groups, \\d for directory, \\u for user, \\h for host.";
+    }
+}
+
+- (BOOL)useInterpolatedStrings {
+    return _useInterpolatedStringsButton.state == NSControlStateValueOn;
 }
 
 - (IBAction)ok:(id)sender
 {
-    [_delegate contextMenuActionsChanged:_model];
+    [_delegate contextMenuActionsChanged:_model
+                  useInterpolatedStrings:self.useInterpolatedStrings];
 }
 
 - (IBAction)add:(id)sender
@@ -182,13 +239,15 @@ static NSString* kParameterKey = @"parameter";
                               @"Run Command…",
                               @"Run Coprocess…",
                               @"Send text…",
-                              @"Run Command in Window…" ];
+                              @"Run Command in Window…",
+                              @"Copy"];
     NSArray *paramPlaceholders = @[ @"Enter file name",
                                     @"Enter URL",
                                     @"Enter command",
                                     @"Enter coprocess command",
                                     @"Enter text",
-                                    @"Enter command" ];
+                                    @"Enter command",
+                                    @""];
 
 
     if (tableColumn == _titleColumn) {

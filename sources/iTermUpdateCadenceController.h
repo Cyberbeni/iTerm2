@@ -20,6 +20,8 @@ typedef struct {
     NSInteger adaptiveFrameRateThroughputThreshold;
     double slowFrameRate;
     BOOL liveResizing;
+    BOOL proMotion;
+    NSInteger estimatedThroughput;
 } iTermUpdateCadenceState;
 
 @protocol iTermUpdateCadenceControllerDelegate<NSObject>
@@ -43,14 +45,13 @@ typedef struct {
 @property (nonatomic, readonly) iTermHistogram *histogram;
 @property (nonatomic, readonly) BOOL isActive;
 
-- (instancetype)initWithThroughputEstimator:(iTermThroughputEstimator *)throughputEstimator NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)init;
 
 - (void)changeCadenceIfNeeded;
 
 - (void)willStartLiveResize;
 - (void)liveResizeDidEnd;
-- (void)didHandleInput;
+- (void)didHandleInputWithThroughput:(NSInteger)throughput;
 - (void)didHandleKeystroke;
 
 @end

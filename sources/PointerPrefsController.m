@@ -10,7 +10,9 @@
 #import "PointerController.h"
 #import "PreferencePanel.h"
 #import "NSPopUpButton+iTerm.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermApplicationDelegate.h"
+#import "iTermFunctionCallTextFieldDelegate.h"
 #import "iTermPasteSpecialViewController.h"
 #import "ITAddressBookMgr.h"
 #import "FutureMethods.h"
@@ -63,6 +65,7 @@ NSString *kMovePanePointerAction = @"kMovePanePointerAction";
 NSString *kSendEscapeSequencePointerAction = @"kSendEscapeSequencePointerAction";
 NSString *kSendHexCodePointerAction = @"kSendHexCodePointerAction";
 NSString *kSendTextPointerAction = @"kSendTextPointerAction";
+NSString *kInvokeScriptFunction = @"kInvokeScriptFunction";
 NSString *kSelectPaneLeftPointerAction = @"kSelectPaneLeftPointerAction";
 NSString *kSelectPaneRightPointerAction = @"kSelectPaneRightPointerAction";
 NSString *kSelectPaneAbovePointerAction = @"kSelectPaneAbovePointerAction";
@@ -76,6 +79,7 @@ NSString *kSelectPreviousPanePointerAction = @"kSelectPreviousPanePointerAction"
 NSString *kExtendSelectionPointerAction = @"kExtendSelectionPointerAction";
 NSString *kQuickLookAction = @"kQuickLookAction";
 NSString *kIgnoreAction = @"kIgnoreAction";
+NSString *kSelectMenuItemPointerAction = @"kSelectMenuItemPointerAction";
 
 typedef enum {
     kNoArg,
@@ -83,7 +87,9 @@ typedef enum {
     kHexCodeArg,
     kTextArg,
     kProfileArg,
-    kAdvancedPasteArg
+    kAdvancedPasteArg,
+    kMenuItemArg,
+    kScriptFunctionArg
 } ArgumentType;
 
 @interface NSString (PointerPrefsController)
@@ -150,6 +156,11 @@ typedef enum {
     IBOutlet NSButton *remove_;
     iTermPasteSpecialViewController *_pasteSpecialViewController;
     IBOutlet NSView *_pasteSpecialViewContainer;
+
+    IBOutlet iTermMenuItemPopupView *_menuItemPopupView;
+
+    iTermFunctionCallTextFieldDelegate *_invocationDelegate;
+
     NSRect _initialFrame;
     NSRect _initialPasteContainerFrame;
 
@@ -393,6 +404,7 @@ typedef enum {
 {
     NSDictionary *names = [NSDictionary dictionaryWithObjectsAndKeys:
                            @"Ignore", kIgnoreAction,
+                           @"Invoke Script Function…", kInvokeScriptFunction,
                            @"Paste from Clipboard…", kPasteFromClipboardPointerAction,
                            @"Paste from Selection…", kPasteFromSelectionPointerAction,
                            @"Extend Selection", kExtendSelectionPointerAction,
@@ -419,6 +431,7 @@ typedef enum {
                            @"New Vertical Split With Profile…", kNewVerticalSplitWithProfilePointerAction,
                            @"New Horizontal Split With Profile…", kNewHorizontalSplitWithProfilePointerAction,
                            @"QuickLook", kQuickLookAction,
+                           @"Select Menu Item", kSelectMenuItemPointerAction,
                            @"Select Next Pane", kSelectNextPanePointerAction,
                            @"Select Previous Pane", kSelectPreviousPanePointerAction,
                            nil];
@@ -431,12 +444,14 @@ typedef enum {
                           @(kEscPlusArg), kSendEscapeSequencePointerAction,
                           @(kHexCodeArg), kSendHexCodePointerAction,
                           @(kTextArg), kSendTextPointerAction,
+                          @(kScriptFunctionArg), kInvokeScriptFunction,
                           @(kProfileArg), kNewWindowWithProfilePointerAction,
                           @(kProfileArg), kNewTabWithProfilePointerAction,
                           @(kProfileArg), kNewVerticalSplitWithProfilePointerAction,
                           @(kProfileArg), kNewHorizontalSplitWithProfilePointerAction,
                           @(kAdvancedPasteArg), kPasteFromClipboardPointerAction,
                           @(kAdvancedPasteArg), kPasteFromSelectionPointerAction,
+                          @(kMenuItemArg), kSelectMenuItemPointerAction,
                           nil];
     NSNumber *n = [args objectForKey:action];
     if (n) {
@@ -480,6 +495,7 @@ typedef enum {
                                                        withString:[NSString stringWithFormat:@" Esc + %@", argument]];
             case kHexCodeArg:
             case kTextArg:
+            case kScriptFunctionArg:
                 return [name stringByReplacingOccurrencesOfString:@"…"
                                                        withString:[NSString stringWithFormat:@" \"%@\"", argument]];
             case kProfileArg: {
@@ -492,10 +508,19 @@ typedef enum {
             }
             case kAdvancedPasteArg: {
                 if (argument.length) {
-                    name = [NSString stringWithFormat:@"%@: %@",
+                    return [NSString stringWithFormat:@"%@: %@",
                             [name stringByReplacingOccurrencesOfString:@"…" withString:@""],
                             [iTermPasteSpecialViewController descriptionForCodedSettings:argument]];
                 }
+                break;
+            }
+            case kMenuItemArg: {
+                NSArray *parts = [argument componentsSeparatedByString:@"\n"];
+                NSString *title = parts.firstObject;
+                if (!title.length) {
+                    break;
+                }
+                return [NSString stringWithFormat:@"Select Menu Item “%@”", title];
             }
         }
     }
@@ -875,6 +900,7 @@ typedef enum {
             [editArgumentLabel_ setHidden:YES];
             [editArgumentField_ setHidden:YES];
             [editArgumentButton_ setHidden:YES];
+            _menuItemPopupView.hidden = YES;
             _pasteSpecialViewContainer.hidden = YES;
             break;
 
@@ -883,12 +909,14 @@ typedef enum {
             [editArgumentField_ setHidden:NO];
             [editArgumentField_ setEnabled:YES];
             [editArgumentButton_ setHidden:YES];
+            _menuItemPopupView.hidden = YES;
             [editArgumentLabel_ setStringValue:@"Esc +"];
             [[editArgumentField_ cell] setPlaceholderString:@"characters to send"];
             [editArgumentField_ setStringValue:currentArg];
             [editArgumentField_ setRefusesFirstResponder:NO];
             [editArgumentField_ setSelectable:YES];
             _pasteSpecialViewContainer.hidden = YES;
+            editArgumentField_.delegate = nil;
             break;
 
         case kHexCodeArg:
@@ -896,10 +924,12 @@ typedef enum {
             [editArgumentField_ setHidden:NO];
             [editArgumentField_ setEnabled:YES];
             [editArgumentButton_ setHidden:YES];
+            _menuItemPopupView.hidden = YES;
             [editArgumentLabel_ setStringValue:@"Hex codes:"];
             [[editArgumentField_ cell] setPlaceholderString:@"ex: 0x7f 0x20"];
             [editArgumentField_ setStringValue:currentArg];
             _pasteSpecialViewContainer.hidden = YES;
+            editArgumentField_.delegate = nil;
             break;
 
         case kTextArg:
@@ -907,16 +937,35 @@ typedef enum {
             [editArgumentField_ setHidden:NO];
             [editArgumentField_ setEnabled:YES];
             [editArgumentButton_ setHidden:YES];
+            _menuItemPopupView.hidden = YES;
             [editArgumentLabel_ setStringValue:@"Text:"];
             [[editArgumentField_ cell] setPlaceholderString:@"Enter value to send"];
             [editArgumentField_ setStringValue:currentArg];
             _pasteSpecialViewContainer.hidden = YES;
+            editArgumentField_.delegate = nil;
+            break;
+
+        case kScriptFunctionArg:
+            [editArgumentLabel_ setHidden:NO];
+            [editArgumentField_ setHidden:NO];
+            [editArgumentField_ setEnabled:YES];
+            [editArgumentButton_ setHidden:YES];
+            _menuItemPopupView.hidden = YES;
+            [editArgumentLabel_ setStringValue:@"Text:"];
+            [[editArgumentField_ cell] setPlaceholderString:@"Enter function invocation"];
+            [editArgumentField_ setStringValue:currentArg];
+            _pasteSpecialViewContainer.hidden = YES;
+            _invocationDelegate = [[iTermFunctionCallTextFieldDelegate alloc] initWithPathSource:[iTermVariableHistory pathSourceForContext:iTermVariablesSuggestionContextSession]
+                                                                                     passthrough:nil
+                                                                                   functionsOnly:YES];
+            editArgumentField_.delegate = _invocationDelegate;
             break;
 
         case kProfileArg:
             [editArgumentLabel_ setHidden:NO];
             [editArgumentField_ setHidden:YES];
             [editArgumentButton_ setHidden:NO];
+            _menuItemPopupView.hidden = YES;
             [editArgumentLabel_ setStringValue:@"Profile:"];
             [editArgumentButton_ populateWithProfilesSelectingGuid:currentArg];
             _pasteSpecialViewContainer.hidden = YES;
@@ -927,8 +976,24 @@ typedef enum {
             editArgumentField_.hidden = YES;
             editArgumentButton_.hidden = YES;
             _pasteSpecialViewContainer.hidden = NO;
+            _menuItemPopupView.hidden = YES;
             [self configurePasteSpecialWithArgument:currentArg];
             break;
+
+        case kMenuItemArg: {
+            editArgumentLabel_.hidden = YES;
+            editArgumentField_.hidden = YES;
+            editArgumentButton_.hidden = YES;
+            _pasteSpecialViewContainer.hidden = YES;
+            _menuItemPopupView.hidden = NO;
+            [_menuItemPopupView reloadData];
+            NSArray<NSString *> *parts = [currentArg componentsSeparatedByString:@"\n"];
+            if (parts.count > 0) {
+                (void)[_menuItemPopupView selectItemWithIdentifier:parts.firstObject];
+            }
+            break;
+        }
+
     }
     [self updateWindowFrame];
 }
@@ -1069,6 +1134,8 @@ typedef enum {
             [newValue setObject:[_pasteSpecialViewController stringEncodedSettings] ?: @""
                          forKey:kArgumentKey];
         }
+    } else if (!_menuItemPopupView.isHidden) {
+        newValue[kArgumentKey] = [NSString stringWithFormat:@"%@\n%@", _menuItemPopupView.selectedIdentifier, _menuItemPopupView.selectedTitle];
     }
     NSString *newKey;
     int modMask = 0;

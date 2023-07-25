@@ -36,6 +36,7 @@
 #import "iTermPathCleaner.h"
 #import "iTermPathFinder.h"
 #import "iTermSemanticHistoryPrefsController.h"
+#import "iTermSlowOperationGateway.h"
 #import "iTermVariableScope.h"
 #import "iTermWarning.h"
 #import "NSArray+iTerm.h"
@@ -80,7 +81,9 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
                        columnNumber:(NSString **)columnNumber {
     iTermPathCleaner *cleaner = [[iTermPathCleaner alloc] initWithPath:path
                                                                 suffix:suffix
-                                                      workingDirectory:workingDirectory];
+                                                      workingDirectory:workingDirectory
+                                                                ignore:[iTermAdvancedSettingsModel pathsToIgnore]
+                                                    allowNetworkMounts:[iTermAdvancedSettingsModel enableSemanticHistoryOnNetworkMounts]];
     cleaner.fileManager = self.fileManager;
     [cleaner cleanSynchronously];
     if (lineNumber) {
@@ -114,6 +117,11 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
     [self launchAppWithBundleIdentifier:bundleIdentifier args:@[ path ]];
 }
 
+- (void)openAppWithBundleIdentifier:(NSString *)bundleIdentifier args:(NSArray *)args {
+    args = [@[ @"-nb", bundleIdentifier, @"--args" ] arrayByAddingObjectsFromArray: args];
+    [self launchTaskWithPath:@"/usr/bin/open" arguments:args completion:nil];
+}
+
 - (NSBundle *)applicationBundleWithIdentifier:(NSString *)bundleIdentifier {
     NSString *bundlePath =
         [[NSWorkspace sharedWorkspace] absolutePathForAppBundleWithIdentifier:bundleIdentifier];
@@ -126,6 +134,16 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
     executable = [executable stringByAppendingPathComponent:
                             [bundle objectForInfoDictionaryKey:(id)kCFBundleExecutableKey]];
     return executable;
+}
+
+- (NSString *)novaClientInApplicationBundle:(NSBundle *)bundle {
+    DLog(@"Trying to find nova in %@", bundle.bundlePath);
+    NSURL *url = bundle.bundleURL;
+    NSArray<NSString *> *parts = @[ @"Contents", @"SharedSupport", @"nova" ];
+    for (NSString *part in parts) {
+        url = [url URLByAppendingPathComponent:part];
+    }
+    return url.path;
 }
 
 - (NSString *)emacsClientInApplicationBundle:(NSBundle *)bundle {
@@ -233,8 +251,16 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
         // I don't expect this to ever happen.
         return;
     }
-    NSString *identifier = codium ? kVSCodiumIdentifier : kVSCodeIdentifier;
-    NSString *bundlePath = [self absolutePathForAppBundleWithIdentifier:identifier];
+    NSArray<NSString *> *possibleIdentifiers = codium ? @[ kVSCodiumIdentifier1, kVSCodiumIdentifier2 ] : @[kVSCodeIdentifier];
+    NSString *identifier;
+    NSString *bundlePath = nil;
+    for (NSString *candidate in possibleIdentifiers) {
+        identifier = candidate;
+        bundlePath = [self absolutePathForAppBundleWithIdentifier:identifier];
+        if (bundlePath) {
+            break;
+        }
+    }
     if (bundlePath) {
         NSString *codeExecutable =
         [bundlePath stringByAppendingPathComponent:@"Contents/Resources/app/bin/code"];
@@ -286,25 +312,23 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
 
 }
 
-- (void)launchIntelliJIDEAWithArguments:(NSArray<NSString *> *)args path:(NSString *)path {
-    NSBundle *bundle = [self applicationBundleWithIdentifier:kIntelliJIDEAIdentifier];
+- (void)openDocumentInNova:(NSString *)path line:(NSString *)line column:(NSString *)column {
+    NSBundle *bundle = [self applicationBundleWithIdentifier:kNovaAppIdentifier];
     if (!bundle) {
-        DLog(@"Failed to find IDEA bundle");
+        DLog(@"Failed to find nova bundle");
         return;
     }
-    NSString *launcher = [self intelliJIDEALauncherInApplicationBundle:bundle];
-    if (!launcher) {
-        DLog(@"Failed to find launcher in %@", bundle);
-        if (path) {
-            DLog(@"Launch idea with path %@", path);
-            [self launchAppWithBundleIdentifier:kIntelliJIDEAIdentifier
-                                           path:path];
+    NSString *novaUtil = [self novaClientInApplicationBundle:bundle];
+    NSMutableArray<NSString *> *args = [@[@"open", path] mutableCopy];
+    if (line) {
+        [args addObject:@"-l"];
+        if (column) {
+            [args addObject:[NSString stringWithFormat:@"%@:%@", line, column]];
+        } else {
+            [args addObject:line];
         }
-        return;
     }
-    [self launchTaskWithPath:launcher
-                   arguments:args
-                  completion:nil];
+    [self launchTaskWithPath:novaUtil arguments:args completion:nil];
 }
 
 - (NSString *)absolutePathForAppBundleWithIdentifier:(NSString *)bundleId {
@@ -336,7 +360,8 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
 + (NSArray *)bundleIdsThatSupportOpeningToLineNumber {
     return @[ kAtomIdentifier,
               kVSCodeIdentifier,
-              kVSCodiumIdentifier,
+              kVSCodiumIdentifier1,
+              kVSCodiumIdentifier2,
               kSublimeText2Identifier,
               kSublimeText3Identifier,
               kSublimeText4Identifier,
@@ -345,7 +370,10 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
               kTextmate2Identifier,
               kBBEditIdentifier,
               kEmacsAppIdentifier,
-              kIntelliJIDEAIdentifier ];
+              kIntelliJIDEAIdentifier,
+              kWebStormIdentifier,
+              kRiderIdentifier,
+              kNovaAppIdentifier ];
 }
 
 - (void)openFile:(NSString *)path
@@ -367,7 +395,8 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
         return;
     }
     if ([identifier isEqualToString:kVSCodeIdentifier] ||
-        [identifier isEqualToString:kVSCodiumIdentifier]) {
+        [identifier isEqualToString:kVSCodiumIdentifier1] ||
+        [identifier isEqualToString:kVSCodiumIdentifier2]) {
         if (lineNumber != nil) {
             path = [NSString stringWithFormat:@"%@:%@", path, lineNumber];
         }
@@ -375,7 +404,7 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
             path = [path stringByAppendingFormat:@":%@", columnNumber];
         }
         [self launchVSCodeWithPath:path
-                            codium:[identifier isEqualToString:kVSCodiumIdentifier]];
+                            codium:([identifier isEqualToString:kVSCodiumIdentifier1] || [identifier isEqualToString:kVSCodiumIdentifier2])];
         return;
     }
     if ([identifier isEqualToString:kSublimeText2Identifier] ||
@@ -414,7 +443,17 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
         [self launchEmacsWithArguments:args];
         return;
     }
-    if ([identifier isEqualToString:kIntelliJIDEAIdentifier]) {
+    if ([identifier isEqualToString:kNovaAppIdentifier]) {
+        [self openDocumentInNova:path line:lineNumber column:columnNumber];
+        return;
+    }
+    // WebStorm doesn't actually support --line, but it's harmless to try.
+    NSArray *jetbrains = @[
+        kIntelliJIDEAIdentifier,
+        kWebStormIdentifier,
+        kRiderIdentifier
+    ];
+    if ([jetbrains containsObject:identifier]) {
         NSArray<NSString *> *args = @[];
         if (path) {
             if (lineNumber) {
@@ -423,7 +462,7 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
                 args = @[ path ];
             }
         }
-        [self launchIntelliJIDEAWithArguments:args path:path];
+        [self openAppWithBundleIdentifier:identifier args:args];
         return;
     }
 
@@ -764,7 +803,9 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
     iTermPathFinder *pathfinder = [[iTermPathFinder alloc] initWithPrefix:beforeStringIn
                                                                    suffix:afterStringIn
                                                          workingDirectory:workingDirectory
-                                                           trimWhitespace:trimWhitespace];
+                                                           trimWhitespace:trimWhitespace
+                                                                   ignore:[iTermAdvancedSettingsModel pathsToIgnore]
+                                                       allowNetworkMounts:[iTermAdvancedSettingsModel enableSemanticHistoryOnNetworkMounts]];
     pathfinder.fileManager = self.fileManager;
     [pathfinder searchSynchronously];
     if (charsTakenFromPrefixPtr) {
@@ -776,31 +817,26 @@ NSString *const kSemanticHistoryColumnNumberKey = @"semanticHistory.columnNumber
     return pathfinder.path;
 }
 
-- (iTermPathFinder *)pathOfExistingFileFoundWithPrefix:(NSString *)beforeStringIn
-                                                suffix:(NSString *)afterStringIn
-                                      workingDirectory:(NSString *)workingDirectory
-                                        trimWhitespace:(BOOL)trimWhitespace
-                                            completion:(void (^)(NSString *path,
-                                                                 int prefixChars,
-                                                                 int suffixChars,
-                                                                 BOOL workingDirectoryIsLocal))completion {
-    iTermPathFinder *pathfinder = [[iTermPathFinder alloc] initWithPrefix:beforeStringIn
-                                                                   suffix:afterStringIn
-                                                         workingDirectory:workingDirectory
-                                                           trimWhitespace:trimWhitespace];
-    pathfinder.fileManager = self.fileManager;
-    __weak __typeof(pathfinder) weakPathfinder = pathfinder;
-    [pathfinder searchWithCompletion:^{
-        __strong __typeof(pathfinder) strongPathfinder = weakPathfinder;
-        if (!strongPathfinder) {
-            return;
-        }
-        completion(strongPathfinder.path,
-                   strongPathfinder.prefixChars,
-                   strongPathfinder.suffixChars,
-                   pathfinder.workingDirectoryIsLocal);
-    }];
-    return pathfinder;
+- (id<iTermCancelable>)pathOfExistingFileFoundWithPrefix:(NSString *)beforeStringIn
+                                                  suffix:(NSString *)afterStringIn
+                                        workingDirectory:(NSString *)workingDirectory
+                                          trimWhitespace:(BOOL)trimWhitespace
+                                              completion:(void (^)(NSString *path,
+                                                                   int prefixChars,
+                                                                   int suffixChars,
+                                                                   BOOL workingDirectoryIsLocal))completion {
+    DLog(@"SemanticHistoryController got request for %@ + %@",
+          [beforeStringIn substringFromIndex:MAX(10, beforeStringIn.length) - 10],
+          [afterStringIn substringToIndex:MIN(afterStringIn.length, 10)]);
+    id<iTermCancelable> canceler =
+    [[iTermSlowOperationGateway sharedInstance] findExistingFileWithPrefix:beforeStringIn
+                                                                    suffix:afterStringIn
+                                                          workingDirectory:workingDirectory
+                                                            trimWhitespace:trimWhitespace
+                                                             pathsToIgnore:[iTermAdvancedSettingsModel pathsToIgnore]
+                                                        allowNetworkMounts:[iTermAdvancedSettingsModel enableSemanticHistoryOnNetworkMounts]
+                                                                completion:completion];
+    return canceler;
 }
 
 - (NSFileManager *)fileManager {

@@ -1,5 +1,8 @@
 #define MAXRW 1024
 
+#import "PTYTask.h"
+#import "PTYTask+Private.h"
+
 #import "Coprocess.h"
 #import "DebugLogging.h"
 #import "iTermMalloc.h"
@@ -22,6 +25,7 @@
 #import "iTermTmuxJobManager.h"
 #import "NSDictionary+iTerm.h"
 
+#import "iTerm2SharedARC-Swift.h"
 #include "iTermFileDescriptorClient.h"
 #include "iTermFileDescriptorServer.h"
 #include "iTermFileDescriptorSocketPath.h"
@@ -40,6 +44,9 @@
 #include <unistd.h>
 #include <util.h>
 
+@interface PTYTask(WinSizeControllerDelegate)<iTermWinSizeControllerDelegate>
+@end
+
 static void HandleSigChld(int n) {
     // This is safe to do because write(2) is listed in the sigaction(2) man page
     // as allowed in a signal handler. Calling a method is *NOT* safe since something might
@@ -47,13 +54,6 @@ static void HandleSigChld(int n) {
     // a sigchild while doing class_addMethod and that caused a crash because of a method call.
     UnblockTaskNotifier();
 }
-
-@interface PTYTask ()<iTermTask>
-@property(atomic, assign) BOOL hasMuteCoprocess;
-@property(atomic, readwrite) int fd;
-@property(atomic, weak) iTermLoggingHelper *loggingHelper;
-@property(atomic, strong) id<iTermJobManager> jobManager;
-@end
 
 @implementation PTYTask {
     int status;
@@ -70,12 +70,6 @@ static void HandleSigChld(int n) {
 
     BOOL _paused;
 
-    PTYTaskSize _desiredSize;
-    CGFloat _lastScaleFactor;
-    PTYTaskSize _lastSize;
-    NSTimeInterval _timeOfLastSizeChange;
-    BOOL _rateLimitedSetSizeToDesiredSizePending;
-    BOOL _haveBumpedProcessCache;
     dispatch_queue_t _jobManagerQueue;
     BOOL _isTmuxTask;
 }
@@ -85,10 +79,8 @@ static void HandleSigChld(int n) {
     if (self) {
         const char *label = [iTermThread uniqueQueueLabelWithName:@"com.iterm2.job-manager"].UTF8String;
         _jobManagerQueue = dispatch_queue_create(label, DISPATCH_QUEUE_SERIAL);
-        _lastSize = (PTYTaskSize) {
-            .cellSize = iTermTTYCellSizeMake(INFINITY, INFINITY),
-            .pixelSize = iTermTTYPixelSizeMake(INFINITY, INFINITY)
-        };
+        _winSizeController = [[iTermWinSizeController alloc] init];
+        _winSizeController.delegate = self;
         writeBuffer = [[NSMutableData alloc] init];
         writeLock = [[NSLock alloc] init];
         if ([iTermAdvancedSettingsModel runJobsInServers]) {
@@ -147,6 +139,7 @@ static void HandleSigChld(int n) {
     }
     // Start/stop selecting on our FD
     [[TaskNotifier sharedInstance] unblock];
+    [_delegate taskDidChangePaused:self paused:paused];
 }
 
 - (pid_t)pidToWaitOn {
@@ -209,11 +202,16 @@ static void HandleSigChld(int n) {
     return nil;
 }
 
+// This runs on the task notifier thread
 - (void)setCoprocess:(Coprocess *)coprocess {
     @synchronized (self) {
         coprocess_ = coprocess;
         self.hasMuteCoprocess = coprocess_.mute;
     }
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf.delegate taskMuteCoprocessDidChange:self hasMuteCoprocess:self.hasMuteCoprocess];
+    });
     [[TaskNotifier sharedInstance] unblock];
 }
 
@@ -324,49 +322,6 @@ static void HandleSigChld(int n) {
     return _jobManager.fd;
 }
 
-- (void)fetchProcessInfoForCurrentJobWithCompletion:(void (^)(iTermProcessInfo *))completion {
-    const pid_t pid = self.tmuxClientProcessID ? self.tmuxClientProcessID.intValue : self.pid;
-    iTermProcessInfo *info = [[iTermProcessCache sharedInstance] deepestForegroundJobForPid:pid];
-    DLog(@"%@ fetch process info for %@", self, @(pid));
-    if (info.name) {
-        DLog(@"Return name synchronously");
-        completion(info);
-    } else if (info) {
-        DLog(@"Have info for pid %@ but no name", @(pid));
-    }
-
-    if (pid <= 0) {
-        DLog(@"Lack a good pid");
-        completion(nil);
-        return;
-    }
-    if (_haveBumpedProcessCache) {
-        DLog(@"Already bumped process cache");
-        [[iTermProcessCache sharedInstance] setNeedsUpdate:YES];
-        return;
-    }
-    _haveBumpedProcessCache = YES;
-    DLog(@"Requesting immediate update");
-    [[iTermProcessCache sharedInstance] requestImmediateUpdateWithCompletionBlock:^{
-        completion([[iTermProcessCache sharedInstance] deepestForegroundJobForPid:pid]);
-    }];
-}
-
-- (iTermProcessInfo *)cachedProcessInfoIfAvailable {
-    const pid_t pid = self.pid;
-    iTermProcessInfo *info = [[iTermProcessCache sharedInstance] deepestForegroundJobForPid:pid];
-    if (info.name) {
-        return info;
-    }
-
-    if (pid > 0 && _haveBumpedProcessCache) {
-        _haveBumpedProcessCache = YES;
-        [[iTermProcessCache sharedInstance] setNeedsUpdate:YES];
-    }
-
-    return nil;
-}
-
 - (void)writeTask:(NSData *)data {
     if (_isTmuxTask) {
         // Send keypresses to tmux.
@@ -391,38 +346,6 @@ static void HandleSigChld(int n) {
     if (_tmuxClientProcessID) {
         [[iTermProcessCache sharedInstance] unregisterTrackedPID:_tmuxClientProcessID.intValue];
     }
-}
-
-// NOTE: maybeScaleFactor will be 0 if the session is not attached to a window. For example, if
-// a different space is active.
-- (BOOL)setSize:(VT100GridSize)size viewSize:(NSSize)viewSize scaleFactor:(CGFloat)maybeScaleFactor {
-    CGFloat scaleFactor = maybeScaleFactor;
-    if (scaleFactor < 1) {
-        scaleFactor = _lastScaleFactor;
-    } else {
-        _lastScaleFactor = scaleFactor;
-    }
-    if (scaleFactor < 1) {
-        scaleFactor = 2;
-    }
-    DLog(@"Set terminal size to %@; %@ * scaleFactor=%f for %@\n%@",
-         VT100GridSizeDescription(size), NSStringFromSize(viewSize), scaleFactor, self.delegate,
-         [NSThread callStackSymbols]);
-    if (self.fd == -1) {
-        DLog(@"I have no file descriptor so not setting size.");
-        return NO;
-    }
-
-    _desiredSize.cellSize = iTermTTYCellSizeMake(size.width, size.height);
-    _desiredSize.pixelSize = iTermTTYPixelSizeMake(viewSize.width * scaleFactor,
-                                                   viewSize.height * scaleFactor);
-
-    if (PTYTaskSizeEqual(_lastSize, _desiredSize)) {
-        DLog(@"Size didn't change");
-        return YES;
-    }
-    [self rateLimitedSetSizeToDesiredSize];
-    return YES;
 }
 
 - (void)stop {
@@ -526,6 +449,8 @@ static void HandleSigChld(int n) {
         coprocess_ = nil;
         self.hasMuteCoprocess = NO;
     }
+    [self.delegate taskMuteCoprocessDidChange:self hasMuteCoprocess:self.hasMuteCoprocess];
+
     if (thePid) {
         [[TaskNotifier sharedInstance] waitForPid:thePid];
     }
@@ -755,7 +680,6 @@ static void HandleSigChld(int n) {
     if (maybeScaleFactor > 0) {
         viewSize.width *= maybeScaleFactor;
         viewSize.height *= maybeScaleFactor;
-        _lastScaleFactor = maybeScaleFactor;
     }
     DLog(@"reallyLaunchWithPath:%@ args:%@ env:%@ gridSize:%@ viewSize:%@ isUTF8:%@",
          progpath, args, env,VT100GridSizeDescription(gridSize), NSStringFromSize(viewSize), @(isUTF8));
@@ -770,11 +694,14 @@ static void HandleSigChld(int n) {
          newSize.cellSize.height,
          newSize.pixelSize.width,
          newSize.pixelSize.height);
-    _lastSize = newSize;
     iTermTTYStateInit(&ttyState,
                       newSize.cellSize,
                       newSize.pixelSize,
                       isUTF8);
+    [_winSizeController setInitialSize:gridSize
+                              viewSize:pointSize
+                           scaleFactor:maybeScaleFactor];
+    
     [self setCommand:progpath];
     if (customShell) {
         DLog(@"Use custom shell");
@@ -813,7 +740,7 @@ static void HandleSigChld(int n) {
     [self.jobManager forkAndExecWithTtyState:ttyState
                                      argpath:commandToExec
                                         argv:argv
-                                  initialPwd:initialPwd
+                                  initialPwd:initialPwd ?: NSHomeDirectory()
                                   newEnviron:newEnviron
                                         task:self
                                   completion:
@@ -923,49 +850,6 @@ static void HandleSigChld(int n) {
     }
 }
 
-#pragma mark Terminal Size
-
-- (void)rateLimitedSetSizeToDesiredSize {
-    DLog(@"%@", self.delegate);
-    if (_rateLimitedSetSizeToDesiredSizePending) {
-        DLog(@"Already have a pending size change");
-        return;
-    }
-
-    static const NSTimeInterval kDelayBetweenSizeChanges = 0.2;
-    if ([NSDate timeIntervalSinceReferenceDate] - _timeOfLastSizeChange < kDelayBetweenSizeChanges) {
-        // Avoid problems with signal coalescing of SIGWINCH preventing redraw for the second size
-        // change. For example, issue 5096 and 4494.
-        _rateLimitedSetSizeToDesiredSizePending = YES;
-        DLog(@" ** Rate limiting **");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDelayBetweenSizeChanges * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            DLog(@"Have waited %@ sec", @(kDelayBetweenSizeChanges));
-            self->_rateLimitedSetSizeToDesiredSizePending = NO;
-            [self setTerminalSizeToDesiredSize];
-        });
-    } else {
-        [self setTerminalSizeToDesiredSize];
-    }
-}
-
-- (void)setTerminalSizeToDesiredSize {
-    DLog(@"Set size of %@ from (%@x%@ cells, %@x%@px) to (%@x%@ cells, %@x%@ px)",
-         self.delegate,
-         @(_lastSize.cellSize.width),
-         @(_lastSize.cellSize.height),
-         @(_lastSize.pixelSize.width),
-         @(_lastSize.pixelSize.height),
-
-         @(_desiredSize.cellSize.width),
-         @(_desiredSize.cellSize.height),
-         @(_desiredSize.pixelSize.width),
-         @(_desiredSize.pixelSize.height));
-    _timeOfLastSizeChange = [NSDate timeIntervalSinceReferenceDate];
-    _lastSize = _desiredSize;
-
-    iTermSetTerminalSize(self.fd, _desiredSize);
-}
-
 #pragma mark - iTermLoggingHelper
 
 // NOTE: This can be called before the task is launched. It is not used when logging plain text.
@@ -979,3 +863,21 @@ static void HandleSigChld(int n) {
 
 @end
 
+@implementation PTYTask(WinSizeControllerDelegate)
+
+- (BOOL)winSizeControllerIsReady {
+    return self.fd != -1;
+}
+
+- (void)winSizeControllerSetGridSize:(VT100GridSize)gridSize
+                            viewSize:(NSSize)pointSize
+                         scaleFactor:(CGFloat)scaleFactor {
+    PTYTaskSize desiredSize = {
+        .cellSize = iTermTTYCellSizeMake(gridSize.width, gridSize.height),
+        .pixelSize = iTermTTYPixelSizeMake(pointSize.width * scaleFactor,
+                                           pointSize.height * scaleFactor)
+    };
+    iTermSetTerminalSize(self.fd, desiredSize);
+}
+
+@end

@@ -9,6 +9,7 @@
 
 #import "DebugLogging.h"
 #import "FileTransferManager.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermActionsMenuController.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermBackgroundCommandRunner.h"
@@ -21,6 +22,7 @@
 #import "iTermPreferences.h"
 #import "iTermScriptConsole.h"
 #import "iTermScriptHistory.h"
+#import "iTermSelection.h"
 #import "iTermShellIntegrationWindowController.h"
 #import "iTermSlowOperationGateway.h"
 #import "iTermSnippetsMenuController.h"
@@ -30,11 +32,13 @@
 #import "iTermURLActionFactory.h"
 #import "iTermURLStore.h"
 #import "iTermWebViewWrapperViewController.h"
+#import "NSArray+iTerm.h"
 #import "NSColor+iTerm.h"
 #import "NSData+iTerm.h"
 #import "NSDictionary+iTerm.h"
 #import "NSEvent+iTerm.h"
 #import "NSFileManager+iTerm.h"
+#import "NSMutableAttributedString+iTerm.h"
 #import "NSObject+iTerm.h"
 #import "NSSavePanel+iTerm.h"
 #import "NSStringITerm.h"
@@ -44,6 +48,8 @@
 #import "PTYNoteViewController.h"
 #import "PTYTextView+Private.h"
 #import "SCPPath.h"
+#import "SearchResult.h"
+#import "ToastWindowController.h"
 #import "URLAction.h"
 #import "VT100Terminal.h"
 
@@ -53,7 +59,8 @@ static const NSUInteger kDragPaneModifiers = (NSEventModifierFlagOption | NSEven
 static const NSUInteger kRectangularSelectionModifiers = (NSEventModifierFlagCommand | NSEventModifierFlagOption);
 static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelectionModifiers | NSEventModifierFlagControl);
 
-@interface PTYTextView (ARCPrivate)<iTermShellIntegrationWindowControllerDelegate>
+@interface PTYTextView (ARCPrivate)<iTermShellIntegrationWindowControllerDelegate,
+iTermCommandInfoViewControllerDelegate>
 @end
 
 
@@ -78,7 +85,42 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
         item.state = [self.delegate textViewTriggersAreEnabledInInteractiveApps] ? NSControlStateValueOn : NSControlStateValueOff;
         return YES;
     }
+    if (item.action == @selector(performFindPanelAction:) && item.tag == NSFindPanelActionSelectAll) {
+        return self.findOnPageHelper.searchResults.count > 0;
+    }
+    if (item.action == @selector(renderSelection:)) {
+        return [self.selection hasSelection] && self.selection.allSubSelections.count == 1 && !self.selection.live && ![self absRangeIntersectsPortholes:self.selection.spanningAbsRange];
+    }
+    if (item.action == @selector(sshDisconnect:)) {
+        NSString *name = [self.delegate textViewCurrentSSHSessionName];
+        if (name) {
+            item.title = [NSString stringWithFormat:@"Disconnect from %@", name];
+            return YES;
+        } else {
+            item.title = @"Disconnect";
+        }
+    }
+    if (item.action == @selector(performNaturalLanguageQuery:)) {
+        return [self.delegate textViewNaturalLanguageQuery] != nil;
+    }
     return NO;
+}
+
+#pragma mark - Actions
+
+- (IBAction)renderSelection:(id)sender {
+    VT100GridAbsCoordRange absRange = self.selection.spanningAbsRange;
+    [self.selection.allSubSelections[0] setAbsRange:VT100GridAbsWindowedRangeMake(absRange, 0, self.dataSource.width)];
+    [self renderRange:absRange type:nil filename:nil forceWide:NO];
+    [self.selection clearSelection];
+}
+
+- (IBAction)sshDisconnect:(id)sender {
+    [self.delegate textViewDisconnectSSH];
+}
+
+- (IBAction)performNaturalLanguageQuery:(id)sender {
+    [self.delegate textViewPerformNaturalLanguageQuery];
 }
 
 #pragma mark - Coordinate Space Conversions
@@ -168,14 +210,14 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
 
 #pragma mark - Query Coordinates
 
-- (iTermImageInfo *)imageInfoAtCoord:(VT100GridCoord)coord {
+- (id<iTermImageInfoReading>)imageInfoAtCoord:(VT100GridCoord)coord {
     if (coord.x < 0 ||
         coord.y < 0 ||
         coord.x >= [self.dataSource width] ||
         coord.y >= [self.dataSource numberOfLines]) {
         return nil;
     }
-    screen_char_t* theLine = [self.dataSource getLineAtIndex:coord.y];
+    const screen_char_t *theLine = [self.dataSource screenCharArrayForLine:coord.y].line;
     if (theLine && theLine[coord.x].image) {
         return GetImageInfo(theLine[coord.x].code);
     } else {
@@ -264,6 +306,8 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
 
     __weak __typeof(self) weakSelf = self;
     DLog(@"updateUnderlinedURLs in screen:\n%@", [self.dataSource compactLineDumpWithContinuationMarks]);
+    [self.lastUrlActionCanceler cancelOperation];
+    self.lastUrlActionCanceler =
     [_urlActionHelper urlActionForClickAtCoord:coord completion:^(URLAction *action) {
         [weakSelf finishUpdatingUnderlinesWithAction:action
                                                event:event];
@@ -295,13 +339,94 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
 #pragma mark - Context Menu
 
 - (NSMenu *)menuForEvent:(NSEvent *)event {
+    iTermOffscreenCommandLine *offscreenCommandLine = [self offscreenCommandLineForClickAt:event.locationInWindow];
+    if (offscreenCommandLine) {
+        return nil;
+    }
+    if ([_contextMenuHelper markForClick:event]) {
+        return nil;
+    }
+
     return [_contextMenuHelper menuForEvent:event];
+}
+
+#pragma mark - Offscreen Command Line
+
+- (iTermOffscreenCommandLine *)offscreenCommandLineForClickAt:(NSPoint)windowPoint {
+    iTermOffscreenCommandLine *offscreenCommandLine = self.drawingHelper.offscreenCommandLine;
+    if (offscreenCommandLine) {
+        NSRect rect =
+        [iTermTextDrawingHelper offscreenCommandLineFrameForVisibleRect:[self adjustedDocumentVisibleRect]
+                                                               cellSize:NSMakeSize(self.charWidth, self.lineHeight)
+                                                               gridSize:VT100GridSizeMake(self.dataSource.width,
+                                                                                          self.dataSource.height)];
+        const NSPoint viewPoint = [self convertPoint:windowPoint fromView:nil];
+        if (NSPointInRect(viewPoint, rect)) {
+            DLog(@"Cursor in OCL");
+            return offscreenCommandLine;
+        }
+        DLog(@"Cursor not in OCL at windowPoint %@, viewPoint %@", NSStringFromPoint(windowPoint), NSStringFromPoint(viewPoint));
+    }
+    return nil;
+}
+
+- (void)presentCommandInfoForOffscreenCommandLine:(iTermOffscreenCommandLine *)offscreenCommandLine
+                                            event:(NSEvent *)event {
+    [self presentCommandInfoForMark:offscreenCommandLine.mark
+                 absoluteLineNumber:offscreenCommandLine.absoluteLineNumber
+                               date:offscreenCommandLine.date
+                              event:event];
+}
+
+- (void)presentCommandInfoForMark:(id<VT100ScreenMarkReading>)mark
+               absoluteLineNumber:(long long)absoluteLineNumber
+                             date:(NSDate *)date
+                            event:(NSEvent *)event {
+    [self presentCommandInfoForMark:mark absoluteLineNumber:absoluteLineNumber date:date point:event.locationInWindow];
+}
+
+// Point is in window coords
+- (void)presentCommandInfoForMark:(id<VT100ScreenMarkReading>)mark
+               absoluteLineNumber:(long long)absoluteLineNumber
+                             date:(NSDate *)date
+                            point:(NSPoint)windowPoint {
+    long long overflow = self.dataSource.totalScrollbackOverflow;
+    const int line = absoluteLineNumber - overflow;
+    const VT100GridCoordRange coordRange = [self.dataSource textViewRangeOfOutputForCommandMark:mark];
+    const VT100GridRange lineRange = VT100GridRangeMake(coordRange.start.y, coordRange.end.y - coordRange.start.y + 1);
+    NSString *directory = [self.dataSource workingDirectoryOnLine:line];
+    const NSPoint point = [self convertPoint:windowPoint
+                                    fromView:nil];
+    iTermSelection *selection = [[iTermSelection alloc] init];
+    selection.delegate = self;
+    [selection beginSelectionAtAbsCoord:VT100GridAbsCoordMake(0, coordRange.start.y + overflow)
+                                   mode:kiTermSelectionModeLine
+                                 resume:NO
+                                 append:NO];
+    [selection moveSelectionEndpointTo:VT100GridAbsCoordMake(0, coordRange.end.y + overflow - 1)];
+    [selection endLiveSelection];
+    iTermProgress *outputProgress = [[iTermProgress alloc] init];
+    iTermRenegablePromise<NSString *> *outputPromise = [self promisedStringForSelectedTextCappedAtSize:INT_MAX
+                                                                                     minimumLineNumber:0
+                                                                                            timestamps:NO
+                                                                                             selection:selection
+                                                                                              progress:outputProgress];
+    [iTermCommandInfoViewController presentMark:mark
+                                           date:date
+                                      directory:directory
+                                     outputSize:[self.dataSource numberOfCellsUsedInRange:lineRange]
+                                  outputPromise:outputPromise
+                                 outputProgress:outputProgress
+                                         inView:self
+                                             at:point
+                                       delegate:self];
 }
 
 #pragma mark - Mouse Cursor
 
 - (BOOL)updateCursor:(NSEvent *)event action:(URLAction *)action {
     NSString *hover = nil;
+    VT100GridWindowedRange anchorRange = VT100GridWindowedRangeMake(VT100GridCoordRangeMake(-1, -1, -1, -1), -1, -1);
     BOOL changed = NO;
     if (([event it_modifierFlags] & kDragPaneModifiers) == kDragPaneModifiers) {
         changed = [self setCursor:[NSCursor openHandCursor]];
@@ -312,19 +437,22 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
         changed = [self setCursor:[NSCursor pointingHandCursor]];
         if (action.hover && action.string.length) {
             hover = action.string;
+            anchorRange = action.range;
         }
     } else if ([self mouseIsOverImageInEvent:event]) {
         changed = [self setCursor:[NSCursor arrowCursor]];
     } else if ([_mouseHandler mouseReportingAllowedForEvent:event] &&
                [_mouseHandler terminalWantsMouseReports]) {
         changed = [self setCursor:[iTermMouseCursor mouseCursorOfType:iTermMouseCursorTypeIBeamWithCircle]];
+    } else if ([self contextMenu:_contextMenuHelper offscreenCommandLineForClickAt:event.locationInWindow]) {
+        changed = [self setCursor:[NSCursor arrowCursor]];
     } else {
         changed = [self setCursor:[iTermMouseCursor mouseCursorOfType:iTermMouseCursorTypeIBeam]];
     }
     if (changed) {
         [self.enclosingScrollView setDocumentCursor:cursor_];
     }
-    return [self.delegate textViewShowHoverURL:hover];
+    return [self.delegate textViewShowHoverURL:hover anchor:anchorRange];
 }
 
 - (BOOL)setCursor:(NSCursor *)cursor {
@@ -382,7 +510,7 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
                 break;
             }
             url = [NSURL URLWithUserSuppliedString:urlAction.string];
-            if (![@[ @"http", @"https" ] containsObject:url.scheme]) {
+            if (![[self allowedQuickLookURLSchemes] containsObject:url.scheme]) {
                 return;
             }
             if (url && [self showWebkitPopoverAtPoint:event.locationInWindow url:url]) {
@@ -420,8 +548,9 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     NSAttributedString *word = [extractor contentInRange:range
                                        attributeProvider:^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
         return [self charAttributes:theChar
-                 externalAttributes:ea];
-                                       }
+                 externalAttributes:ea
+                          processed:NO];
+    }
                                               nullPolicy:kiTermTextExtractorNullPolicyMidlineAsSpaceIgnoreTerminal
                                                      pad:NO
                                       includeLastNewline:NO
@@ -476,7 +605,9 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
 #pragma mark - Copy to Pasteboard
 
 // Returns a dictionary to pass to NSAttributedString.
-- (NSDictionary *)charAttributes:(screen_char_t)c externalAttributes:(iTermExternalAttribute *)ea {
+- (NSDictionary *)charAttributes:(screen_char_t)c
+              externalAttributes:(iTermExternalAttribute *)ea
+                       processed:(BOOL)processed {
     BOOL isBold = c.bold;
     BOOL isFaint = c.faint;
     NSColor *fgColor;
@@ -491,22 +622,29 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
         fgColor = bgColor;
     } else {
         fgColor = [self colorForCode:c.foregroundColor
-                                        green:c.fgGreen
-                                         blue:c.fgBlue
-                                    colorMode:c.foregroundColorMode
-                                         bold:isBold
-                                        faint:isFaint
-                                 isBackground:NO];
+                               green:c.fgGreen
+                                blue:c.fgBlue
+                           colorMode:c.foregroundColorMode
+                                bold:isBold
+                               faint:isFaint
+                        isBackground:NO];
+    }
+    if (processed) {
+        fgColor = [self.colorMap processedTextColorForTextColor:fgColor overBackgroundColor:bgColor disableMinimumContrast:NO];
+        bgColor = [self.colorMap processedBackgroundColorForBackgroundColor:bgColor];
+    }
+    if (!c.invisible) {
         fgColor = [fgColor colorByPremultiplyingAlphaWithColor:bgColor];
     }
-
     int underlineStyle = (ea.urlCode || c.underline) ? (NSUnderlineStyleSingle | NSUnderlineByWord) : 0;
 
     BOOL isItalic = c.italic;
+    UTF32Char remapped = 0;
     PTYFontInfo *fontInfo = [self getFontForChar:c.code
                                        isComplex:c.complexChar
                                       renderBold:&isBold
-                                    renderItalic:&isItalic];
+                                    renderItalic:&isItalic
+                                        remapped:&remapped];
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.lineBreakMode = NSLineBreakByCharWrapping;
 
@@ -544,6 +682,10 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
         attributes = [attributes dictionaryBySettingObject:color
                                                     forKey:NSUnderlineColorAttributeName];
     }
+    if (remapped) {
+        attributes = [attributes dictionaryBySettingObject:@(remapped)
+                                                    forKey:iTermReplacementBaseCharacterAttributeName];
+    }
     if ([iTermAdvancedSettingsModel excludeBackgroundColorsFromCopiedStyle]) {
         attributes = [attributes dictionaryByRemovingObjectForKey:NSBackgroundColorAttributeName];
     }
@@ -568,14 +710,215 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     _indicatorMessagePopoverViewController.textView.font = [NSFont systemFontOfSize:[NSFont systemFontSize]];
     _indicatorMessagePopoverViewController.textView.drawsBackground = NO;
     [_indicatorMessagePopoverViewController appendString:message];
+    const NSRect textViewFrame = [_indicatorMessagePopoverViewController.view convertRect:_indicatorMessagePopoverViewController.textView.bounds
+                                                                                 fromView:_indicatorMessagePopoverViewController.textView];
+    const CGFloat horizontalInsets = NSWidth(_indicatorMessagePopoverViewController.view.bounds) - NSWidth(textViewFrame);
+    const CGFloat verticalInsets = NSHeight(_indicatorMessagePopoverViewController.view.bounds) - NSHeight(textViewFrame);
+
     NSRect frame = _indicatorMessagePopoverViewController.view.frame;
     frame.size.width = 200;
-    frame.size.height = 50;
+    frame.size.height = [_indicatorMessagePopoverViewController.textView.attributedString heightForWidth:frame.size.width - horizontalInsets] + verticalInsets;
+    
     _indicatorMessagePopoverViewController.view.frame = frame;
     [_indicatorMessagePopoverViewController.popover showRelativeToRect:NSMakeRect(point.x, point.y, 1, 1)
                                                                 ofView:self.enclosingScrollView
                                                          preferredEdge:NSRectEdgeMaxY];
 }
+
+#pragma mark - Selected Text
+
+- (iTermPromise<NSString *> *)recordSelection:(iTermSelection *)selection {
+    const NSInteger maxSize = 10 * 1000 * 1000;
+    DLog(@"Renege on last selection promise");
+    // No need to keep working on the last one; if it hasn't been waited on then it'll never be used.
+    [[[iTermController sharedInstance] lastSelectionPromise] renege];
+
+    iTermRenegablePromise<NSString *> *promise = [self promisedStringForSelectedTextCappedAtSize:maxSize
+                                                                               minimumLineNumber:0
+                                                                                      timestamps:NO
+                                                                                       selection:selection
+                                                                                        progress:nil];
+    if (promise) {
+        [[iTermController sharedInstance] setLastSelectionPromise:promise];
+    }
+    return promise;
+}
+
+- (BOOL)selectionIsBig {
+    return [self selectionIsBig:self.selection];
+}
+
+- (BOOL)selectionIsBig:(iTermSelection *)selection {
+    return selection.approximateNumberOfLines > 1000;
+}
+
+
+- (iTermSelectionExtractorOptions)commonSelectionOptions {
+    iTermSelectionExtractorOptions options = 0;
+    const BOOL copyLastNewline = [iTermPreferences boolForKey:kPreferenceKeyCopyLastNewline];
+    if (copyLastNewline) {
+        options |= iTermSelectionExtractorOptionsCopyLastNewline;
+    }
+    const BOOL trimWhitespace = [iTermAdvancedSettingsModel trimWhitespaceOnCopy];
+    if (trimWhitespace) {
+        options |= iTermSelectionExtractorOptionsTrimWhitespace;
+    }
+    if (self.useCustomBoldColor) {
+        options |= iTermSelectionExtractorOptionsUseCustomBoldColor;
+    }
+    if (self.brightenBold) {
+        options |= iTermSelectionExtractorOptionsBrightenBold;
+    }
+    return options;
+}
+
+- (iTermRenegablePromise<NSString *> *)promisedStringForSelectedTextCappedAtSize:(int)maxBytes
+                                                               minimumLineNumber:(int)minimumLineNumber
+                                                                      timestamps:(BOOL)timestamps
+                                                                       selection:(iTermSelection *)selection
+                                                                        progress:(iTermProgress *)outputProgress {
+    iTermStringSelectionExtractor *extractor =
+    [[iTermStringSelectionExtractor alloc] initWithSelection:selection
+                                                    snapshot:[self.dataSource snapshotDataSource]
+                                                     options:[self commonSelectionOptions]
+                                                    maxBytes:maxBytes
+                                           minimumLineNumber:minimumLineNumber];
+    extractor.progress = outputProgress;
+    extractor.addTimestamps = timestamps;
+    return [iTermSelectionPromise string:extractor
+                              allowEmpty:![iTermAdvancedSettingsModel disallowCopyEmptyString]];
+}
+
+- (iTermRenegablePromise<NSString *> *)promisedSGRStringForSelectedTextCappedAtSize:(int)maxBytes
+                                                                  minimumLineNumber:(int)minimumLineNumber
+                                                                         timestamps:(BOOL)timestamps
+                                                                          selection:(iTermSelection *)selection {
+    iTermSGRSelectionExtractor *extractor =
+    [[iTermSGRSelectionExtractor alloc] initWithSelection:selection
+                                                 snapshot:[self.dataSource snapshotDataSource]
+                                                  options:[self commonSelectionOptions]
+                                                 maxBytes:maxBytes
+                                        minimumLineNumber:minimumLineNumber];
+    extractor.addTimestamps = timestamps;
+    return [iTermSelectionPromise string:extractor
+                              allowEmpty:![iTermAdvancedSettingsModel disallowCopyEmptyString]];
+}
+
+- (iTermRenegablePromise<NSAttributedString *> *)promisedAttributedStringForSelectedTextCappedAtSize:(int)maxBytes
+                                                                                   minimumLineNumber:(int)minimumLineNumber
+                                                                                          timestamps:(BOOL)timestamps
+                                                                                           selection:(iTermSelection *)selection {
+    iTermCharacterAttributesProvider *provider =
+    [[iTermCharacterAttributesProvider alloc] initWithColorMap:self.colorMap
+                                            useCustomBoldColor:self.useCustomBoldColor
+                                                  brightenBold:self.brightenBold
+                                                   useBoldFont:self.useBoldFont
+                                                 useItalicFont:self.useItalicFont
+                                               useNonAsciiFont:self.useNonAsciiFont
+                                           copyBackgroundColor:[iTermAdvancedSettingsModel copyBackgroundColor]
+                        excludeBackgroundColorsFromCopiedStyle:[iTermAdvancedSettingsModel excludeBackgroundColorsFromCopiedStyle]
+                                                     fontTable:self.fontTable];
+
+    iTermAttributedStringSelectionExtractor *extractor =
+    [[iTermAttributedStringSelectionExtractor alloc] initWithSelection:selection
+                                                              snapshot:[self.dataSource snapshotDataSource]
+                                                               options:[self commonSelectionOptions]
+                                                              maxBytes:maxBytes
+                                                     minimumLineNumber:minimumLineNumber];
+    extractor.addTimestamps = timestamps;
+    return [iTermSelectionPromise attributedString:extractor
+                       characterAttributesProvider:provider
+                                        allowEmpty:![iTermAdvancedSettingsModel disallowCopyEmptyString]];
+}
+
+- (void)asynchronouslyVendSelectedTextWithStyle:(iTermCopyTextStyle)style
+                                   cappedAtSize:(int)maxBytes
+                              minimumLineNumber:(int)minimumLineNumber
+                                      selection:(iTermSelection *)selection {
+    iTermRenegablePromise *promise = nil;
+    NSPasteboardType type = NSPasteboardTypeString;
+    switch (style) {
+        case iTermCopyTextStyleAttributed:
+            promise = [self promisedAttributedStringForSelectedTextCappedAtSize:maxBytes
+                                                              minimumLineNumber:minimumLineNumber
+                                                                     timestamps:NO
+                                                                      selection:selection];
+            type = NSPasteboardTypeRTF;
+            break;
+
+        case iTermCopyTextStylePlainText:
+            promise = [self promisedStringForSelectedTextCappedAtSize:maxBytes
+                                                    minimumLineNumber:minimumLineNumber
+                                                           timestamps:NO
+                                                            selection:selection
+                                                             progress:nil];
+            type = NSPasteboardTypeString;
+            break;
+
+        case iTermCopyTextStyleWithControlSequences:
+            promise = [self promisedSGRStringForSelectedTextCappedAtSize:maxBytes
+                                                       minimumLineNumber:minimumLineNumber
+                                                              timestamps:NO
+                                                               selection:selection];
+            type = NSPasteboardTypeString;
+            break;
+    }
+    if (promise) {
+        [iTermAsyncSelectionProvider copyPromise:promise type:type];
+    }
+}
+
+- (id)selectedTextWithStyle:(iTermCopyTextStyle)style
+               cappedAtSize:(int)maxBytes
+          minimumLineNumber:(int)minimumLineNumber
+                 timestamps:(BOOL)timestamps
+                  selection:(iTermSelection *)selection {
+    if (@available(macOS 11.0, *)) {
+        [[iTermAsyncSelectionProvider currentProvider] cancel];
+    }
+    switch (style) {
+        case iTermCopyTextStyleAttributed:
+            return [[self promisedAttributedStringForSelectedTextCappedAtSize:maxBytes
+                                                            minimumLineNumber:minimumLineNumber
+                                                                   timestamps:timestamps
+                                                                    selection:selection] wait].maybeFirst;
+
+        case iTermCopyTextStylePlainText:
+            return [[self promisedStringForSelectedTextCappedAtSize:maxBytes
+                                                  minimumLineNumber:minimumLineNumber
+                                                         timestamps:timestamps
+                                                          selection:selection
+                                                           progress:nil] wait].maybeFirst;
+
+        case iTermCopyTextStyleWithControlSequences:
+            return [[self promisedSGRStringForSelectedTextCappedAtSize:maxBytes
+                                                     minimumLineNumber:minimumLineNumber
+                                                            timestamps:timestamps
+                                                             selection:selection] wait].maybeFirst;
+    }
+}
+
+- (NSString *)selectedTextCappedAtSize:(int)maxBytes
+                     minimumLineNumber:(int)minimumLineNumber {
+    return [self selectedTextWithStyle:iTermCopyTextStylePlainText
+                          cappedAtSize:maxBytes
+                     minimumLineNumber:minimumLineNumber
+                            timestamps:NO
+                             selection:self.selection];
+}
+
+- (NSAttributedString *)selectedAttributedTextWithPad:(BOOL)pad {
+    return [self selectedAttributedTextWithPad:pad selection:self.selection];
+}
+
+- (NSAttributedString *)selectedAttributedTextWithPad:(BOOL)pad selection:(iTermSelection *)selection {
+    return [self selectedTextWithStyle:iTermCopyTextStyleAttributed
+                          cappedAtSize:0
+                     minimumLineNumber:0
+                            timestamps:NO
+                             selection:selection];
+}
+
 
 #pragma mark - iTermURLActionHelperDelegate
 
@@ -583,7 +926,7 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     return [self.delegate textViewInInteractiveApplication];
 }
 
-- (iTermImageInfo *)urlActionHelper:(iTermURLActionHelper *)helper imageInfoAt:(VT100GridCoord)coord {
+- (id<iTermImageInfoReading>)urlActionHelper:(iTermURLActionHelper *)helper imageInfoAt:(VT100GridCoord)coord {
     return [self imageInfoAtCoord:coord];
 }
 
@@ -628,7 +971,7 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     return self.dataSource.totalScrollbackOverflow;
 }
 
-- (VT100RemoteHost *)urlActionHelper:(iTermURLActionHelper *)helper remoteHostOnLine:(int)y {
+- (id<VT100RemoteHostReading>)urlActionHelper:(iTermURLActionHelper *)helper remoteHostOnLine:(int)y {
     return [self.dataSource remoteHostOnLine:y];
 }
 
@@ -653,7 +996,7 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     NSColor *textColor = [self.colorMap processedTextColorForTextColor:[self.colorMap colorForKey:kColorMapSelectedText]
                                                    overBackgroundColor:backgroundColor
                                                 disableMinimumContrast:NO];
-    NSFont *font = self.primaryFont.font;
+    NSFont *font = self.fontTable.asciiFont.font;
     NSDictionary *attributes = @{ NSForegroundColorAttributeName: textColor,
                                   NSBackgroundColorAttributeName: backgroundColor,
                                   NSFontAttributeName: font };
@@ -685,6 +1028,10 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
 
 - (iTermVariableScope *)urlActionHelperScope:(iTermURLActionHelper *)helper {
     return [self.delegate textViewVariablesScope];
+}
+
+- (id<iTermObject>)urlActionHelperOwner:(iTermURLActionHelper *)helper {
+    return self.delegate;
 }
 
 - (void)urlActionHelperCopySelectionIfNeeded:(iTermURLActionHelper *)helper {
@@ -746,18 +1093,18 @@ static const NSUInteger kRectangularSelectionModifierMask = (kRectangularSelecti
     }
 }
 
-- (BOOL)missingImageIsVisible:(iTermImageInfo *)image {
+- (BOOL)missingImageIsVisible:(id<iTermImageInfoReading>)image {
     if (![self.drawingHelper.missingImages containsObject:image.uniqueIdentifier]) {
         return NO;
     }
     return [self imageIsVisible:image];
 }
 
-- (BOOL)imageIsVisible:(iTermImageInfo *)image {
+- (BOOL)imageIsVisible:(id<iTermImageInfoReading>)image {
     int firstVisibleLine = [[self enclosingScrollView] documentVisibleRect].origin.y / self.lineHeight;
     int width = [self.dataSource width];
     for (int y = 0; y < [self.dataSource height]; y++) {
-        screen_char_t *theLine = [self.dataSource getLineAtIndex:y + firstVisibleLine];
+        const screen_char_t *theLine = [self.dataSource screenCharArrayForLine:y + firstVisibleLine].line;
         for (int x = 0; x < width; x++) {
             if (theLine && theLine[x].image && GetImageInfo(theLine[x].code) == image) {
                 return YES;
@@ -780,8 +1127,13 @@ allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
     return [self selectedTextCappedAtSize:maxBytes];
 }
 
-- (VT100ScreenMark *)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
-                      markOnLine:(int)line {
+- (iTermOffscreenCommandLine *)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+            offscreenCommandLineForClickAt:(NSPoint)windowPoint {
+    return [self offscreenCommandLineForClickAt:windowPoint];
+}
+
+- (id<VT100ScreenMarkReading>)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+                               markOnLine:(int)line {
     return [self.dataSource markOnLine:line];
 }
 
@@ -790,8 +1142,8 @@ allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
     return [self.dataSource workingDirectoryOnLine:line];
 }
 
-- (nullable iTermImageInfo *)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
-                        imageInfoAtCoord:(VT100GridCoord)coord {
+- (nullable id<iTermImageInfoReading>)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+                                 imageInfoAtCoord:(VT100GridCoord)coord {
     return [self imageInfoAtCoord:coord];
 }
 
@@ -872,7 +1224,8 @@ allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
 
 - (BOOL)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
 hasOpenAnnotationInRange:(VT100GridCoordRange)coordRange {
-    for (PTYNoteViewController *note in [self.dataSource notesInRange:coordRange]) {
+    for (id<PTYAnnotationReading> annotation in [self.dataSource annotationsInRange:coordRange]) {
+        PTYNoteViewController *note = (PTYNoteViewController *)annotation.delegate;
         if (note.isNoteHidden) {
             return YES;
         }
@@ -880,11 +1233,15 @@ hasOpenAnnotationInRange:(VT100GridCoordRange)coordRange {
     return NO;
 }
 
-- (void)contextMenuRevealAnnotations:(iTermTextViewContextMenuHelper *)contextMenu at:(VT100GridCoord)coord {
-    for (PTYNoteViewController *note in [self.dataSource notesInRange:VT100GridCoordRangeMake(coord.x,
-                                                                                              coord.y,
-                                                                                              coord.x + 1,
-                                                                                              coord.y)]) {
+- (void)contextMenuRevealAnnotations:(iTermTextViewContextMenuHelper *)contextMenu
+                                  at:(VT100GridCoord)coord {
+    const VT100GridCoordRange coordRange =
+        VT100GridCoordRangeMake(coord.x,
+                                coord.y,
+                                coord.x + 1,
+                                coord.y);
+    for (id<PTYAnnotationReading> annotation in [self.dataSource annotationsInRange:coordRange]) {
+        PTYNoteViewController *note = (PTYNoteViewController *)annotation.delegate;
         [note setNoteHidden:NO];
     }
 }
@@ -948,7 +1305,7 @@ hasOpenAnnotationInRange:(VT100GridCoordRange)coordRange {
     return self.smartSelectionRules;
 }
 
-- (VT100RemoteHost *)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu remoteHostOnLine:(int)line {
+- (id<VT100RemoteHostReading>)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu remoteHostOnLine:(int)line {
     return [self.dataSource remoteHostOnLine:line];
 }
 
@@ -956,12 +1313,12 @@ hasOpenAnnotationInRange:(VT100GridCoordRange)coordRange {
     [self.delegate insertText:text];
 }
 
-- (BOOL)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu hasOutputForCommandMark:(VT100ScreenMark *)commandMark {
+- (BOOL)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu hasOutputForCommandMark:(id<VT100ScreenMarkReading>)commandMark {
     return [self.dataSource textViewRangeOfOutputForCommandMark:commandMark].start.x != -1;
 }
 
 - (VT100GridCoordRange)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
-       rangeOfOutputForCommandMark:(VT100ScreenMark *)mark {
+       rangeOfOutputForCommandMark:(id<VT100ScreenMarkReading>)mark {
     return [self.dataSource textViewRangeOfOutputForCommandMark:mark];
 }
 
@@ -970,8 +1327,31 @@ hasOpenAnnotationInRange:(VT100GridCoordRange)coordRange {
 }
 
 - (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+copyRangeAccordingToUserPreferences:(VT100GridWindowedRange)range {
+    iTermSelection *selection = [[iTermSelection alloc] init];
+    VT100GridAbsWindowedRange absRange = VT100GridAbsWindowedRangeFromRelative(range,
+                                                                               self.dataSource.totalScrollbackOverflow);
+    iTermSubSelection *sub = [iTermSubSelection subSelectionWithAbsRange:absRange
+                                                                    mode:kiTermSelectionModeCharacter
+                                                                   width:self.dataSource.width];
+    selection.delegate = self;
+    [selection addSubSelection:sub];
+    if ([iTermAdvancedSettingsModel copyWithStylesByDefault]) {
+        [self copySelectionWithStyles:selection];
+    } else {
+        [self copySelection:selection];
+    }
+}
+
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
                copy:(NSString *)string {
-    [self copyString:string];
+    const BOOL copied = [self copyString:string];
+    if (copied) {
+        [ToastWindowController showToastWithMessage:@"Copied"
+                                           duration:1.5
+                                   screenCoordinate:[NSEvent mouseLocation]
+                                          pointSize:12];
+    }
 }
 
 - (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
@@ -1021,7 +1401,8 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
 
 }
 
-- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu saveImage:(iTermImageInfo *)imageInfo {
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+          saveImage:(id<iTermImageInfoReading>)imageInfo {
     NSSavePanel* panel = [NSSavePanel savePanel];
 
     NSString *directory = [[NSFileManager defaultManager] downloadsDirectory] ?: NSHomeDirectory();
@@ -1038,7 +1419,8 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
     }
 }
 
-- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu copyImage:(iTermImageInfo *)imageInfo {
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu copyImage:(
+                                                                             id<iTermImageInfoReading>)imageInfo {
     NSPasteboard *pboard = [NSPasteboard generalPasteboard];
     NSPasteboardItem *item = imageInfo.pasteboardItem;
     if (item) {
@@ -1048,14 +1430,16 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
 }
 
 
-- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu openImage:(iTermImageInfo *)imageInfo {
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+          openImage:(id<iTermImageInfoReading>)imageInfo {
     NSString *name = imageInfo.nameForNewSavedTempFile;
     if (name) {
         [[iTermLaunchServices sharedInstance] openFile:name];
     }
 }
 
-- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu inspectImage:(iTermImageInfo *)imageInfo {
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+       inspectImage:(id<iTermImageInfoReading>)imageInfo {
     if (imageInfo) {
         NSString *text = [NSString stringWithFormat:
                           @"Filename: %@\n"
@@ -1072,7 +1456,8 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
     }
 }
 
-- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu toggleAnimationOfImage:(iTermImageInfo *)imageInfo {
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     if (imageInfo) {
         imageInfo.paused = !imageInfo.paused;
         if (!imageInfo.paused) {
@@ -1108,6 +1493,50 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
     [self.delegate textViewAddTrigger:text];
 }
 
+- (id<iTermObject>)contextMenuOwner:(iTermTextViewContextMenuHelper *)contextMenu {
+    return self.delegate;
+}
+
+- (BOOL)contextMenuSmartSelectionActionsShouldUseInterpolatedStrings:(iTermTextViewContextMenuHelper *)contextMenu {
+    return [self.delegate textViewSmartSelectionActionsShouldUseInterpolatedStrings];
+}
+
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu showCommandInfoForMark:(id<VT100ScreenMarkReading>)mark {
+    if (!mark.startDate) {
+        return;
+    }
+    const VT100GridCoordRange range = [self.dataSource coordRangeOfAnnotation:mark];
+    const long long offset = [self.dataSource totalScrollbackOverflow];
+    const VT100GridAbsCoordRange absRange = VT100GridAbsCoordRangeFromCoordRange(range, offset);
+    const NSRect frame = [self rectForAbsCoord:absRange.start];
+    const NSPoint localPoint = NSMakePoint(NSMidX(frame), NSMidY(frame));
+    const NSPoint windowPoint = [self convertPoint:localPoint toView:nil];
+    [self presentCommandInfoForMark:mark
+                 absoluteLineNumber:absRange.start.y
+                               date:mark.startDate
+                              point:windowPoint];
+}
+
+- (void)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+    removeNamedMark:(id<VT100ScreenMarkReading>)mark {
+    [self.dataSource removeNamedMark:mark];
+}
+
+- (NSArray<NSString *> *)allowedQuickLookURLSchemes {
+    return @[ @"http", @"https" ];
+}
+
+- (BOOL)contextMenu:(iTermTextViewContextMenuHelper *)contextMenu
+    canQuickLookURL:(NSURL *)url {
+    return [[self allowedQuickLookURLSchemes] containsObject:url.scheme];
+}
+
+- (void)contextMenuHandleQuickLook:(iTermTextViewContextMenuHelper *)contextMenu
+                         url:(NSURL *)url
+                  windowCoordinate:(NSPoint)windowCoordinate {
+    [self showWebkitPopoverAtPoint:windowCoordinate url:url];
+}
+
 #pragma mark - NSResponder Additions
 
 - (void)sendSnippet:(id)sender {
@@ -1136,6 +1565,216 @@ toggleTerminalStateForMenuItem:(nonnull NSMenuItem *)item {
 
 - (IBAction)toggleEnableTriggersInInteractiveApps:(id)sender {
     [self.delegate textViewToggleEnableTriggersInInteractiveApps];
+}
+
+#pragma mark - Find on Page
+
+- (void)convertMatchesToSelections {
+    [self.selection endLiveSelection];
+    [self.selection clearSelection];
+    const int width = [self.dataSource width];
+
+    NSArray<iTermSubSelection *> *subs = [self.findOnPageHelper.searchResults.array mapWithBlock:^id(SearchResult *result) {
+        if (result.isExternal) {
+            [self selectExternalSearchResult:result.externalResult multiple:YES scroll:NO];
+            return nil;
+        } else {
+            const VT100GridAbsWindowedRange range  =
+            VT100GridAbsWindowedRangeMake(result.internalAbsCoordRange, 0, 0);
+            iTermSubSelection *sub = [iTermSubSelection subSelectionWithAbsRange:range
+                                                                            mode:kiTermSelectionModeCharacter
+                                                                           width:width];
+            return sub;
+        }
+    }];
+    if (!subs.count) {
+        return;
+    }
+    [self.selection addSubSelections:subs];
+    [self.window makeFirstResponder:self];
+}
+
+#pragma mark - Tracking Child Windows
+
+- (void)trackChildWindow:(id<PTYTrackingChildWindow>)window {
+    if (_trackingChildWindows.count == 0) {
+        // In case we're in metal and this is out of date.
+        _lastVirtualOffset = [self virtualOffset];
+    }
+    [_trackingChildWindows addObject:window];
+    __weak __typeof(self) weakSelf = self;
+    __weak __typeof(window) weakWindow = window;
+    window.requestRemoval = ^{
+        [weakSelf stopTrackingChildWindow:weakWindow];
+    };
+}
+
+- (void)stopTrackingChildWindow:(id<PTYTrackingChildWindow>)window {
+    if (!window) {
+        return;
+    }
+    [_trackingChildWindows removeObject:window];
+}
+
+- (void)shiftTrackingChildWindows {
+    const CGFloat virtualOffset = [self virtualOffset];
+    const CGFloat delta = virtualOffset - _lastVirtualOffset;
+    _lastVirtualOffset = virtualOffset;
+    [_trackingChildWindows enumerateObjectsUsingBlock:^(id<PTYTrackingChildWindow> child, NSUInteger idx, BOOL * _Nonnull stop) {
+        [child shiftVertically:delta];
+    }];
+}
+
+#pragma mark - Content Navigation
+
+- (ContentNavigationShortcutView *)addShortcutWithRange:(VT100GridAbsCoordRange)range
+                                          keyEquivalent:(NSString *)keyEquivalent
+                                                 action:(void (^)(id<iTermContentNavigationShortcutView>))action {
+    if (!self.contentNavigationShortcuts) {
+        self.contentNavigationShortcuts = [NSMutableArray array];
+    }
+    iTermContentNavigationShortcut *shortcut = [[iTermContentNavigationShortcut alloc] initWithRange:range
+                                                                                       keyEquivalent:keyEquivalent
+                                                                                              action:action];
+    [self.contentNavigationShortcuts addObject:shortcut];
+    return [self addViewForContentNavigationShortcut:shortcut];
+}
+
+- (NSRect)rectForAbsCoord:(VT100GridAbsCoord)coord {
+    BOOL ok;
+    VT100GridCoord relative = VT100GridCoordFromAbsCoord(coord, self.dataSource.totalScrollbackOverflow, &ok);
+    if (!ok) {
+        return NSZeroRect;
+    }
+    return [self rectForCoord:relative];
+}
+
+- (ContentNavigationShortcutView *)addViewForContentNavigationShortcut:(iTermContentNavigationShortcut *)shortcut
+                                                          {
+    const NSRect rect = NSUnionRect([self rectForAbsCoord:shortcut.range.start],
+                                    [self rectForAbsCoord:shortcut.range.end]);
+    ContentNavigationShortcutView *view = [[ContentNavigationShortcutView alloc] initWithShortcut:shortcut
+                                                                                           target:rect];
+    shortcut.view = view;
+    const NSSize size = view.bounds.size;
+    view.frame = NSMakeRect(MAX(0, rect.origin.x - size.width / 2),
+                            MAX(0, rect.origin.y - size.height / 2),
+                            size.width,
+                            size.height);
+    [self refresh];
+    [self addSubview:view];
+    [self setNeedsDisplay:YES];
+    [self updateAlphaValue];
+    [[NSNotificationCenter defaultCenter] postNotificationName:iTermAnnotationVisibilityDidChange object:nil];
+    [view animateIn];
+    return view;
+}
+
+- (void)removeContentNavigationShortcuts {
+    if (!self.contentNavigationShortcuts.count) {
+        return;
+    }
+    __weak __typeof(self) weakSelf = self;
+    for (iTermContentNavigationShortcut *shortcut in self.contentNavigationShortcuts) {
+        if (!shortcut.view.terminating) {
+            [shortcut.view dissolveWithCompletion:^{
+                [weakSelf removeContentNavigationShortcutView:shortcut.view];
+            }];
+        }
+    }
+}
+
+- (void)removeContentNavigationShortcutView:(id<iTermContentNavigationShortcutView>)view {
+    [self.contentNavigationShortcuts removeObjectsPassingTest:^BOOL(iTermContentNavigationShortcut *anObject) {
+        return anObject.view == view;
+    }];
+    [[NSView castFrom:view] removeFromSuperview];
+    [self refresh];
+    [self setNeedsDisplay:YES];
+    [self updateAlphaValue];
+    [[NSNotificationCenter defaultCenter] postNotificationName:iTermAnnotationVisibilityDidChange object:nil];
+}
+
+- (void)convertVisibleSearchResultsToContentNavigationShortcuts {
+    [self removeContentNavigationShortcuts];
+    const VT100GridRange relativeRange = [self rangeOfVisibleLines];
+    const NSRange range = NSMakeRange(relativeRange.location + self.dataSource.totalScrollbackOverflow,
+                                      relativeRange.length);
+    __weak __typeof(self) weakSelf = self;
+    iTermTextExtractor *extractor = [iTermTextExtractor textExtractorWithDataSource:self.dataSource];
+    ContentNavigationShortcutLayerOuter *layerOuter = [[ContentNavigationShortcutLayerOuter alloc] init];
+    NSMutableArray<SearchResult *> *results = [NSMutableArray array];
+    [self.findOnPageHelper enumerateSearchResultsInRangeOfLines:range
+                                                          block:^(SearchResult *result) {
+        [results addObject:result];
+    }];
+    if (results.count == 0) {
+        return;
+    }
+    [results sortUsingComparator:^NSComparisonResult(SearchResult *lhs, SearchResult *rhs) {
+        if (lhs.internalAbsStartY == rhs.internalAbsStartY) {
+            return [@(lhs.internalStartX) compare:@(rhs.internalStartX)];
+        }
+        return [@(lhs.internalAbsStartY) compare:@(rhs.internalAbsStartY)];
+    }];
+    NSInteger i = 0;
+    for (SearchResult *result in results) {
+        VT100GridCoordRange range = VT100GridCoordRangeFromAbsCoordRange(result.internalAbsCoordRange,
+                                                                         self.dataSource.totalScrollbackOverflow);
+        VT100GridWindowedRange windowedRange = VT100GridWindowedRangeMake(range, 0, 0);
+        NSString *content = [extractor contentInRange:windowedRange
+                                    attributeProvider:nil
+                                           nullPolicy:kiTermTextExtractorNullPolicyTreatAsSpace
+                                                  pad:NO
+                                   includeLastNewline:NO
+                               trimTrailingWhitespace:YES
+                                         cappedAtSize:4096
+                                         truncateTail:YES
+                                    continuationChars:nil
+                                               coords:nil];
+        NSString *folder = [self.dataSource workingDirectoryOnLine:range.start.y];
+        if (!content.length) {
+            return;
+        }
+        id<VT100RemoteHostReading> remoteHost = [self.dataSource remoteHostOnLine:range.start.y];
+        i += 1;
+        NSString *keyEquivalent;
+        if (i < 10) {
+            keyEquivalent = [@(i) stringValue];
+        } else if (i < 10 + 26) {
+            keyEquivalent = [NSString stringWithLongCharacter:'A' + i - 10];
+        } else {
+            break;
+        }
+        ContentNavigationShortcutView *view =
+        [self addShortcutWithRange:result.internalAbsCoordRange
+                     keyEquivalent:keyEquivalent
+                            action:^(id<iTermContentNavigationShortcutView> view){
+            [weakSelf.delegate textViewOpen:content workingDirectory:folder remoteHost:remoteHost];
+            [view popWithCompletion:^{
+                [weakSelf removeContentNavigationShortcutView:view];
+            }];
+            [weakSelf.delegate textViewExitShortcutNavigationMode];
+        }];
+        [layerOuter addView:view];
+    }
+    [layerOuter layoutWithin:self.enclosingScrollView.documentVisibleRect];
+    [self refresh];
+    [self.delegate textViewEnterShortcutNavigationMode];
+}
+
+#pragma mark - iTermCommandInfoViewControllerDelegate
+
+- (void)commandInfoSend:(NSString *)string {
+    [self.delegate sendText:string escaping:iTermSendTextEscapingNone];
+}
+
+- (void)commandInfoOpenInCompose:(NSString *)string {
+    [self.delegate textViewOpenComposer:string];
+}
+
+- (void)commandInfoSelectOutput:(id<VT100ScreenMarkReading>)mark {
+    [_contextMenuHelper selectOutputOfCommandMark:mark];
 }
 
 @end

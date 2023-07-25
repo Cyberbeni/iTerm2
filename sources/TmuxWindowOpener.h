@@ -25,10 +25,12 @@ extern NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, assign) NSSize size;
 @property (nonatomic, copy) NSString *layout;
+@property (nonatomic, copy) NSString *visibleLayout;
 @property (nonatomic, assign) int maxHistory;
 @property (nonatomic, retain) TmuxGateway *gateway;
 @property (nonatomic, retain) NSMutableDictionary *parseTree;
-@property (nonatomic, assign) TmuxController *controller;  // weak
+@property (nonatomic, retain) NSMutableDictionary *visibleParseTree;
+@property (nonatomic, weak) TmuxController *controller;
 @property (nonatomic, retain) id target;
 // Selector is called even if the window is already open and nothing is done.
 @property (nonatomic, assign) SEL selector;
@@ -40,7 +42,9 @@ extern NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen;
 // Maps a window ID as a string to a dictionary of window flags (see WindowFlag constants above).
 @property (nonatomic, retain) NSDictionary *windowOptions;
 @property (nonatomic, assign) BOOL manuallyOpened;
+@property (nonatomic, assign) BOOL allInitialWindowsAdded;
 @property (nonatomic, copy) NSDictionary<NSNumber *, NSString *> *tabColors;
+@property (nonatomic) BOOL focusReporting;
 @property (nonatomic, copy) Profile *profile;
 
 // Are we just attaching to a tmux session initially? If false, the initial window restoration has completed.
@@ -58,6 +62,7 @@ extern NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen;
 @property (nonatomic, copy) NSString *windowGUID;  // the expected window GUID, or nil if unknown.
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *perWindowSettings;
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *perTabSettings;
+@property (nonatomic) BOOL shouldWorkAroundTabBug;
 
 + (TmuxWindowOpener *)windowOpener;
 - (BOOL)openWindows:(BOOL)initial;

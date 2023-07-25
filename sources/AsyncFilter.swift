@@ -65,7 +65,7 @@ class FilteringUpdater {
         switch context.status {
         case .Matched:
             DLog("FilteringUpdater: Matched")
-            let positions = lineBuffer.convertPositions(context.results as! [ResultRange], withWidth: width)
+            let positions = lineBuffer.convertPositions(context.results as! [ResultRange], withWidth: width) ?? []
             for range in positions {
                 let temporary = range === positions.last && context.includesPartialLastLine
                 accept?(range.yStart, temporary)
@@ -107,7 +107,7 @@ protocol FilterDestination {
     @objc(filterDestinationAppendCharacters:count:externalAttributeIndex:continuation:)
     func append(_ characters: UnsafePointer<screen_char_t>,
                 count: Int32,
-                externalAttributeIndex: iTermExternalAttributeIndex?,
+                externalAttributeIndex: iTermExternalAttributeIndexReading?,
                 continuation: screen_char_t)
 
     @objc(filterDestinationRemoveLastLine)
@@ -136,9 +136,9 @@ class AsyncFilter: NSObject {
          cadence: TimeInterval,
          refining: AsyncFilter?,
          progress: ((Double) -> (Void))?) {
-        lineBufferCopy = lineBuffer.newAppendOnlyCopy()
+        lineBufferCopy = lineBuffer.copy()
         lineBufferCopy.setMaxLines(-1)
-        grid.appendLines(grid.numberOfLinesUsed(), to: lineBufferCopy)
+        grid.appendLines(grid.numberOfLinesUsed(), to: lineBufferCopy, makeCursorLineSoft: true)
         let numberOfLines = lineBufferCopy.numLines(withWidth: grid.size.width)
         let width = grid.size.width
         self.width = width
@@ -171,7 +171,7 @@ class AsyncFilter: NSObject {
                                                          width: width)
         destination.append(chars.line,
                            count: chars.length,
-                           externalAttributeIndex: iTermMetadataGetExternalAttributesIndex(metadata),
+                           externalAttributeIndex: iTermImmutableMetadataGetExternalAttributesIndex(metadata),
                            continuation: chars.continuation)
     }
 
@@ -234,7 +234,7 @@ class AsyncFilter: NSObject {
 }
 
 extension AsyncFilter: ContentSubscriber {
-    func deliver(_ array: ScreenCharArray, metadata: iTermMetadata) {
+    func deliver(_ array: ScreenCharArray, metadata: iTermImmutableMetadata) {
         lineBufferCopy.appendLine(array.line,
                                   length: array.length,
                                   partial: array.eol != EOL_HARD,
@@ -248,27 +248,3 @@ extension AsyncFilter: ContentSubscriber {
     }
 }
 
-extension screen_char_t {
-    static var zero = screen_char_t(code: 0,
-                                    foregroundColor: UInt32(ALTSEM_DEFAULT),
-                                    fgGreen: 0,
-                                    fgBlue: 0,
-                                    backgroundColor: UInt32(ALTSEM_DEFAULT),
-                                    bgGreen: 0,
-                                    bgBlue: 0,
-                                    foregroundColorMode: ColorModeAlternate.rawValue,
-                                    backgroundColorMode: ColorModeAlternate.rawValue,
-                                    complexChar: 0,
-                                    bold: 0,
-                                    faint: 0,
-                                    italic: 0,
-                                    blink: 0,
-                                    underline: 0,
-                                    image: 0,
-                                    strikethrough: 0,
-                                    underlineStyle: VT100UnderlineStyle.single,
-                                    invisible: 0,
-                                    inverse: 0,
-                                    guarded: 0,
-                                    unused: 0)
-}

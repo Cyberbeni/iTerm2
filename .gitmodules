@@ -25,3 +25,15 @@
 [submodule "submodules/iTerm2-shell-integration"]
 	path = submodules/iTerm2-shell-integration
 	url = https://github.com/gnachman/iTerm2-shell-integration
+[submodule "submodules/MultiCursor"]
+	path = submodules/MultiCursor
+	url = https://github.com/gnachman/MultiCursor
+[submodule "submodules/SwiftyMarkdown"]
+	path = submodules/SwiftyMarkdown
+	url = https://github.com/gnachman/SwiftyMarkdown
+[submodule "submodules/Highlightr"]
+	path = submodules/Highlightr
+	url = https://github.com/gnachman/Highlightr
+[submodule "submodules/powerline-extra-symbols"]
+	path = submodules/powerline-extra-symbols
+	url = https://github.com/ryanoasis/powerline-extra-symbols

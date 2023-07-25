@@ -7,10 +7,10 @@
 //
 
 #import "PasswordTrigger.h"
-#import "iTermApplicationDelegate.h"
 #import "iTermPasswordManagerWindowController.h"
 #import "NSArray+iTerm.h"
-#import "PTYSession.h"
+
+static NSString *PasswordTriggerPlaceholderString = @"Open Password Manager to Unlock";
 
 @interface PasswordTrigger ()
 @property(nonatomic, copy) NSArray *accountNames;
@@ -26,29 +26,55 @@
     self = [super init];
     if (self) {
         [self reloadData];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(passwordManagerDidLoadAccounts:)
+                                                     name:iTermPasswordManagerDidLoadAccounts
+                                                   object:nil];
     }
     return self;
 }
 
+- (void)passwordManagerDidLoadAccounts:(NSNotification *)notification {
+    [self reloadData];
+    [self.delegate triggerDidChangeParameterOptions:self];
+}
+
+- (id)param {
+    NSString *value = [super param];
+    if ([value isEqual:PasswordTriggerPlaceholderString]) {
+        return @"";
+    }
+    return value;
+}
+
 - (void)reloadData {
-    _accountNames = [[iTermPasswordManagerWindowController entriesWithFilter:nil] mapWithBlock:^id(iTermPasswordEntry *entry) {
-        return entry.combinedAccountNameUserName;
-    }];
-    if (!_accountNames.count) {
-        _accountNames = @[ @"" ];
+    _accountNames = [iTermPasswordManagerWindowController cachedCombinedAccountNames];
+    [self addUnlockToAccountNamesIfNeeded];
+}
+
+- (void)addUnlockToAccountNamesIfNeeded {
+    if (![_accountNames filteredArrayUsingBlock:^BOOL(id anObject) {
+        return ![anObject isEqual:PasswordTriggerPlaceholderString];
+    }].count) {
+        NSString *param = [NSString castFrom:[self param]];
+        if (param.length > 0) {
+            _accountNames = @[ param, PasswordTriggerPlaceholderString ];
+        } else {
+            _accountNames = @[ PasswordTriggerPlaceholderString ];
+        }
     }
 }
 
 - (NSString *)triggerOptionalParameterPlaceholderWithInterpolation:(BOOL)interpolation {
-  return @"";
+    return @"";
 }
 
 - (BOOL)takesParameter {
-  return YES;
+    return YES;
 }
 
 - (BOOL)paramIsPopupButton {
-  return YES;
+    return YES;
 }
 
 - (NSArray *)sortedAccountNames {
@@ -56,7 +82,6 @@
 }
 
 - (NSInteger)indexForObject:(id)object {
-
     NSUInteger index = [[self sortedAccountNames] indexOfObject:object];
     if (index == NSNotFound) {
         return -1;
@@ -73,6 +98,7 @@
 }
 
 - (NSDictionary *)menuItemsForPoupupButton {
+    [self addUnlockToAccountNamesIfNeeded];
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     for (NSString *name in _accountNames) {
         result[name] = name;
@@ -80,25 +106,24 @@
     return result;
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *accountName) {
-                                             if (accountName) {
-                                                 iTermApplicationDelegate *itad = [iTermApplication.sharedApplication delegate];
-                                                 [itad openPasswordManagerToAccountName:accountName
-                                                                                  inSession:aSession];
-                                             }
-                                         }];
+    // Need to stop the world to get scope, provided it is needed. Password manager opens are so slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull accountName) {
+        [scheduler scheduleTriggerCallback:^{
+            [aSession triggerSession:self openPasswordManagerToAccountName:accountName];
+        }];
+    }];
     return YES;
 }
 

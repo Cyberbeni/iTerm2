@@ -218,6 +218,7 @@ typedef NS_ENUM(NSUInteger, iTermShellIntegrationInstallationState) {
     __block iTermExpectation *expectation =
     [[self.delegate shellIntegrationExpect] expectRegularExpression:regex
                                                               after:precedecessor
+                                                           deadline:nil
                                                          willExpect:willExpect
                                                          completion:^(NSArray<NSString *> * _Nonnull captureGroups) {
         if (expectation) {
@@ -344,13 +345,8 @@ typedef NS_ENUM(NSUInteger, iTermShellIntegrationInstallationState) {
 
 - (NSString *)discoverShell:(BOOL)reallySend completion:(void (^)(NSString *shell, NSString *dotdir))completion {
     iTermExpectation *expectation = nil;
-    NSString *result = [self sendText:@"echo My shell is $SHELL\n" reallySend:reallySend];
-    if (!reallySend) {
-        result = [result stringByAppendingString:
-                  @"# If the result is zsh, send:\n"
-                  @"echo My dotfiles go in ${ZDOTDIR:-$HOME}"];
-    }
-    [self sendText:nil
+    NSString *result = @"echo My shell is $SHELL\n";
+    [self sendText:result
         reallySend:reallySend
         afterRegex:@"^My shell is (.+)"
        expectation:&expectation
@@ -409,12 +405,12 @@ typedef NS_ENUM(NSUInteger, iTermShellIntegrationInstallationState) {
     [self sendText:[strings componentsJoinedByString:@""] reallySend:reallySend];
     NSString *joined = [strings componentsJoinedByString:@""];
     [strings removeAllObjects];
-    
+
     [strings addObject:[self sendText:[NSString stringWithFormat:@"if ! grep iterm2_shell_integration %@  > /dev/null 2>&1; then\n", script]
                            reallySend:reallySend
                            afterRegex:@"^>> "
                           expectation:expectation]];
-    [strings addObject:[self sendText:[NSString stringWithFormat:@"    cat <<-EOF >> %@\n", script]
+    [strings addObject:[self sendText:[NSString stringWithFormat:@"    cat <<-EOF >> %@\n\n", script]
                            reallySend:reallySend
                            afterRegex:@"^> "
                           expectation:expectation]];
@@ -555,7 +551,7 @@ typedef NS_ENUM(NSUInteger, iTermShellIntegrationInstallationState) {
                             expectation:expectation]];
     [result appendString:[self sendText:self.exitBashString
                              reallySend:reallySend
-                          afterRegex:@"> EOF"
+                             afterRegex:@"> EOF"
                             expectation:expectation
                              completion:^(NSArray<NSString *> *captures) {
         completion();
@@ -641,6 +637,8 @@ typedef NS_ENUM(NSUInteger, iTermShellIntegrationInstallationState) {
     __weak __typeof(self) weakSelf = self;
 
     [self expectRegularExpression:@"(^Done.$)|(^Your shell, .*, is not supported yet)"
+                            after:nil
+                       willExpect:nil
                        completion:^(NSArray<NSString *> * _Nonnull captureGroups) {
         if ([captureGroups[0] hasPrefix:@"Your shell"]) {
             [self.downloadAndRunViewController showShellUnsupportedError];

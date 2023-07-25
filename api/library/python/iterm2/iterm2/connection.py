@@ -1,17 +1,14 @@
 """Manages the details of the websocket connection. """
 
 import asyncio
+import iterm2.auth
 import os
 import sys
 import traceback
 import typing
 import websockets
-try:
-  import AppKit
-  import iterm2.auth
-  gAppKitAvailable = True
-except:
-  gAppKitAvailable = False
+
+gDisconnectCallbacks = []
 
 # websockets 9.0 moved client into legacy.client and didn't document how to
 # migrate to the new API :(. Stick with the old one until I have time to deal
@@ -48,8 +45,7 @@ def _headers():
                "x-iterm2-disable-auth-ui": "true"}
     if cookie is not None:
         headers["x-iterm2-cookie"] = cookie
-    elif gAppKitAvailable:
-        headers["x-iterm2-advisory-name"] = iterm2.auth.get_script_name()
+    headers["x-iterm2-advisory-name"] = iterm2.auth.get_script_name()
     if key is not None:
         headers["x-iterm2-key"] = key
     return headers
@@ -97,6 +93,8 @@ class Connection:
         connection and returns it without creating an asyncio event loop.
 
         :returns: A new connection to iTerm2.
+
+        .. seealso:: ":ref:`Running in a REPL <running-repl>`"
         """
         connection = Connection()
 
@@ -237,7 +235,13 @@ class Connection:
 
         loop.set_debug(debug)
         self.loop = loop
-        return loop.run_until_complete(self.async_connect(async_main, retry))
+        result = loop.run_until_complete(self.async_connect(async_main, retry))
+        global gDisconnectCallbacks
+        callbacks = list(gDisconnectCallbacks)
+        gDisconnectCallbacks = []
+        for callback in callbacks:
+            callback()
+        return result
 
     async def async_send_message(self, message):
         """
@@ -325,12 +329,11 @@ class Connection:
         return (int(parts[0]), int(parts[1]))
 
     def _get_connect_coro(self):
-        if gAppKitAvailable:
-            path = self._unix_domain_socket_path()
-            exists = os.path.exists(path)
+        path = self._unix_domain_socket_path()
+        exists = os.path.exists(path)
 
-            if exists:
-                return self._get_unix_connect_coro()
+        if exists:
+            return self._get_unix_connect_coro()
         return self._get_tcp_connect_coro()
 
     def _remove_auth(self):
@@ -341,12 +344,7 @@ class Connection:
                 del os.environ[var]
 
     def _unix_domain_socket_path(self):
-        applicationSupport = os.path.join(
-            AppKit.NSSearchPathForDirectoriesInDomains(
-                AppKit.NSApplicationSupportDirectory,
-                AppKit.NSUserDomainMask,
-                True)[0],
-            "iTerm2")
+        applicationSupport = os.path.expanduser("~/Library/Application Support/iTerm2")
         return os.path.join(applicationSupport, "private", "socket")
 
     def _get_unix_connect_coro(self):
@@ -380,8 +378,6 @@ class Connection:
             mean either a failure to connect or that there was already a
             (possibly stale) cookie in the environment.
         """
-        if not gAppKitAvailable:
-            return False
         if force:
             self._remove_auth()
         try:
@@ -476,16 +472,15 @@ Please check the following:
 
 If you'd prefer to retry connecting automatically instead of
 raising an exception, pass retry=true to run_until_complete()
-or run_forever()
+or run_forever().
 
 """, file=sys.stderr)
-                    if gAppKitAvailable:
-                        path = self._unix_domain_socket_path()
-                        exists = os.path.exists(path)
-                        if exists:
-                            print(f"If you have downgraded from iTerm2 3.3.12+ to an older version, you must\nmanually delete the file at {path}.\n", file=sys.stderr)
+                    path = self._unix_domain_socket_path()
+                    exists = os.path.exists(path)
+                    if exists:
+                        print(f"If you have downgraded from iTerm2 3.3.12+ to an older version, you must\nmanually delete the file at {path}.\n", file=sys.stderr)
                     done = True
-                    raise
+                    raise ConnectionRefusedError("Problem connecting to iTerm2")
             finally:
                 self._remove_auth()
 
@@ -506,7 +501,10 @@ def run_until_complete(
         does not need to return a value.
     :param retry: Keep trying to connect until it succeeds?
     """
-    return Connection().run_until_complete(coro, retry, debug)
+    try:
+        return Connection().run_until_complete(coro, retry, debug)
+    except (ConnectionRefusedError) as exception:
+        sys.exit(1)
 
 
 def run_forever(
@@ -526,4 +524,18 @@ def run_forever(
         does not need to return a value.
     :param retry: Keep trying to connect until it succeeds?
     """
-    Connection().run_forever(coro, retry, debug)
+    try:
+        Connection().run_forever(coro, retry, debug)
+    except (ConnectionRefusedError) as exception:
+        sys.exit(1)
+
+def add_disconnect_callback(callback: typing.Callable[[], None]):
+    """Add a function to run on the next disconnection.
+
+    The provided function gets called next time a connection closes, even if one
+    has not yet been opened.
+
+    :param callback: Takes no arguments.
+    """
+    global gDisconnectCallbacks
+    gDisconnectCallbacks.append(callback)

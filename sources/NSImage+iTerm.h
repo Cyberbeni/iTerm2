@@ -9,6 +9,7 @@
 #import <Cocoa/Cocoa.h>
 
 @interface NSImage (iTerm)
++ (NSSize)pointSizeOfGeneratedImageWithPixelSize:(NSSize)pixelSize;
 - (CGImageRef)CGImage;
 + (NSImage *)imageOfSize:(NSSize)size color:(NSColor *)color;
 + (NSColorSpace *)colorSpaceForProgramaticallyGeneratedImages;
@@ -49,7 +50,6 @@
 - (NSData *)dataForFileOfType:(NSBitmapImageFileType)fileType;
 
 - (NSData *)rawPixelsInRGBColorSpace;
-- (NSData *)rawDataForMetalOfSize:(NSSize)size;
 
 // Resizes an image in a way that lets you use rawDataForMetal. If you resize an image with only
 // Cocoa APIs (lockFocus, drawInRect, unlockFocus), it won't work with 8 bits per component (only
@@ -74,9 +74,15 @@
 // resulting image.
 - (NSImage *)it_imageFillingSize:(NSSize)size;
 
+- (NSImage *)it_subimageWithRect:(NSRect)rect;
+
 @end
 
 @interface NSBitmapImageRep(iTerm)
 - (NSBitmapImageRep *)it_bitmapScaledTo:(NSSize)size;
+// Assumes premultiplied alpha and little endian. Floating point must be 16 bit.
+- (MTLPixelFormat)metalPixelFormat;
+- (NSBitmapImageRep *)it_bitmapWithAlphaLast;
+
 @end
 

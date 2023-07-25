@@ -31,9 +31,11 @@ extern NSString *kLayoutDictAltHistoryKey;    // Alternate screen history
 extern NSString *kLayoutDictStateKey;         // see TmuxStateParser
 extern NSString *kLayoutDictHotkeyKey;        // Session hotkey dictionary
 extern NSString *kLayoutDictTabColorKey;      // Tab color
+extern NSString *kLayoutDictFocusReportingKey;  // Focus reporting
 
 // Children of leaf:
 extern NSString *kLayoutDictTabOpenedManually;  // Was this tab opened by a user-initiated action?
+extern NSString *kLayoutDictAllInitialWindowsAdded;  // Have we finished initial window loading?
 extern NSString *kLayoutDictTabIndex;           // Which index the tab should have in the native window
 
 typedef NS_ENUM(NSInteger, LayoutNodeType) {

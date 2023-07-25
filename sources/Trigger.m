@@ -7,7 +7,6 @@
 
 #import "Trigger.h"
 #import "DebugLogging.h"
-#import "iTermObject.h"
 #import "iTermSwiftyString.h"
 #import "iTermVariableScope.h"
 #import "iTermWarning.h"
@@ -15,6 +14,7 @@
 #import "RegexKitLite.h"
 #import "ScreenChar.h"
 #import <CommonCrypto/CommonDigest.h>
+#import "iTerm2SharedARC-Swift.h"
 
 NSString * const kTriggerRegexKey = @"regex";
 NSString * const kTriggerActionKey = @"action";
@@ -22,7 +22,7 @@ NSString * const kTriggerParameterKey = @"parameter";
 NSString * const kTriggerPartialLineKey = @"partial";
 NSString * const kTriggerDisabledKey = @"disabled";
 
-@interface Trigger()<iTermObject>
+@interface Trigger()
 @end
 
 @implementation Trigger {
@@ -31,7 +31,8 @@ NSString * const kTriggerDisabledKey = @"disabled";
     long long _lastLineNumber;
     NSString *regex_;
     id param_;
-    iTermSwiftyString *_cachedSwiftyString;
+    iTermSwiftyStringWithBackreferencesEvaluator *_evaluator;
+    NSRegularExpression *_compiledRegex;
 }
 
 @synthesize regex = regex_;
@@ -39,6 +40,13 @@ NSString * const kTriggerDisabledKey = @"disabled";
 
 + (NSSet<NSString *> *)synonyms {
     return [NSSet set];
+}
+
+// The purpose of this is to re-encode colors that were previously key-value encoded into hex so that the Python APi can consume them.
++ (NSDictionary *)sanitizedTriggerDictionary:(NSDictionary *)dict {
+    Trigger *trigger = [self triggerFromDict:dict];
+    [trigger sanitize];
+    return trigger.dictionaryValue;
 }
 
 + (Trigger *)triggerFromDict:(NSDictionary *)dict
@@ -63,7 +71,7 @@ NSString * const kTriggerDisabledKey = @"disabled";
 
 - (NSString *)description {
     return [NSString stringWithFormat:@"<%@: %p regex=%@ param=%@>",
-               NSStringFromClass(self.class), self, self.regex, self.param];
+            NSStringFromClass(self.class), self, self.regex, self.param];
 }
 
 - (NSString *)action {
@@ -72,6 +80,10 @@ NSString * const kTriggerDisabledKey = @"disabled";
 
 - (void)setAction:(NSString *)action {
     assert(false);
+}
+
+- (void)sanitize {
+    // Do nothing by default because most triggers don't neet sanitization.
 }
 
 + (NSString *)title {
@@ -120,22 +132,21 @@ NSString * const kTriggerDisabledKey = @"disabled";
 
 - (NSArray *)groupedMenuItemsForPopupButton
 {
-  NSDictionary *menuItems = [self menuItemsForPoupupButton];
-  if (menuItems) {
-    return @[ menuItems ];
-  } else {
-    return nil;
-  }
+    NSDictionary *menuItems = [self menuItemsForPoupupButton];
+    if (menuItems) {
+        return @[ menuItems ];
+    } else {
+        return nil;
+    }
 }
 
 - (id<iTermFocusReportingTextFieldDelegate>)newParameterDelegateWithPassthrough:(id<NSTextFieldDelegate>)passthrough {
     return nil;
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
@@ -148,8 +159,49 @@ NSString * const kTriggerDisabledKey = @"disabled";
     return NO;
 }
 
+- (void)setRegex:(NSString *)regex {
+    regex_ = [regex copy];
+    _compiledRegex = [NSRegularExpression regularExpressionWithPattern:regex_ options:0 error:nil];
+}
+
+- (void)enumerateMatchesInString:(NSString *)string
+                           block:(void (^)(NSArray<NSString *> *capturedStrings,
+                                           const NSRange *capturedRanges,
+                                           BOOL *stop))block {
+    const size_t maxStaticRangeCount = 16;
+    __block size_t rangeCapacity = maxStaticRangeCount;
+    NSRange rangeStorage[maxStaticRangeCount];
+    __block NSRange *ranges = rangeStorage;
+    __block NSRange *dynamicRangeStorage = NULL;
+    [_compiledRegex enumerateMatchesInString:string options:0 range:NSMakeRange(0, string.length) usingBlock:^(NSTextCheckingResult * _Nullable result, NSMatchingFlags flags, BOOL * _Nonnull stop) {
+        NSMutableArray<NSString *> *captures = [NSMutableArray arrayWithCapacity:result.numberOfRanges];
+        if (result.numberOfRanges > rangeCapacity) {
+            dynamicRangeStorage = iTermRealloc(dynamicRangeStorage, result.numberOfRanges, sizeof(NSRange));
+            ranges = dynamicRangeStorage;
+            rangeCapacity = result.numberOfRanges;
+        }
+
+        for (NSInteger i = 0; i < result.numberOfRanges; i++) {
+            const NSRange range = [result rangeAtIndex:i];
+            NSString *substring;
+            if (range.length == 0) {
+                substring = @"";
+            } else {
+                substring = [string substringWithRange:range];
+            }
+            [captures addObject:substring];
+            ranges[i] = [result rangeAtIndex:i];
+        }
+        block(captures, ranges, stop);
+
+    }];
+    if (ranges != rangeStorage) {
+        free(ranges);
+    }
+}
+
 - (BOOL)tryString:(iTermStringLine *)stringLine
-        inSession:(PTYSession *)aSession
+        inSession:(id<iTermTriggerSession>)aSession
       partialLine:(BOOL)partialLine
        lineNumber:(long long)lineNumber
  useInterpolation:(BOOL)useInterpolation {
@@ -169,68 +221,85 @@ NSString * const kTriggerDisabledKey = @"disabled";
         // This trigger doesn't support partial lines.
         return NO;
     }
-
+    
     __block BOOL stopFutureTriggersFromRunningOnThisLine = NO;
     NSString *s = stringLine.stringValue;
     DLog(@"Search for regex %@ in string %@", regex_, s);
-    [s enumerateStringsMatchedByRegex:regex_
-                           usingBlock:^(NSInteger captureCount,
-                                        NSString *const __unsafe_unretained *capturedStrings,
-                                        const NSRange *capturedRanges,
-                                        volatile BOOL *const stopEnumerating) {
-                               self->_lastLineNumber = lineNumber;
-                               DLog(@"Trigger %@ matched string %@", self, s);
-                               if (![self performActionWithCapturedStrings:capturedStrings
-                                                            capturedRanges:capturedRanges
-                                                              captureCount:captureCount
-                                                                 inSession:aSession
-                                                                  onString:stringLine
-                                                      atAbsoluteLineNumber:lineNumber
-                                                          useInterpolation:useInterpolation
-                                                                      stop:&stopFutureTriggersFromRunningOnThisLine]) {
-                                   *stopEnumerating = YES;
-                               }
-                           }];
+    if (![iTermAdvancedSettingsModel fastTriggerRegexes]) {
+        DLog(@"Use RegexKitLite");
+        [s enumerateStringsMatchedByRegex:regex_
+                               usingBlock:^(NSInteger captureCount,
+                                            NSString *const __unsafe_unretained *capturedStrings,
+                                            const NSRange *capturedRanges,
+                                            volatile BOOL *const stopEnumerating) {
+            self->_lastLineNumber = lineNumber;
+            DLog(@"Trigger %@ matched string %@", self, s);
+            NSArray<NSString *> *stringArray = [[NSArray alloc] initWithObjects:capturedStrings
+                                                                          count:captureCount];
+            if (![self performActionWithCapturedStrings:stringArray
+                                         capturedRanges:capturedRanges
+                                              inSession:aSession
+                                               onString:stringLine
+                                   atAbsoluteLineNumber:lineNumber
+                                       useInterpolation:useInterpolation
+                                                   stop:&stopFutureTriggersFromRunningOnThisLine]) {
+                *stopEnumerating = YES;
+            }
+        }];
+    } else if (s != nil) {
+        DLog(@"Use NSRegularExpression");
+        [self enumerateMatchesInString:s block:^(NSArray<NSString *> *stringArray,
+                                                 const NSRange *capturedRanges,
+                                                 BOOL *stopEnumerating) {
+            self->_lastLineNumber = lineNumber;
+            DLog(@"Trigger %@ matched string %@", self, s);
+            if (![self performActionWithCapturedStrings:stringArray
+                                         capturedRanges:capturedRanges
+                                              inSession:aSession
+                                               onString:stringLine
+                                   atAbsoluteLineNumber:lineNumber
+                                       useInterpolation:useInterpolation
+                                                   stop:&stopFutureTriggersFromRunningOnThisLine]) {
+                *stopEnumerating = YES;
+            }
+        }];
+    }
     if (!partialLine) {
         _lastLineNumber = -1;
     }
     return stopFutureTriggersFromRunningOnThisLine;
 }
 
-- (void)paramWithBackreferencesReplacedWithValues:(NSArray *)strings
-                                            scope:(iTermVariableScope *)scope
-                                 useInterpolation:(BOOL)useInterpolation
-                                       completion:(void (^)(NSString *))completion {
-    NSString *temp[10];
-    int i;
-    for (i = 0; i < strings.count; i++) {
-        temp[i] = strings[i];
-    }
-    [self paramWithBackreferencesReplacedWithValues:temp
-                                              count:i
-                                              scope:scope
-                                   useInterpolation:useInterpolation
-                                         completion:completion];
-}
-
-- (void)paramWithBackreferencesReplacedWithValues:(NSString * const*)strings
-                                            count:(NSInteger)count
-                                            scope:(iTermVariableScope *)scope
-                                 useInterpolation:(BOOL)useInterpolation
-                                       completion:(void (^)(NSString *))completion {
+- (iTermPromise<NSString *> *)paramWithBackreferencesReplacedWithValues:(NSArray *)stringArray
+                                                                absLine:(long long)absLine
+                                                                  scope:(id<iTermTriggerScopeProvider>)scopeProvider
+                                                       useInterpolation:(BOOL)useInterpolation {
     NSString *p = [NSString castFrom:self.param] ?: @"";
-    if (useInterpolation) {
-        [self evaluateSwiftyStringParameter:p
-                             backreferences:[[NSArray alloc] initWithObjects:strings count:count]
-                                      scope:scope
-                                 completion:completion];
-        return;
+    if (useInterpolation && [p interpolatedStringContainsNonliteral]) {
+        return [iTermPromise promise:^(id<iTermPromiseSeal>  _Nonnull seal) {
+            [scopeProvider performBlockWithScope:^(iTermVariableScope * _Nonnull scope, id<iTermObject> _Nonnull object) {
+                assert([NSThread isMainThread]);
+                [self evaluateSwiftyStringParameter:p
+                                     backreferences:stringArray
+                                            absLine:absLine
+                                              scope:scope
+                                              owner:object
+                                         completion:^(NSString *value) {
+                    if (value) {
+                        [seal fulfill:value];
+                    } else {
+                        [seal reject:[NSError errorWithDomain:@"com.iterm2.trigger" code:0 userInfo:nil]];
+                    }
+                }];
+            }];
+        }];
     }
-
+    
+    const NSUInteger count = stringArray.count;
     for (int i = 0; i < 9; i++) {
         NSString *rep = @"";
         if (count > i) {
-            rep = strings[i];
+            rep = stringArray[i];
         }
         p = [p stringByReplacingBackreference:i withString:rep];
     }
@@ -242,40 +311,54 @@ NSString * const kTriggerDisabledKey = @"disabled";
     p = [p stringByReplacingEscapedChar:'t' withString:@"\t"];
     p = [p stringByReplacingEscapedChar:'\\' withString:@"\\"];
     p = [p stringByReplacingEscapedHexValuesWithChars];
-    completion(p);
+
+    return [iTermPromise promise:^(id<iTermPromiseSeal>  _Nonnull seal) {
+        [seal fulfill:p];
+    }];
 }
 
 - (iTermVariableScope *)variableScope:(iTermVariableScope *)scope byAddingBackreferences:(NSArray<NSString *> *)backreferences {
-    iTermVariables *matchesFrame = [[iTermVariables alloc] initWithContext:iTermVariablesSuggestionContextNone owner:self];
-    iTermVariableScope *myScope = [scope copy];
-    [myScope addVariables:matchesFrame toScopeNamed:nil];
-    [myScope setValue:backreferences forVariableNamed:@"matches"];
-    return myScope;
+    return [scope variableScopeByAddingBackreferences:backreferences owner:self];
 }
 
 - (void)evaluateSwiftyStringParameter:(NSString *)expression
                        backreferences:(NSArray<NSString *> *)backreferences
+                              absLine:(long long)absLine
                                 scope:(iTermVariableScope *)scope
+                                owner:(id<iTermObject>)owner
                            completion:(void (^)(NSString *))completion {
-    iTermVariableScope *myScope = [self variableScope:scope byAddingBackreferences:backreferences];;
-    if (![_cachedSwiftyString.swiftyString isEqualToString:expression]) {
-        _cachedSwiftyString = [[iTermSwiftyString alloc] initWithString:expression scope:myScope observer:nil];
+    if (!_evaluator) {
+        _evaluator = [[iTermSwiftyStringWithBackreferencesEvaluator alloc] initWithExpression:expression];
+    } else {
+        _evaluator.expression = expression;
     }
-
-    [_cachedSwiftyString evaluateSynchronously:NO withScope:myScope completion:^(NSString * _Nonnull value, NSError * _Nonnull error, NSSet<NSString *> * _Nonnull missing) {
+    __weak __typeof(self) weakSelf = self;
+    [_evaluator evaluateWithAdditionalContext:@{ @"matches": backreferences, @"line": @(absLine) }
+                                        scope:scope
+                                        owner:owner
+                                   completion:^(NSString * _Nullable value, NSError * _Nullable error) {
         if (error) {
-            [iTermWarning showWarningWithTitle:[NSString stringWithFormat:@"The following parameter for a “%@” trigger could not be evaluated:\n\n%@\n\nThe error was:\n\n%@",
-                                                [[self class] title], self->_cachedSwiftyString.swiftyString, error.localizedDescription]
-                                       actions:@[ @"OK" ]
-                                     accessory:nil
-                                    identifier:@"NoSyncErrorInTriggerParameter"
-                                   silenceable:kiTermWarningTypeTemporarilySilenceable
-                                       heading:@"Error in Trigger Parameter"
-                                        window:nil];
+            [weakSelf evaluationDidFailWithError:error];
             completion(nil);
+        } else {
+            completion(value);
         }
-        completion(value);
     }];
+}
+
+- (void)evaluationDidFailWithError:(NSError *)error {
+    NSString *title =
+    [NSString stringWithFormat:@"The following parameter for a “%@” trigger could not be evaluated:\n\n%@\n\nThe error was:\n\n%@",
+     [[self class] title],
+     _evaluator.expression,
+     error.localizedDescription];
+    [iTermWarning showWarningWithTitle:title
+                               actions:@[ @"OK" ]
+                             accessory:nil
+                            identifier:@"NoSyncErrorInTriggerParameter"
+                           silenceable:kiTermWarningTypeTemporarilySilenceable
+                               heading:@"Error in Trigger Parameter"
+                                window:nil];
 }
 
 - (NSComparisonResult)compareTitle:(Trigger *)other
@@ -308,19 +391,23 @@ NSString * const kTriggerDisabledKey = @"disabled";
 - (void)reloadData {
 }
 
-- (NSData *)digest {
-    NSDictionary *triggerDictionary = @{ kTriggerActionKey: NSStringFromClass(self.class),
-                                         kTriggerRegexKey: self.regex ?: @"",
-                                         kTriggerParameterKey: self.param ?: @"",
-                                         kTriggerPartialLineKey: @(self.partialLine),
-                                         kTriggerDisabledKey: @(self.disabled) };
+- (NSDictionary *)dictionaryValue {
+    return @{ kTriggerActionKey: NSStringFromClass(self.class),
+              kTriggerRegexKey: self.regex ?: @"",
+              kTriggerParameterKey: self.param ?: @"",
+              kTriggerPartialLineKey: @(self.partialLine),
+              kTriggerDisabledKey: @(self.disabled) };
+}
 
+- (NSData *)digest {
+    NSDictionary *triggerDictionary = [self dictionaryValue];
+    
     // Glom all the data together as key=value\nkey=value\n...
     NSMutableString *temp = [NSMutableString string];
     for (NSString *key in [[triggerDictionary allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
         [temp appendFormat:@"%@=%@\n", key, triggerDictionary[key]];
     }
-
+    
     NSData *data = [temp dataUsingEncoding:NSUTF8StringEncoding];
     unsigned char hash[CC_SHA1_DIGEST_LENGTH];
     if (CC_SHA1([data bytes], [data length], hash) ) {
@@ -329,6 +416,20 @@ NSString * const kTriggerDisabledKey = @"disabled";
     } else {
         return data;
     }
+}
+
++ (NSDictionary *)triggerNormalizedDictionary:(NSDictionary *)dict {
+    NSMutableDictionary *temp = [dict mutableCopy];
+    if (!temp[kTriggerPartialLineKey]) {
+        temp[kTriggerPartialLineKey] = @NO;
+    }
+    if (!temp[kTriggerDisabledKey]) {
+        temp[kTriggerDisabledKey] = @NO;
+    }
+    if (!temp[kTriggerParameterKey]) {
+        temp[kTriggerParameterKey] = @"";
+    }
+    return temp;
 }
 
 #pragma mark - iTermObject

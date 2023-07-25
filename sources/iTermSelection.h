@@ -94,7 +94,7 @@ typedef NS_ENUM(NSInteger, iTermSelectionMode) {
 @property(nonatomic, readonly) BOOL live;
 
 // All sub selections, including the live one if applicable.
-@property(nonatomic, readonly) NSArray *allSubSelections;
+@property(nonatomic, readonly) NSArray<iTermSubSelection *> *allSubSelections;
 
 // The last range, including the live one if applicable. Ranges are ordered by endpoint.
 // The range will be -1,-1,-1,-1 if there are none.
@@ -123,6 +123,8 @@ typedef NS_ENUM(NSInteger, iTermSelectionMode) {
 
 // Has clearColumnWindowForLiveSelection been called?
 @property(nonatomic, readonly) BOOL haveClearedColumnWindow;
+
+@property(nonatomic, readonly) int approximateNumberOfLines;
 
 // Returns the debugging name for a selection mode.
 + (NSString *)nameForMode:(iTermSelectionMode)mode;
@@ -169,7 +171,7 @@ typedef NS_ENUM(NSInteger, iTermSelectionMode) {
 - (NSIndexSet *)selectedIndexesOnAbsoluteLine:(long long)line;
 
 // Calls the block for each selected range.
-- (void)enumerateSelectedAbsoluteRanges:(void (^)(VT100GridAbsWindowedRange range, BOOL *stop, BOOL eol))block;
+- (void)enumerateSelectedAbsoluteRanges:(void (^ NS_NOESCAPE)(VT100GridAbsWindowedRange range, BOOL *stop, BOOL eol))block;
 
 // Changes the first/last range.
 - (void)setFirstAbsRange:(VT100GridAbsWindowedRange)firstRange mode:(iTermSelectionMode)mode;

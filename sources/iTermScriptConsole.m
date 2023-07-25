@@ -12,6 +12,7 @@
 #import "iTermScriptInspector.h"
 #import "iTermAPIScriptLauncher.h"
 #import "iTermWebSocketConnection.h"
+#import "DebugLogging.h"
 #import "NSArray+iTerm.h"
 #import "NSObject+iTerm.h"
 #import "NSTextField+iTerm.h"
@@ -96,13 +97,13 @@ typedef NS_ENUM(NSInteger, iTermScriptFilterControlTag) {
     }
 }
 
-- (void)showFindPanel:(id)sender {
-    NSControl *fakeSender = [[NSControl alloc] init];
-    fakeSender.tag = NSTextFinderActionShowFindInterface;
-    if (_tabView.selectedTabViewItem.view == _logsView.enclosingScrollView) {
-        [_logsView performFindPanelAction:fakeSender];
-    } else {
-        [_callsView performFindPanelAction:fakeSender];
+- (IBAction)performFindPanelAction:(id)sender {
+    if ([[NSMenuItem castFrom:sender] tag] == NSFindPanelActionShowFindPanel) {
+        if (_tabView.selectedTabViewItem.view == _logsView.enclosingScrollView) {
+            [_logsView performFindPanelAction:sender];
+        } else {
+            [_callsView performFindPanelAction:sender];
+        }
     }
 }
 
@@ -445,6 +446,7 @@ typedef NS_ENUM(NSInteger, iTermScriptFilterControlTag) {
 
 - (void)connectionAccepted:(NSNotification *)notification {
     NSString *key = notification.object;
+    DLog(@"Connection accepted with key %@", key);
     iTermScriptHistoryEntry *entry = nil;
     if (key) {
         entry = [[iTermScriptHistory sharedInstance] entryWithIdentifier:key];
@@ -465,11 +467,14 @@ typedef NS_ENUM(NSInteger, iTermScriptFilterControlTag) {
                                                    identifier:key
                                                      relaunch:nil];
         entry.pids = notification.userInfo[@"pids"];
+        DLog(@"Add history entry");
         [[iTermScriptHistory sharedInstance] addHistoryEntry:entry];
     }
     entry.websocketConnection = notification.userInfo[@"websocket"];
+    DLog(@"Adding output");
     [entry addOutput:[NSString stringWithFormat:@"Connection accepted: %@\n", notification.userInfo[@"reason"]]
           completion:^{}];
+    DLog(@"Done");
 }
 
 - (void)connectionClosed:(NSNotification *)notification {

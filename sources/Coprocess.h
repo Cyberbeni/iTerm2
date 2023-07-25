@@ -29,7 +29,8 @@
 @property(nonatomic, retain) id<iTermCoprocessDelegate, iTermWeakReference> delegate;
 @property(nonatomic, readonly) NSString *command;
 
-+ (Coprocess *)launchedCoprocessWithCommand:(NSString *)command;
++ (Coprocess *)launchedCoprocessWithCommand:(NSString *)command
+                                environment:(NSDictionary<NSString *, NSString *> *)environment;
 
 + (NSArray *)mostRecentlyUsedCommands;
 + (void)setSilentlyIgnoreErrors:(BOOL)shouldIgnore fromCommand:(NSString *)command;

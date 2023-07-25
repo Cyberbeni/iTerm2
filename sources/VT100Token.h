@@ -201,6 +201,7 @@ typedef enum {
     XTERMCC_MULTITOKEN_HEADER_SET_KVP,
     XTERMCC_PASTE64,
     XTERMCC_FINAL_TERM,
+    XTERMCC_FRAMER_WRAPPER,
     XTERMCC_RESET_COLOR,
     XTERMCC_RESET_VT100_TEXT_FOREGROUND_COLOR,
     XTERMCC_RESET_VT100_TEXT_BACKGROUND_COLOR,
@@ -260,7 +261,17 @@ typedef enum {
     // there are escape codes for but they're really old-fashioned, so only these two are supported
     // so far.
     ISO2022_SELECT_LATIN_1,
-    ISO2022_SELECT_UTF_8
+    ISO2022_SELECT_UTF_8,
+
+    DCS_SSH_HOOK,
+    SSH_INIT,
+    SSH_LINE,
+    SSH_UNHOOK,  // Leave conductor mode and behave like a regular session
+    SSH_BEGIN,
+    SSH_END,   // At the end of a command
+    SSH_OUTPUT,  // %output
+    SSH_TERMINATE,  // %terminate
+    SSH_RECOVERY_BOUNDARY
 } VT100TerminalTokenType;
 
 // A preinitialized array of screen_char_t. When ASCII data is present, it will have the codes
@@ -281,6 +292,38 @@ typedef struct {
     char staticBuffer[128];
     ScreenChars *screenChars;
 } AsciiData;
+
+typedef struct {
+    AsciiData asciiData;
+    ScreenChars screenChars;
+} BundledAsciiData;
+
+NS_INLINE NSString *iTermCreateStringFromAsciiData(AsciiData *asciiData) {
+    return [[NSString alloc] initWithBytes:asciiData->buffer
+                                    length:asciiData->length
+                                  encoding:NSASCIIStringEncoding];
+}
+
+void iTermAsciiDataSet(AsciiData *asciiData, const char *bytes, int length, ScreenChars *screenChars);
+void iTermAsciiDataFree(AsciiData *asciiData);
+
+#define SSH_OUTPUT_AUTOPOLL_PID -1000
+#define SSH_OUTPUT_NOTIF_PID -1001
+
+typedef struct {
+    int8_t channel;
+    int32_t pid;
+    int depth: 23;
+    unsigned int valid: 1;
+} SSHInfo;
+
+NS_INLINE NSString *SSHInfoDescription(SSHInfo info) {
+    if (!info.valid) {
+        return @"<SSHInfo: invalid>";
+    }
+    return [NSString stringWithFormat:@"<SSHInfo: channel=%@ pid=%@ depth=%@>",
+            @(info.channel), @(info.pid), @(info.depth)];
+}
 
 @interface VT100Token : NSObject {
 @public
@@ -314,7 +357,8 @@ typedef struct {
 
 // For ascii strings (type==VT100_ASCIISTRING).
 @property(nonatomic, readonly) AsciiData *asciiData;
-@property(nonatomic, readonly) VT100TerminalTokenType type;
+@property(nonatomic) VT100TerminalTokenType type;
+@property(nonatomic) SSHInfo sshInfo;
 
 + (instancetype)token;
 + (instancetype)newTokenForControlCharacter:(unsigned char)controlCharacter;

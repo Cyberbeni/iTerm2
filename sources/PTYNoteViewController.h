@@ -7,7 +7,7 @@
 //
 
 #import <Cocoa/Cocoa.h>
-#import "IntervalTree.h"
+#import "PTYAnnotation.h"
 #import "PTYNoteView.h"
 
 // Post this when the note view's anchor has a chance to become centered.
@@ -20,30 +20,28 @@ extern NSString *const iTermAnnotationVisibilityDidChange;
 
 @protocol PTYNoteViewControllerDelegate <NSObject>
 - (void)noteDidRequestRemoval:(PTYNoteViewController *)note;
+- (void)noteWillBeRemoved:(PTYNoteViewController *)note;
 - (void)noteDidEndEditing:(PTYNoteViewController *)note;
+- (void)noteVisibilityDidChange:(PTYNoteViewController *)note;
+- (void)note:(PTYNoteViewController *)note
+setAnnotation:(id<PTYAnnotationReading>)annotation
+ stringValue:(NSString *)stringValue;
 @end
 
-@interface PTYNoteViewController : NSViewController <
-  IntervalTreeObject,
-  NSTextViewDelegate,
-  PTYNoteViewDelegate> {
-    PTYNoteView *noteView_;
-    NSTextView *textView_;
-    NSScrollView *scrollView_;
-    NSPoint anchor_;
-    BOOL watchForUpdate_;
-    BOOL hidden_;
-}
+@interface PTYNoteViewController : NSViewController<PTYAnnotationDelegate>
 
-@property(nonatomic, retain) PTYNoteView *noteView;
+@property(nonatomic, weak) id<PTYNoteViewControllerDelegate> delegate;
+@property(nonatomic, strong) id<PTYAnnotationReading> annotation;
+@property(nonatomic, strong) PTYNoteView *noteView;
 @property(nonatomic, assign) NSPoint anchor;
-@property(nonatomic, assign) id<PTYNoteViewControllerDelegate> delegate;
 
 + (BOOL)anyNoteVisible;
 
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)initWithAnnotation:(id<PTYAnnotationReading>)annotation;
+
 - (void)beginEditing;
 - (BOOL)isEmpty;
-- (void)setString:(NSString *)string;
 - (void)setNoteHidden:(BOOL)hidden;
 - (BOOL)isNoteHidden;
 - (void)sizeToFit;

@@ -29,9 +29,9 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
 
 @interface iTermImageInfo ()
 
-@property(atomic, retain) NSMutableDictionary *embeddedImages;  // frame number->downscaled image
+@property(atomic, strong) NSMutableDictionary *embeddedImages;  // frame number->downscaled image
 @property(atomic, assign) unichar code;
-@property(atomic, retain) iTermAnimatedImageInfo *animatedImage;  // If animated GIF, this is nonnil
+@property(atomic, strong) iTermAnimatedImageInfo *animatedImage;  // If animated GIF, this is nonnil
 @end
 
 @implementation iTermImageInfo {
@@ -43,6 +43,15 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
     iTermImage *_image;
     iTermAnimatedImageInfo *_animatedImage;
 }
+
+@synthesize image = _image;
+@synthesize data = _data;
+@synthesize code = _code;
+@synthesize broken = _broken;
+@synthesize paused = _paused;
+@synthesize uniqueIdentifier = _uniqueIdentifier;
+@synthesize size = _size;
+@synthesize filename = _filename;
 
 - (instancetype)initWithCode:(unichar)code {
     self = [super init];
@@ -58,7 +67,7 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
         _size = [dictionary[kImageInfoSizeKey] sizeValue];
         _broken = [dictionary[kImageInfoBrokenKey] boolValue];
         _inset = [dictionary[kImageInfoInsetKey] futureEdgeInsetsValue];
-        _data = [dictionary[kImageInfoImageKey] retain];
+        _data = [dictionary[kImageInfoImageKey] copy];
         _dictionary = [dictionary copy];
         _preserveAspectRatio = [dictionary[kImageInfoPreserveAspectRatioKey] boolValue];
         _filename = [dictionary[kImageInfoFilenameKey] copy];
@@ -105,23 +114,19 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
             return;
         }
 
-        [_dictionary release];
         _dictionary = nil;
 
         DLog(@"Queueing load of %@", self.uniqueIdentifier);
         void (^block)(void) = ^{
             // This is a slow operation that blocks for a long time.
-            iTermImage *image = [[iTermImage imageWithCompressedData:_data] retain];
+            iTermImage *image = [iTermImage imageWithCompressedData:self->_data];
             dispatch_sync(dispatch_get_main_queue(), ^{
-                [image autorelease];
-                [_queuedBlock release];
-                _queuedBlock = nil;
-                [_animatedImage autorelease];
-                _animatedImage = [[iTermAnimatedImageInfo alloc] initWithImage:image];
-                if (!_animatedImage) {
-                    _image = [image retain];
+                self->_queuedBlock = nil;
+                self->_animatedImage = [[iTermAnimatedImageInfo alloc] initWithImage:image];
+                if (!self->_animatedImage) {
+                    self->_image = image;
                 }
-                if (_image || _animatedImage) {
+                if (self->_image || self->_animatedImage) {
                     DLog(@"Loaded %@", self.uniqueIdentifier);
                     [[NSNotificationCenter defaultCenter] postNotificationName:iTermImageDidLoad object:self];
                 }
@@ -135,24 +140,11 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
             void (^blockToRun)(void) = nil;
             @synchronized(self) {
                 blockToRun = [blocks firstObject];
-                [blockToRun retain];
                 [blocks removeObjectAtIndex:0];
             }
             blockToRun();
-            [blockToRun release];
         });
     }
-}
-
-- (void)dealloc {
-    [_filename release];
-    [_image release];
-    [_embeddedImages release];
-    [_animatedImage release];
-    [_data release];
-    [_dictionary release];
-    [_uniqueIdentifier release];
-    [super dealloc];
 }
 
 - (void)saveToFile:(NSString *)filename {
@@ -198,17 +190,10 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
 
 - (void)setImageFromImage:(iTermImage *)image data:(NSData *)data {
     @synchronized(self) {
-        [_dictionary release];
         _dictionary = nil;
-
-        [_animatedImage autorelease];
         _animatedImage = [[iTermAnimatedImageInfo alloc] initWithImage:image];
-
-        [_data autorelease];
-        _data = [data retain];
-
-        [_image autorelease];
-        _image = [image retain];
+        _data = [data copy];
+        _image = image;
     }
 }
 
@@ -223,7 +208,7 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
     }
 }
 
-- (NSDictionary *)dictionary {
+- (NSDictionary<NSString *, NSObject<NSCopying> *> *)dictionary {
     @synchronized(self) {
         return @{ kImageInfoSizeKey: [NSValue valueWithSize:_size],
                   kImageInfoInsetKey: [NSValue futureValueWithEdgeInsets:_inset],
@@ -257,8 +242,7 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
 
 - (void)setImage:(iTermImage *)image {
     @synchronized(self) {
-        [_image autorelease];
-        _image = [image retain];
+        _image = image;
     }
 }
 
@@ -271,8 +255,7 @@ NSString *const iTermImageDidLoad = @"iTermImageDidLoad";
 
 - (void)setAnimatedImage:(iTermAnimatedImageInfo *)animatedImage {
     @synchronized (self) {
-        [_animatedImage autorelease];
-        _animatedImage = [animatedImage retain];
+        _animatedImage = animatedImage;
     }
 }
 
@@ -323,22 +306,27 @@ static NSSize iTermImageInfoGetSizeForRegionPreservingAspectRatio(const NSSize r
             DLog(@"%@ not ready", self.uniqueIdentifier);
             return nil;
         }
+        DLog(@"[%p imageWithCellSize:%@ timestamp:%@ scale:%@]",
+             self, NSStringFromSize(cellSize), @(timestamp), @(scale));
         if (!_embeddedImages) {
             _embeddedImages = [[NSMutableDictionary alloc] init];
         }
         int frame = [self.animatedImage frameForTimestamp:timestamp];  // 0 if not animated
         iTermTuple *key = [iTermTuple tupleWithObject:@(frame) andObject:@(scale)];
         NSImage *embeddedImage = _embeddedImages[key];
-
+        DLog(@"embeddedImage=%@", embeddedImage);
         NSSize region = NSMakeSize(cellSize.width * _size.width,
                                    cellSize.height * _size.height);
+        DLog(@"region=%@", NSStringFromSize(region));
         if (!NSEqualSizes(embeddedImage.size, region)) {
+            DLog(@"Sizes differ. Resize.");
             NSImage *theImage;
             if (self.animatedImage) {
                 theImage = [self.animatedImage imageForFrame:frame];
             } else {
                 theImage = [self.image.images firstObject];
             }
+            DLog(@"theImage is %@", theImage);
             NSEdgeInsets inset = _inset;
             inset.top *= cellSize.height;
             inset.bottom *= cellSize.height;
@@ -351,9 +339,12 @@ static NSSize iTermImageInfoGetSizeForRegionPreservingAspectRatio(const NSSize r
             NSImage *canvas = [theImage safelyResizedImageWithSize:region
                                                    destinationRect:destinationRect
                                                              scale:scale];
+            DLog(@"Assign %@ to %@", canvas, key);
             self.embeddedImages[key] = canvas;
         }
-        return _embeddedImages[key];
+        NSImage *image = _embeddedImages[key];
+        DLog(@"return %@", image);
+        return image;
     }
 }
 
@@ -424,7 +415,7 @@ static NSSize iTermImageInfoGetSizeForRegionPreservingAspectRatio(const NSSize r
 
 - (NSPasteboardItem *)pasteboardItem {
     @synchronized(self) {
-        NSPasteboardItem *pbItem = [[[NSPasteboardItem alloc] init] autorelease];
+        NSPasteboardItem *pbItem = [[NSPasteboardItem alloc] init];
         NSArray *types;
         NSString *imageType = self.imageType;
         if (imageType) {

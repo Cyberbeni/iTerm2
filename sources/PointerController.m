@@ -70,6 +70,8 @@ compatibilityEscaping:(BOOL)compatibilityEscaping {
         [delegate_ sendHexCode:argument withEvent:event];
     } else if ([action isEqualToString:kSendTextPointerAction]) {
         [delegate_ sendText:argument withEvent:event escaping:compatibilityEscaping ? iTermSendTextEscapingCompatibility : iTermSendTextEscapingCommon];
+    } else if ([action isEqualToString:kInvokeScriptFunction]) {
+        [delegate_ invokeScriptFunction:argument withEvent:event];
     } else if ([action isEqualToString:kSelectPaneLeftPointerAction]) {
         [delegate_ selectPaneLeftWithEvent:event];
     } else if ([action isEqualToString:kSelectPaneRightPointerAction]) {
@@ -94,6 +96,13 @@ compatibilityEscaping:(BOOL)compatibilityEscaping {
         [delegate_ extendSelectionWithEvent:event];
     } else if ([action isEqualToString:kQuickLookAction]) {
         [delegate_ quickLookWithEvent:event];
+    } else if ([action isEqualToString:kSelectMenuItemPointerAction]) {
+        NSArray<NSString *> *parts = [argument componentsSeparatedByString:@"\n"];
+        if (parts.count > 1) {
+            NSString *identifier = parts[0];
+            NSString *title = parts[1];
+            [delegate_ selectMenuItemWithIdentifier:identifier title:title event:event];
+        }
     } else if ([action isEqualToString:kIgnoreAction]) {
         // Do nothing
     }

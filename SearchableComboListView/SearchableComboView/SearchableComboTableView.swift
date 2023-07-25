@@ -7,7 +7,7 @@
 
 import AppKit
 
-protocol SearchableComboTableViewDelegate: class {
+protocol SearchableComboTableViewDelegate: AnyObject {
     func searchableComboTableView(_ tableView: SearchableComboTableView,
                                   didClickRow row: Int)
     func searchableComboTableView(_ tableView: SearchableComboTableView,
@@ -38,6 +38,12 @@ class SearchableComboTableView: NSTableView, MouseObservingTableView {
         }
         let point = window.convertPoint(fromScreen: NSEvent.mouseLocation)
         return selectableRowAt(point) >= 0
+    }
+
+    override func awakeFromNib() {
+        if #available(macOS 11.0, *) {
+            style = .sourceList
+        }
     }
 
     public override func keyDown(with event: NSEvent) {

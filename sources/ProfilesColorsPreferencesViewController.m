@@ -72,7 +72,7 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
     IBOutlet NSTextField *_backgroundColorLabel;
     IBOutlet NSTextField *_linkColorLabel;
     IBOutlet NSTextField *_selectionColorLabel;
-    IBOutlet NSTextField *_selectedTextColorLabel;
+    IBOutlet NSButton *_selectedTextColorEnabledButton;
     IBOutlet NSTextField *_badgeColorLabel;
 
     IBOutlet NSTextField *_cursorColorLabel;
@@ -83,6 +83,8 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
     IBOutlet NSButton *_useSmartCursorColor;
 
     IBOutlet NSSlider *_minimumContrast;
+    IBOutlet NSTextField *_faintTextAlphaLabel;
+    IBOutlet NSSlider *_faintTextAlpha;
     IBOutlet NSSlider *_cursorBoost;
     IBOutlet NSTextField *_minimumContrastLabel;
     IBOutlet NSTextField *_cursorBoostLabel;
@@ -164,6 +166,7 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
     NSDictionary *relatedViews = [self colorWellRelatedViews];
     for (NSString *key in colorWellDictionary) {
         CPKColorWell *colorWell = colorWellDictionary[key];
+        colorWell.colorSpace = [NSColorSpace it_defaultColorSpace];
         NSTextField *relatedView = relatedViews[key];
         [self defineControl:colorWell
                         key:key
@@ -191,8 +194,31 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
 
     PreferenceInfo *info;
     __weak __typeof(self) weakSelf = self;
+
+    // The separate colors stuff should be done first because -amendedKey:, which is called when
+    // defining controls, expects it to be correct.
+    const BOOL dark = [NSApp effectiveAppearance].it_isDark;
+    [_mode selectItemWithTag:dark ? 1 : 0];
+    info = [self defineControl:_useSeparateColorsForLightAndDarkMode
+                           key:KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE
+                   relatedView:nil
+                          type:kPreferenceInfoTypeCheckbox];
+    info.customSettingChangedHandler = ^(id sender) {
+        const BOOL useModes = [sender state] == NSControlStateValueOn;
+        [weakSelf useSeparateColorsDidChange:useModes];
+        // This has to be done after copying colors or else default colors might be used.
+        [weakSelf setBool:useModes forKey:KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE];
+    };
+
+
     info = [self defineControl:_useTabColor
                            key:KEY_USE_TAB_COLOR
+                   relatedView:nil
+                          type:kPreferenceInfoTypeCheckbox];
+    info.observer = ^() { [weakSelf updateColorControlsEnabled]; };
+
+    info = [self defineControl:_selectedTextColorEnabledButton
+                           key:KEY_USE_SELECTED_TEXT_COLOR
                    relatedView:nil
                           type:kPreferenceInfoTypeCheckbox];
     info.observer = ^() { [weakSelf updateColorControlsEnabled]; };
@@ -215,6 +241,11 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
                           type:kPreferenceInfoTypeSlider];
     info.observer = ^() { [weakSelf maybeWarnAboutExcessiveContrast]; };
 
+    [self defineControl:_faintTextAlpha
+                    key:KEY_FAINT_TEXT_ALPHA
+            relatedView:_faintTextAlphaLabel
+                   type:kPreferenceInfoTypeSlider];
+
     [self defineControl:_cursorBoost
                     key:KEY_CURSOR_BOOST
             relatedView:_cursorBoostLabel
@@ -236,19 +267,6 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
                    displayName:@"Brighten bold text"
                           type:kPreferenceInfoTypeCheckbox];
     info.observer = ^{ [weakSelf updateColorControlsEnabled]; };
-
-    const BOOL dark = [NSApp effectiveAppearance].it_isDark;
-    [_mode selectItemWithTag:dark ? 1 : 0];
-    info = [self defineControl:_useSeparateColorsForLightAndDarkMode
-                           key:KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE
-                   relatedView:nil
-                          type:kPreferenceInfoTypeCheckbox];
-    info.customSettingChangedHandler = ^(id sender) {
-        const BOOL useModes = [sender state] == NSControlStateValueOn;
-        [weakSelf useSeparateColorsDidChange:useModes];
-        // This has to be done after copying colors or else default colors might be used.
-        [weakSelf setBool:useModes forKey:KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE];
-    };
 
     [self addViewToSearchIndex:_presetsPopupButton
                    displayName:@"Color presets"
@@ -340,6 +358,7 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
 
 - (void)updateColorControlsEnabled {
     _tabColor.enabled = [self boolForKey:KEY_USE_TAB_COLOR];
+    _selectedTextColor.enabled = [self boolForKey:KEY_USE_SELECTED_TEXT_COLOR];
     _underlineColor.enabled = [self boolForKey:KEY_USE_UNDERLINE_COLOR];
 
     const BOOL smartCursorColorSelected = [self boolForKey:KEY_SMART_CURSOR_COLOR];
@@ -398,7 +417,7 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
               KEY_FOREGROUND_COLOR: _foregroundColorLabel,
               KEY_BACKGROUND_COLOR: _backgroundColorLabel,
               KEY_SELECTION_COLOR: _selectionColorLabel,
-              KEY_SELECTED_TEXT_COLOR: _selectedTextColorLabel,
+              KEY_SELECTED_TEXT_COLOR: _selectedTextColorEnabledButton,
               KEY_CURSOR_COLOR: _cursorColorLabel,
               KEY_CURSOR_TEXT_COLOR: _cursorTextColorLabel,
               KEY_BADGE_COLOR: _badgeColorLabel };

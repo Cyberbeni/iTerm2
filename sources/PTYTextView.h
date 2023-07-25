@@ -10,6 +10,8 @@
 #import "iTermKeyBindingAction.h"
 #import "iTermKeyboardHandler.h"
 #import "iTermLogicalMovementHelper.h"
+#import "iTermObject.h"
+#import "iTermPopupWindowController.h"
 #import "iTermSemanticHistoryController.h"
 #import "iTermTextDrawingHelper.h"
 #import "LineBuffer.h"
@@ -20,6 +22,7 @@
 #import "PTYFontInfo.h"
 #import "ScreenChar.h"
 #import "VT100Output.h"
+#import "VT100SyncResult.h"
 #include <sys/time.h>
 
 @class CRunStorage;
@@ -27,6 +30,7 @@
 @class iTermExpect;
 @class iTermFindCursorView;
 @class iTermFindOnPageHelper;
+@class iTermFontTable;
 @class iTermImageWrapper;
 @class iTermQuickLookController;
 @class iTermSelection;
@@ -35,6 +39,7 @@
 @class iTermURLActionHelper;
 @class iTermVariableScope;
 @class MovingAverage;
+@protocol PTYAnnotationReading;
 @class PTYScroller;
 @class PTYScrollView;
 @class PTYTask;
@@ -55,10 +60,17 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
     CHARTYPE_OTHER,       // Symbols, etc. Anything that doesn't fall into the other categories.
 };
 
-@protocol PTYTextViewDelegate <NSObject, iTermBadgeLabelDelegate>
+extern NSTimeInterval PTYTextViewHighlightLineAnimationDuration;
+
+extern NSNotificationName iTermPortholesDidChange;
+extern NSNotificationName PTYTextViewWillChangeFontNotification;
+
+@protocol PTYTextViewDelegate <NSObject, iTermBadgeLabelDelegate, iTermObject>
 
 @property (nonatomic, readonly) NSEdgeInsets textViewEdgeInsets;
 
+// Returns scrollback overflow.
+- (VT100SyncResult)textViewWillRefresh;
 - (BOOL)xtermMouseReporting;
 - (BOOL)xtermMouseReportingAllowMouseWheel;
 - (BOOL)xtermMouseReportingAllowClicksAndDrags;
@@ -120,8 +132,11 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 - (void)textViewCreateTabWithProfileGuid:(NSString *)guid;
 - (void)textViewSelectNextPane;
 - (void)textViewSelectPreviousPane;
+- (void)textViewSelectMenuItemWithIdentifier:(NSString *)identifier
+                                       title:(NSString *)title;
 - (void)textViewPasteSpecialWithStringConfiguration:(NSString *)configuration
                                       fromSelection:(BOOL)fromSelection;
+- (void)textViewInvokeScriptFunction:(NSString *)function;
 - (void)textViewEditSession;
 - (void)textViewToggleBroadcastingInput;
 - (void)textViewCloseWithConfirmation;
@@ -152,7 +167,7 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
                           button:(MouseButtonNumber)button
                       coordinate:(VT100GridCoord)coord
                            point:(NSPoint)point
-                          deltaY:(CGFloat)deltaY
+                           delta:(CGSize)delta
         allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
                         testOnly:(BOOL)testOnly;
 
@@ -186,15 +201,16 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 - (void)textViewDidRefresh;
 
 // The background color in the color map changed.
-- (void)textViewBackgroundColorDidChange;
-- (void)textViewForegroundColorDidChange;
+- (void)textViewBackgroundColorDidChangeFrom:(NSColor *)before to:(NSColor *)after;
+- (void)textViewForegroundColorDidChangeFrom:(NSColor *)before to:(NSColor *)after;
+- (void)textViewCursorColorDidChangeFrom:(NSColor *)before to:(NSColor *)after;
 - (void)textViewTransparencyDidChange;
 - (void)textViewProcessedBackgroundColorDidChange;
 
 // Describes the current user, host, and path.
 - (NSURL *)textViewCurrentLocation;
 - (void)textViewBurySession;
-- (BOOL)textViewShowHoverURL:(NSString *)url;
+- (BOOL)textViewShowHoverURL:(NSString *)url anchor:(VT100GridWindowedRange)anchor;
 
 - (BOOL)textViewCopyMode;
 - (BOOL)textViewCopyModeSelecting;
@@ -246,7 +262,29 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 
 - (BOOL)textViewCanWriteToTTY;
 - (BOOL)textViewAnyMouseReportingModeIsEnabled;
-
+- (BOOL)textViewSmartSelectionActionsShouldUseInterpolatedStrings;
+- (void)textViewShowFindPanel;
+- (void)textViewDidAddOrRemovePorthole;
+- (NSString *)textViewCurrentSSHSessionName;
+- (void)textViewDisconnectSSH;
+- (void)textViewShowFindIndicator:(VT100GridCoordRange)range;
+- (void)textViewOpen:(NSString *)string
+    workingDirectory:(NSString *)folder
+          remoteHost:(id<VT100RemoteHostReading>)remoteHost;
+- (void)textViewEnterShortcutNavigationMode;
+- (void)textViewExitShortcutNavigationMode;
+- (void)textViewWillHandleMouseDown:(NSEvent *)event;
+- (BOOL)textViewPasteFiles:(NSArray<NSString *> *)filenames;
+- (NSString *)textViewNaturalLanguageQuery;
+- (void)textViewPerformNaturalLanguageQuery;
+- (void)textViewUpdateTrackingAreas;
+- (BOOL)textViewShouldShowOffscreenCommandLine;
+- (BOOL)textViewShouldUseSelectedTextColor;
+- (void)textViewOpenComposer:(NSString *)string;
+- (BOOL)textViewIsAutoComposerOpen;
+- (VT100GridRange)textViewLinesToSuppressDrawing;
+- (NSRect)textViewCursorFrameInScreenCoords;
+- (void)textViewDidReceiveSingleClick;
 @end
 
 @interface iTermHighlightedRow : NSObject
@@ -256,7 +294,7 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 @end
 
 @interface PTYTextView : NSView <
-  iTermColorMapDelegate,
+  iTermImmutableColorMapDelegate,
   iTermFocusFollowsMouseFocusReceiver,
   iTermIndicatorsHelperDelegate,
   iTermSemanticHistoryControllerDelegate,
@@ -276,7 +314,7 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 @property(nonatomic, assign) BOOL useNonAsciiFont;
 
 // Provider for screen contents, plus misc. other stuff.
-@property(nonatomic, assign) id<PTYTextViewDataSource> dataSource;
+@property(nonatomic, weak) id<PTYTextViewDataSource> dataSource;
 
 // The delegate. Interfaces to the rest of the app for this view.
 @property(nonatomic, assign) id<PTYTextViewDelegate> delegate;
@@ -337,15 +375,7 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 // Returns the entire content of the view as a string.
 @property(nonatomic, readonly) NSString *content;
 
-// Regular and non-ascii fonts.
-@property(nonatomic, readonly) NSFont *font;
-@property(nonatomic, readonly) NSFont *nonAsciiFont;
-
-@property(nonatomic, readonly) PTYFontInfo *primaryFont;
-@property(nonatomic, readonly) PTYFontInfo *secondaryFont;  // non-ascii font, only used if self.useNonAsciiFont is set.
-
-// Returns the non-ascii font, even if it's not being used.
-@property(nonatomic, readonly) NSFont *nonAsciiFontEvenIfNotUsed;
+@property(nonatomic, readonly) iTermFontTable *fontTable;
 
 // Size of a character.
 @property(nonatomic, readonly) double lineHeight;
@@ -369,8 +399,8 @@ typedef NS_ENUM(NSInteger, PTYCharType) {
 // Indicates if the "find cursor" mode is active.
 @property(nonatomic, readonly) BOOL isFindingCursor;
 
-// Stores colors. This object is its delegate.
-@property(nonatomic, readonly) iTermColorMap *colorMap;
+// Stores colors. Gets updated on sync.
+@property(nonatomic, retain) id<iTermColorMapReading> colorMap;
 
 // Semantic history. TODO: Move this into PTYSession.
 @property(nonatomic, readonly) iTermSemanticHistoryController *semanticHistoryController;
@@ -434,16 +464,18 @@ typedef void (^PTYTextViewDrawingHookBlock)(iTermTextDrawingHelper *);
 
 @property (nonatomic, readonly) BOOL wantsMouseMovementEvents;
 
+// Checked and at the end of -refresh. Meant to be use when a reentrant call failed.
+@property (nonatomic) BOOL needsUpdateSubviewFrames;
+
 // Returns the size of a cell for a given font. hspace and vspace are multipliers and the width
 // and height.
 + (NSSize)charSizeForFont:(NSFont*)aFont
         horizontalSpacing:(CGFloat)hspace
           verticalSpacing:(CGFloat)vspace;
 
-// This is the designated initializer. The color map should have the
-// basic colors plus the 8-bit ansi colors set shortly after this is
-// called.
-- (instancetype)initWithFrame:(NSRect)frame colorMap:(iTermColorMap *)colorMap;
+- (instancetype)initWithFrame:(NSRect)frame NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)initWithCoder:(NSCoder *)coder NS_UNAVAILABLE;
 
 // Changes the document cursor, if needed. The event is used to get modifier flags.
 - (void)updateCursor:(NSEvent *)event;
@@ -472,7 +504,7 @@ typedef void (^PTYTextViewDrawingHookBlock)(iTermTextDrawingHelper *);
 
 // Copy with or without styles, as set by user defaults. Not for use when a copy item in the menu is invoked.
 - (void)copySelectionAccordingToUserPreferences;
-- (void)copyString:(NSString *)string;
+- (BOOL)copyString:(NSString *)string;
 
 // Copy the current selection to the pasteboard.
 - (void)copy:(id)sender;
@@ -494,11 +526,11 @@ typedef void (^PTYTextViewDrawingHookBlock)(iTermTextDrawingHelper *);
 - (void)setSemanticHistoryPrefs:(NSDictionary *)prefs;
 
 // Various accessors (TODO: convert as many as possible into properties)
-- (void)setFont:(NSFont*)aFont
-    nonAsciiFont:(NSFont *)nonAsciiFont
-    horizontalSpacing:(CGFloat)horizontalSpacing
-    verticalSpacing:(CGFloat)verticalSpacing;
+- (void)setFontTable:(iTermFontTable *)fontTable
+   horizontalSpacing:(CGFloat)horizontalSpacing
+     verticalSpacing:(CGFloat)verticalSpacing;
 - (NSRect)scrollViewContentSize;
+- (NSRect)offscreenCommandLineFrameForView:(NSView *)view;
 - (void)setAntiAlias:(BOOL)asciiAA nonAscii:(BOOL)nonAsciiAA;
 
 // Update the scroller color for light or dark backgrounds.
@@ -527,6 +559,7 @@ typedef void (^PTYTextViewDrawingHookBlock)(iTermTextDrawingHelper *);
 - (void)scrollEnd;
 - (void)scrollToAbsoluteOffset:(long long)absOff height:(int)height;
 - (void)scrollToSelection;
+- (void)lockScroll;
 
 // Saving/printing
 - (void)saveDocumentAs:(id)sender;
@@ -548,7 +581,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 - (void)clearHighlights:(BOOL)resetContext;
 
 // Performs a find on the next chunk of text.
-- (BOOL)continueFind:(double *)progress;
+- (BOOL)continueFind:(double *)progress range:(NSRange *)rangePtr;
 
 // This textview is about to become invisible because another tab is selected.
 - (void)aboutToHide;
@@ -579,9 +612,10 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 
 // Add a search result for highlighting in yellow.
 - (void)addSearchResult:(SearchResult *)searchResult;
+- (void)removeSearchResultsInRange:(VT100GridAbsCoordRange)range;
 
 // When a new note is created, call this to add a view for it.
-- (void)addViewForNote:(PTYNoteViewController *)note;
+- (void)addViewForNote:(id<PTYAnnotationReading>)annotation focus:(BOOL)focus visible:(BOOL)visible;
 
 // Makes sure not view frames are in the right places (e.g., after a resize).
 - (void)updateNoteViewFrames;
@@ -600,10 +634,11 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
                          suffix:(NSString *)suffix
                      completion:(void (^)(BOOL ok))completion;
 
-- (PTYFontInfo*)getFontForChar:(UniChar)ch
-                     isComplex:(BOOL)isComplex
-                    renderBold:(BOOL*)renderBold
-                  renderItalic:(BOOL*)renderItalic;
+- (PTYFontInfo *)getFontForChar:(UniChar)ch
+                      isComplex:(BOOL)isComplex
+                     renderBold:(BOOL *)renderBold
+                   renderItalic:(BOOL *)renderItalic
+                       remapped:(UTF32Char *)ch;
 
 - (NSColor*)colorForCode:(int)theIndex
                    green:(int)green
@@ -660,12 +695,15 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 // Turns on the flicker fixer (if enabled) while drawing.
 - (void)performBlockWithFlickerFixerGrid:(void (NS_NOESCAPE ^)(void))block;
 
-- (id)contentWithAttributes:(BOOL)attributes;
+- (id)contentWithAttributes:(BOOL)attributes timestamps:(BOOL)timestamps;
 - (void)setUseBoldColor:(BOOL)flag brighten:(BOOL)brighten;
 
 - (void)drawRect:(NSRect)rect inView:(NSView *)view;
 
 - (void)setAlphaValue:(CGFloat)alphaValue NS_UNAVAILABLE;
+- (NSRect)rectForCoord:(VT100GridCoord)coord;
+- (void)updateSubviewFrames;
+- (NSDictionary *(^)(screen_char_t, iTermExternalAttribute *))attributeProviderUsingProcessedColors:(BOOL)processed;
 
 #pragma mark - Testing only
 
@@ -674,10 +712,6 @@ typedef NS_ENUM(NSUInteger, iTermCopyTextStyle) {
     iTermCopyTextStyleAttributed,
     iTermCopyTextStyleWithControlSequences
 };
-
-- (id)selectedTextWithStyle:(iTermCopyTextStyle)style
-               cappedAtSize:(int)maxBytes
-          minimumLineNumber:(int)minimumLineNumber;
 
 @end
 

@@ -1827,6 +1827,18 @@ class LocalWriteOnlyProfile:
         """
         return self._simple_set("Smart Selection Rules", value)
 
+    def set_smart_selection_actions_use_interpolated_strings(self, value: bool):
+        """
+        Sets whether smart selection action parameters are interpolated
+        strings.
+
+        Should smart selection actions' parameters be treated as interpolated
+        strings? If false, use the backward-compatibility syntax.
+
+        :param value: A bool
+        """
+        return self._simple_set("Smart Selection Actions Use Interpolated Strings", value)
+
     def set_semantic_history(self, value: typing.Dict[str, typing.Any]):
         """
         Sets the semantic history prefs.
@@ -1927,9 +1939,10 @@ class LocalWriteOnlyProfile:
 
     def set_background_image_location(self, value: str):
         """
-        Sets the path to the background image.
+        Sets or clears the path to a background image.
 
-        The value is a Path.
+        The value is a string with the path to the image file,
+        or an empty string to clear the setting.
 
         :param value: A str
         """
@@ -3858,6 +3871,16 @@ class WriteOnlyProfile:
         """
         return await self._async_simple_set("Smart Selection Rules", value)
 
+    async def async_set_smart_selection_actions_use_interpolated_strings(self, value: bool):
+        """
+        Sets whether smart selection action parameters are interpolated
+        strings.
+
+        Should smart selection actions' parameters be treated as interpolated
+        strings? If false, use the backward-compatibility syntax.
+        """
+        return await self._async_simple_set("Smart Selection Actions Use Interpolated Strings", value)
+
     async def async_set_semantic_history(self, value: typing.Dict[str, typing.Any]):
         """
         Sets the semantic history prefs.
@@ -3946,9 +3969,12 @@ class WriteOnlyProfile:
 
     async def async_set_background_image_location(self, value: str):
         """
-        Sets the path to the background image.
+        Sets or clears the path to a background image.
 
-        The value is a Path.
+        The value is a string with the path to the image file,
+        or an empty string to clear the setting.
+        
+        :param value: A str
         """
         return await self._async_simple_set("Background Image Location", value)
 
@@ -6115,6 +6141,19 @@ class Profile(WriteOnlyProfile):
         return self._simple_get("Smart Selection Rules")
 
     @property
+    def smart_selection_actions_use_interpolated_strings(self) -> bool:
+        """
+        Returns whether smart selection action parameters are interpolated
+        strings.
+
+        Should smart selection actions' parameters be treated as interpolated
+        strings? If false, use the backward-compatibility syntax.
+
+        :returns: A bool
+        """
+        return self._simple_get("Smart Selection Actions Use Interpolated Strings")
+
+    @property
     def semantic_history(self) -> typing.Dict[str, typing.Any]:
         """
         Returns the semantic history prefs.
@@ -6226,8 +6265,6 @@ class Profile(WriteOnlyProfile):
     def background_image_location(self) -> str:
         """
         Returns the path to the background image.
-
-        The value is a Path.
 
         :returns: A str
         """

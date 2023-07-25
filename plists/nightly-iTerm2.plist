@@ -122,6 +122,8 @@
         <string>The operation being performed by a program in iTerm2 requires elevated permission.</string>
         <key>NSAppleEventsUsageDescription</key>
         <string>An application in iTerm2 wants to use AppleScript.</string>
+        <key>NSBluetoothAlwaysUsageDescription</key>
+        <string>An application in iTerm2 wants to use Bluetooth.</string>
         <key>NSCalendarsUsageDescription</key>
         <string>An application in iTerm2 wants to use Calendar data.</string>
         <key>NSCameraUsageDescription</key>
@@ -136,6 +138,8 @@
         <string>An application in iTerm2 wants to use your location information while active.</string>
         <key>NSMicrophoneUsageDescription</key>
         <string>An application in iTerm2 wants to use your microphone.</string>
+        <key>NSSpeechRecognitionUsageDescription</key>
+        <string>An application in iTerm2 wants to use speech recognition.</string>
         <key>NSRemindersUsageDescription</key>
         <string>An application in iTerm2 wants to use your reminders.</string>
         <key>NSServices</key>
@@ -285,6 +289,22 @@
                 </dict>
                 <dict>
                         <key>CFBundleURLName</key>
+                        <string>Gemini URL</string>
+                        <key>CFBundleURLSchemes</key>
+                        <array>
+                                <string>gemini</string>
+                        </array>
+                </dict>
+                <dict>
+                        <key>CFBundleURLName</key>
+                        <string>Titan URL</string>
+                        <key>CFBundleURLSchemes</key>
+                        <array>
+                                <string>titan</string>
+                        </array>
+                </dict>
+                <dict>
+                        <key>CFBundleURLName</key>
                         <string>whois URL</string>
                         <key>CFBundleURLSchemes</key>
                         <array>
@@ -323,8 +343,6 @@
         <key>NSPrincipalClass</key>
         <string>iTermApplication</string>
         <key>NSSupportsAutomaticGraphicsSwitching</key>
-        <true/>
-        <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
         <true/>
         <key>SUPublicEDKey</key>
         <string>xdqAa0KXBPhMbUrutVTe87i6U7yWf7WKaCeRG7AAZ0w=</string>

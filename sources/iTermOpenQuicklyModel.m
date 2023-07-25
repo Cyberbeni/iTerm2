@@ -6,10 +6,12 @@
 #import "iTermColorPresets.h"
 #import "iTermController.h"
 #import "iTermGitPollWorker.h"
+#import "iTermHotKeyController.h"
 #import "iTermLogoGenerator.h"
 #import "iTermMinimumSubsequenceMatcher.h"
 #import "iTermOpenQuicklyCommands.h"
 #import "iTermOpenQuicklyItem.h"
+#import "iTermProfileHotKey.h"
 #import "iTermScriptsMenuController.h"
 #import "iTermSnippetsModel.h"
 #import "iTermVariableScope.h"
@@ -19,6 +21,7 @@
 #import "NSArray+iTerm.h"
 #import "NSDictionary+iTerm.h"
 #import "NSObject+iTerm.h"
+#import "NSScreen+iTerm.h"
 #import "NSStringITerm.h"
 #import "PseudoTerminal.h"
 #import "PTYSession+Scripting.h"
@@ -36,6 +39,9 @@ static const double kUserDefinedVariableMultiplier = 1;
 static const double kDirectoryMultiplier = 0.9;
 static const double kCommandMultiplier = 0.8;
 static const double kUsernameMultiplier = 0.5;
+
+// Variables like tty and job pid.
+static const double kOtherVariableMultiplier = 0.4;
 
 // Action items (as defined in Prefs > Shortcuts > Snippets)
 static const double kActionMultiplier = 0.4;
@@ -55,6 +61,9 @@ static const double kProfileNameMultiplierForColorPresetItem = 0.095;
 // Multipliers for script items. Ranks below profiles.
 static const double kProfileNameMultiplierForScriptItem = 0.09;
 
+// Multipliers for windows items. Windows rank below scripts since it's a redundant feature.
+static const double kProfileNameMultiplierForWindowItem = 0.08;
+
 @implementation iTermOpenQuicklyModel
 
 #pragma mark - Commands
@@ -66,6 +75,7 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
         commands = @[ [iTermOpenQuicklyWindowArrangementCommand class],
                       [iTermOpenQuicklySearchSessionsCommand class],
                       [iTermOpenQuicklySwitchProfileCommand class],
+                      [iTermOpenQuicklySearchWindowsCommand class],
                       [iTermOpenQuicklyCreateTabCommand class],
                       [iTermOpenQuicklyColorPresetCommand class],
                       [iTermOpenQuicklyScriptCommand class],
@@ -146,27 +156,32 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
     }
 }
 
-- (NSString *(^)(PTYSession *))detailFunctionForSessions:(NSArray<PTYSession *> *)sessions {
-    NSString *(^pwd)(PTYSession *) = ^NSString *(PTYSession *session) {
-        return session.variablesScope.path;
+- (NSString *)documentForWindow:(PseudoTerminal *)term {
+    return term.window.title ?: @"";
+}
+
+// Returns a function PTYSession -> (Feature name, Feature value) that gives the value which most distinguishes sesssions from one another.
+- (iTermTuple<NSString *, NSString *> *(^)(PTYSession *))detailFunctionForSessions:(NSArray<PTYSession *> *)sessions {
+    iTermTuple<NSString *, NSString *> *(^pwd)(PTYSession *) = ^iTermTuple<NSString *, NSString *> *(PTYSession *session) {
+        return [iTermTuple tupleWithObject:@"Directory" andObject:session.variablesScope.path];
     };
-    NSString *(^command)(PTYSession *) = ^NSString *(PTYSession *session) {
-        return session.commands.lastObject;
+    iTermTuple<NSString *, NSString *> *(^command)(PTYSession *) = ^iTermTuple<NSString *, NSString *> *(PTYSession *session) {
+        return [iTermTuple tupleWithObject:@"Command" andObject:session.commands.lastObject];
     };
-    NSString *(^hostname)(PTYSession *) = ^NSString *(PTYSession *session) {
-        return session.currentHost.usernameAndHostname;
+    iTermTuple<NSString *, NSString *> *(^hostname)(PTYSession *) = ^iTermTuple<NSString *, NSString *> *(PTYSession *session) {
+        return [iTermTuple tupleWithObject:@"Host" andObject:session.currentHost.usernameAndHostname];
     };
-    NSString *(^badge)(PTYSession *) = ^NSString *(PTYSession *session) {
-        return session.badgeLabel;
+    iTermTuple<NSString *, NSString *> *(^badge)(PTYSession *) = ^iTermTuple<NSString *, NSString *> *(PTYSession *session) {
+        return [iTermTuple tupleWithObject:@"Badge" andObject:session.badgeLabel];
     };
-    NSArray<NSString *(^)(PTYSession *)> *functions = @[ pwd, command, hostname, badge ];
+    NSArray<iTermTuple<NSString *, NSString *> *(^)(PTYSession *)> *functions = @[ pwd, command, hostname, badge ];
     NSMutableArray<NSMutableArray *> *functionValues = [NSMutableArray array];
-    [functions enumerateObjectsUsingBlock:^(NSString *(^ _Nonnull obj)(PTYSession *), NSUInteger idx, BOOL * _Nonnull stop) {
+    [functions enumerateObjectsUsingBlock:^(iTermTuple<NSString *, NSString *> *(^ _Nonnull obj)(PTYSession *), NSUInteger idx, BOOL * _Nonnull stop) {
         [functionValues addObject:[NSMutableArray array]];
     }];
     [sessions enumerateObjectsUsingBlock:^(PTYSession * _Nonnull session, NSUInteger sessionIndex, BOOL * _Nonnull stop) {
-        [functions enumerateObjectsUsingBlock:^(NSString *(^ _Nonnull f)(PTYSession *), NSUInteger functionIndex, BOOL * _Nonnull stop) {
-            NSString *value = f(session);
+        [functions enumerateObjectsUsingBlock:^(iTermTuple<NSString *, NSString *> *(^ _Nonnull f)(PTYSession *), NSUInteger functionIndex, BOOL * _Nonnull stop) {
+            iTermTuple<NSString *, NSString *> *value = f(session);
             if (value) {
                 [functionValues[functionIndex] addObject:value];
             }
@@ -179,19 +194,21 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
         }
     }];
 
-    NSMutableArray<NSString *(^)(PTYSession *)> *filteredFunctions = [NSMutableArray array];
+    NSMutableArray<iTermTuple<NSString *, NSString *> *(^)(PTYSession *)> *filteredFunctions = [NSMutableArray array];
     NSMutableArray<NSMutableArray *> *filteredFunctionValues = [NSMutableArray array];
     [indexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL * _Nonnull stop) {
         [filteredFunctions addObject:functions[idx]];
         [filteredFunctionValues addObject:functionValues[idx]];
     }];
-    double (^variance)(NSArray<NSString *> *) = ^double(NSArray<NSString *> *strings) {
-        NSSet<NSString *> *set = [NSSet setWithArray:strings];
+    double (^variance)(NSArray<iTermTuple<NSString *, NSString *> *> *) = ^double(NSArray<iTermTuple<NSString *, NSString *> *> *tuples) {
+        NSSet<NSString *> *set = [NSSet setWithArray:[tuples mapWithBlock:^id _Nonnull(iTermTuple<NSString *,NSString *> * _Nonnull tuple) {
+            return tuple.secondObject;
+        }]];
         return set.count;
     };
     const NSUInteger best = [filteredFunctionValues indexOfMaxWithBlock:
-                             ^NSComparisonResult(NSMutableArray<NSString *> *obj1,
-                                                 NSMutableArray<NSString *> *obj2) {
+                             ^NSComparisonResult(NSMutableArray<iTermTuple<NSString *, NSString *> *> *obj1,
+                                                 NSMutableArray<iTermTuple<NSString *, NSString *> *> *obj2) {
         return [@(variance(obj1)) compare:@(variance(obj2))];
     }];
     if (best == NSNotFound) {
@@ -202,7 +219,8 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
 
 - (void)addSessionLocationToItems:(NSMutableArray<iTermOpenQuicklyItem *> *)items
                     withMatcher:(iTermMinimumSubsequenceMatcher *)matcher {
-    NSString *(^detailFunction)(PTYSession *) = [self detailFunctionForSessions:self.sessions];
+    // (feature name, display string)
+    iTermTuple<NSString *, NSString *> *(^detailFunction)(PTYSession *) = [self detailFunctionForSessions:self.sessions];
 
     for (PTYSession *session in self.sessions) {
         NSMutableArray *features = [NSMutableArray array];
@@ -218,7 +236,9 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
                                   features:features
                             attributedName:attributedName];
         if (item.score > 0) {
-            item.detail = [self detailForSession:session features:features];
+            iTermTuple<NSString *, NSAttributedString *> *detail = [self detailForSession:session features:features];
+            // "Feature: value" giving why this session was recalled.
+            item.detail = detail.secondObject;
             if (attributedName.length) {
                 item.title = attributedName;
             } else {
@@ -229,11 +249,99 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
 
             item.identifier = session.guid;
             if (detailFunction) {
-                item.detail = [self.delegate openQuicklyModelAttributedStringForDetail:detailFunction(session)];
+                iTermTuple<NSString *, NSString *> *detailTuple = detailFunction(session);
+                // "Feature: value" giving identifying info about this session to distinguish it from others. Query-independent.
+                NSAttributedString *refinement =
+                [self.delegate openQuicklyModelAttributedStringForDetail:detailTuple.secondObject
+                                                             featureName:detailTuple.firstObject];
+                if (![detailTuple.firstObject isEqual:detail.firstObject] && item.detail != nil) {
+                    NSMutableAttributedString *temp = [item.detail mutableCopy];
+                    NSAttributedString *emdash = [[NSAttributedString alloc] initWithString:@" — "
+                                                                                 attributes:[item.detail attributesAtIndex:0 effectiveRange:nil]];
+                    [temp appendAttributedString:emdash];
+                    [temp appendAttributedString:refinement];
+                    item.detail = temp;
+                } else {
+                    item.detail = refinement;
+                }
             }
             [items addObject:item];
         }
     }
+}
+
+- (void)addWindowLocationToItems:(NSMutableArray<iTermOpenQuicklyItem *> *)items
+                     withMatcher:(iTermMinimumSubsequenceMatcher *)matcher {
+    const BOOL multipleDisplays = [[NSScreen screens] count] > 1;
+    for (PseudoTerminal *term in [[iTermController sharedInstance] terminals]) {{
+        iTermOpenQuicklyWindowItem *item = [[iTermOpenQuicklyWindowItem alloc] init];
+        NSMutableAttributedString *attributedName = [[NSMutableAttributedString alloc] init];
+        item.score = [self scoreForWindow:term
+                                  matcher:matcher
+                           attributedName:attributedName];
+        if (item.score > 0) {
+            NSMutableArray<NSString *> *features = [NSMutableArray array];
+            if (multipleDisplays) {
+                NSString *name = [term.window.screen it_uniqueName];
+                if (name) {
+                    [features addObject:[NSString stringWithFormat:@"On %@", name]];
+                } else {
+                    [features addObject:@"Offscreen"];
+                }
+            }
+            if (term.window.isMiniaturized) {
+                [features addObject:@"Miniaturized"];
+            }
+            if (term.anyFullScreen) {
+                [features addObject:@"Full screen"];
+            }
+            if (!term.window.isOnActiveSpace && !(term.window.collectionBehavior & NSWindowCollectionBehaviorCanJoinAllSpaces)) {
+                [features addObject:@"On other Space"];
+            }
+            if (term.isHotKeyWindow) {
+                iTermProfileHotKey *profileHotkey = [[iTermHotKeyController sharedInstance] profileHotKeyForWindowController:term];
+                iTermShortcut *shortcut = profileHotkey.shortcuts.firstObject;
+                if (shortcut) {
+                    [features addObject:[NSString stringWithFormat:@"Hotkey %@", shortcut.stringValue]];
+                } else if (profileHotkey.hasModifierActivation) {
+                    const iTermHotKeyModifierActivation mod = profileHotkey.modifierActivation;
+                    NSEventModifierFlags flags = 0;
+                    switch (mod) {
+                        case iTermHotKeyModifierActivationShift:
+                            flags = NSEventModifierFlagShift;
+                            break;
+                        case iTermHotKeyModifierActivationOption:
+                            flags = NSEventModifierFlagOption;
+                            break;
+                        case iTermHotKeyModifierActivationCommand:
+                            flags = NSEventModifierFlagCommand;
+                            break;
+                        case iTermHotKeyModifierActivationControl:
+                            flags = NSEventModifierFlagControl;
+                            break;
+                    }
+                    if (flags) {
+                        NSString *key = [NSString stringForModifiersWithMask:flags];
+                        [features addObject:[NSString stringWithFormat:@"Hotkey %@%@", key, key]];
+                    }
+                }
+            }
+            if (features.count) {
+                item.detail = [_delegate openQuicklyModelDisplayStringForFeatureNamed:nil
+                                                                                value:[features componentsJoinedByString:@" — "]
+                                                                   highlightedIndexes:nil];
+            }
+            if (attributedName.length) {
+                item.title = attributedName;
+            } else {
+                item.title = [_delegate openQuicklyModelDisplayStringForFeatureNamed:nil
+                                                                               value:[self documentForWindow:term]
+                                                                  highlightedIndexes:nil];
+            }
+            item.identifier = term.terminalGuid;
+            [items addObject:item];
+        }
+    }}
 }
 
 - (void)addCreateNewTabToItems:(NSMutableArray<iTermOpenQuicklyItem *> *)items
@@ -455,7 +563,9 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
     if ([command supportsSessionLocation]) {
         [self addSessionLocationToItems:items withMatcher:matcher];
     }
-
+    if ([command supportsWindowLocation]) {
+        [self addWindowLocationToItems:items withMatcher:matcher];
+    }
     BOOL haveCurrentWindow = [[iTermController sharedInstance] currentTerminal] != nil;
     if ([command supportsCreateNewTab]) {
         [self addCreateNewTabToItems:items withMatcher:matcher haveCurrentWindow:haveCurrentWindow];
@@ -513,6 +623,13 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
                 return session;
             }
         }
+    } else if ([item isKindOfClass:[iTermOpenQuicklyWindowItem class]]) {
+        NSString *guid = item.identifier;
+        for (PseudoTerminal *term in [[iTermController sharedInstance] terminals]) {
+            if ([term.terminalGuid isEqual:guid]) {
+                return term;
+            }
+        }
     } else if ([item isKindOfClass:[iTermOpenQuicklyScriptItem class]]) {
         return item;
     } else if ([item isKindOfClass:[iTermOpenQuicklyColorPresetItem class]]) {
@@ -542,6 +659,22 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
         // Make the default arrangement always be the highest-scored arrangement if it matches the query.
         score += 0.2;
     }
+    if (nameFeature.count) {
+        [attributedName appendAttributedString:nameFeature[0][0]];
+    }
+    return score;
+}
+
+- (double)scoreForWindow:(PseudoTerminal *)term
+                 matcher:(iTermMinimumSubsequenceMatcher *)matcher
+          attributedName:(NSMutableAttributedString *)attributedName {
+    NSMutableArray *nameFeature = [NSMutableArray array];
+    double score = [self scoreUsingMatcher:matcher
+                                 documents:@[ term.window.title ?: @"" ]
+                                multiplier:kProfileNameMultiplierForWindowItem
+                                      name:nil
+                                  features:nameFeature
+                                     limit:2 * kProfileNameMultiplierForWindowItem];
     if (nameFeature.count) {
         [attributedName appendAttributedString:nameFeature[0][0]];
     }
@@ -638,7 +771,7 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
 // session: The session to score against a query
 // query: The search query (null terminate)
 // length: The length of the query array
-// features: An array that will be populated with tuples of (detail, score).
+// features: An array that will be populated with tuples of (detail, score, feature name).
 //   The detail element is a suitable-for-display NSAttributedString*s
 //   describing features that matched the query, while the score element is the
 //   score assigned to that feature.
@@ -648,7 +781,7 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
                   matcher:(iTermMinimumSubsequenceMatcher *)matcher
                  features:(NSMutableArray *)features
            attributedName:(NSMutableAttributedString *)attributedName {
-    double score = 0;
+    __block double score = 0;
     double maxScorePerFeature = 2 + matcher.query.length / 4;
     if (session.name) {
         NSMutableArray *nameFeature = [NSMutableArray array];
@@ -724,6 +857,25 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
                                    limit:maxScorePerFeature];
     }
 
+    NSString *tty = [NSString castFrom:[session.variables valueForVariableName:iTermVariableKeySessionTTY]];
+    NSNumber *pid = [NSNumber castFrom:[session.variables valueForVariableName:iTermVariableKeySessionJobPid]];
+    NSDictionary<NSString *, NSString *> *variables = [@{
+        @"tty": tty ?: [NSNull null],
+        @"pid": pid.stringValue ?: [NSNull null]
+    } mapValuesWithBlock:^NSString *(NSString *key, NSString *value) {
+        return [value nilIfNull];
+    }];
+    [variables enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull name,
+                                                   NSString * _Nonnull value,
+                                                   BOOL * _Nonnull stop) {
+        score += [self scoreUsingMatcher:matcher
+                               documents:@[ value ]
+                              multiplier:kOtherVariableMultiplier
+                                    name:name
+                                features:features
+                                   limit:maxScorePerFeature];
+    }];
+
     // TODO: add a bonus for:
     // Doing lots of typing in a session
     // Being newly created
@@ -734,13 +886,16 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
 
 // Given an array of features which are a tuple of (detail, score), return the
 // detail for the highest scoring one.
-- (NSAttributedString *)detailForSession:(PTYSession *)session features:(NSArray *)features {
+// Returns (feature name, display string)
+- (iTermTuple<NSString *, NSAttributedString *> *)detailForSession:(PTYSession *)session
+                                                          features:(NSArray *)features {
     NSArray *sorted = [features sortedArrayUsingComparator:^NSComparisonResult(NSArray *tuple1, NSArray *tuple2) {
         NSNumber *score1 = tuple1[1];
         NSNumber *score2 = tuple2[1];
         return [score1 compare:score2];
     }];
-    return [sorted lastObject][0];
+    NSArray *winner = [sorted lastObject];
+    return [iTermTuple tupleWithObject:winner[2] andObject:winner[0]];
 }
 
 // Returns the total score for a query matching an array of documents. This
@@ -771,7 +926,7 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
                 id displayString = [_delegate openQuicklyModelDisplayStringForFeatureNamed:name
                                                                                      value:document
                                                                         highlightedIndexes:[NSIndexSet indexSet]];
-                [features addObject:@[ displayString, @(score) ]];
+                [features addObject:@[ displayString, @(score), name ?: @"" ]];
             }
         }
         return score;
@@ -807,7 +962,7 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
         id displayString = [_delegate openQuicklyModelDisplayStringForFeatureNamed:name
                                                                              value:bestFeature
                                                                 highlightedIndexes:bestIndexSet];
-        [features addObject:@[ displayString, @(score) ]];
+        [features addObject:@[ displayString, @(score), name ?: @"" ]];
     }
 
     return MIN(limit, score);
@@ -856,18 +1011,18 @@ static const double kProfileNameMultiplierForScriptItem = 0.09;
 #pragma mark - Feature Extraction
 
 // Returns an array of hostnames from an array of VT100RemoteHost*s
-- (NSArray *)hostnamesInHosts:(NSArray *)hosts {
+- (NSArray *)hostnamesInHosts:(NSArray<id<VT100RemoteHostReading>> *)hosts {
     NSMutableArray *names = [NSMutableArray array];
-    for (VT100RemoteHost *host in hosts) {
+    for (id<VT100RemoteHostReading> host in hosts) {
         [names addObject:host.hostname];
     }
     return names;
 }
 
 // Returns an array of usernames from an array of VT100RemoteHost*s
-- (NSArray *)usernamesInHosts:(NSArray *)hosts {
+- (NSArray *)usernamesInHosts:(NSArray<id<VT100RemoteHostReading>> *)hosts {
     NSMutableArray *names = [NSMutableArray array];
-    for (VT100RemoteHost *host in hosts) {
+    for (id<VT100RemoteHostReading> host in hosts) {
         [names addObject:host.username];
     }
     return names;

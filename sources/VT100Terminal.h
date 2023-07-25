@@ -105,7 +105,6 @@ typedef NS_OPTIONS(int, VT100TerminalKeyReportingFlags) {
 // True if receiving a file in multitoken mode, or if between BeginFile and
 // EndFile codes (which are deprecated).
 @property(nonatomic, readonly) BOOL receivingFile;
-@property(nonatomic, readonly) BOOL copyingToPasteboard;
 
 // If nonnil then we're currently in a hypertext link.
 @property(nonatomic, readonly) NSURL *url;
@@ -128,6 +127,21 @@ typedef NS_OPTIONS(int, VT100TerminalKeyReportingFlags) {
 @property(nonatomic, readonly) BOOL decsaceRectangleMode;
 @property(nonatomic, readonly) VT100TerminalProtectedMode protectedMode;
 @property(nonatomic, strong, readonly) VT100Token *lastToken;
+@property(nonatomic, copy) NSDictionary<NSNumber *, id> *stringForKeypress;
+@property(nonatomic) BOOL wantsDidExecuteCallback;
+
+@property(atomic) BOOL dirty;
+typedef NS_ENUM(NSUInteger, VT100TerminalFramerRecoveryMode) {
+    VT100TerminalFramerRecoveryModeNone,
+    VT100TerminalFramerRecoveryModeRecovering,
+    VT100TerminalFramerRecoveryModeSyncing  // between when recovery begins and when the parser starts producing normal tokens
+};
+
+@property(nonatomic) VT100TerminalFramerRecoveryMode framerRecoveryMode;
+@property(nonatomic) NSInteger framerBoundaryNumber;
+
++ (NSOrderedSet<NSString *> *)sgrCodesForCharacter:(screen_char_t)c
+                                externalAttributes:(iTermExternalAttribute *)ea;
 
 - (void)setStateFromDictionary:(NSDictionary *)dict;
 
@@ -143,6 +157,9 @@ typedef NS_OPTIONS(int, VT100TerminalKeyReportingFlags) {
 // off for a newly launched program. It differs from resetByUserRequest: by not modifying screen
 // contents.
 - (void)resetForRelaunch;
+
+// Initialize terminal state for fresh host.
+- (void)resetForSSH;
 
 - (void)setDisableSmcupRmcup:(BOOL)value;
 
@@ -173,9 +190,6 @@ typedef NS_OPTIONS(int, VT100TerminalKeyReportingFlags) {
 - (void)resetGraphicRendition;
 
 - (void)gentleReset;
-
-- (NSSet<NSString *> *)sgrCodesForCharacter:(screen_char_t)c
-                         externalAttributes:(iTermExternalAttribute *)ea;
 
 - (void)resetSendModifiersWithSideEffects:(BOOL)sideEffects;
 - (void)toggleAlternateScreen;

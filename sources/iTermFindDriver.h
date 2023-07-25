@@ -22,7 +22,7 @@
 - (BOOL)findInProgress;
 
 // Search more. Fill in *progress with how much of the buffer has been searched.
-- (BOOL)continueFind:(double *)progress;
+- (BOOL)continueFind:(double *)progress range:(NSRange *)rangePtr;
 
 // Moves the beginning of the current selection leftward by a word.
 - (BOOL)growSelectionLeft;
@@ -72,8 +72,9 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 
 @property (nonatomic, weak) id<iTermFindDriverDelegate> delegate;
 @property (nonatomic, readonly) NSViewController<iTermFindViewController> *viewController;
-@property (nonatomic, readonly) NSViewController<iTermFindViewController> *filterViewController;
+@property (nonatomic, readonly) NSViewController<iTermFilterViewController> *filterViewController;
 @property (nonatomic) iTermFindMode mode;
+@property (nonatomic, readonly) BOOL shouldSearchAutomatically;
 
 // NOTE: Permanently visible find views (those added to status bars via configuration) never
 // return YES for isVisible.
@@ -83,7 +84,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 @property (nonatomic) BOOL needsUpdateOnFocus;
 
 - (instancetype)initWithViewController:(NSViewController<iTermFindViewController> *)viewController
-                  filterViewController:(NSViewController<iTermFindViewController> *)filterViewController NS_DESIGNATED_INITIALIZER;
+                  filterViewController:(NSViewController<iTermFilterViewController> *)filterViewController NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
 // Animates in a hidden find view.
@@ -104,7 +105,8 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 // navigate with with next-previous. When the find window is opened, the state
 // is restored.
 - (void)closeViewAndDoTemporarySearchForString:(NSString *)string
-                                          mode:(iTermFindMode)mode;
+                                          mode:(iTermFindMode)mode
+                                      progress:(void (^)(NSRange linesSearched))progress;
 
 - (void)owningViewDidBecomeFirstResponder;
 - (void)setFilterWithoutSideEffects:(NSString *)filter;
@@ -113,5 +115,6 @@ scrollToFirstResult:(BOOL)scrollToFirstResult;
 - (void)invalidateFrame;
 - (void)filterVisibilityDidChange;
 - (void)setFilterProgress:(double)progress;
+- (void)highlightWithoutSelectingSearchResultsForQuery:(NSString *)string;
 
 @end

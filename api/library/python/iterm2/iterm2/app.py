@@ -7,6 +7,7 @@ import json
 import typing
 
 import iterm2.broadcast
+import iterm2.capabilities
 import iterm2.connection
 import iterm2.notifications
 import iterm2.rpc
@@ -34,10 +35,13 @@ async def async_get_app(
     if App.instance is None:
         if create_if_needed:
             App.instance = await App.async_construct(connection)
+            iterm2.connection.add_disconnect_callback(invalidate_app)
     else:
         await App.instance.async_refresh()
     return App.instance
 
+def invalidate_app():
+    App.instance = None
 
 # See note in tmux.async_get_tmux_connections()
 iterm2.tmux.DELEGATE_FACTORY = async_get_app  # type: ignore
@@ -152,7 +156,7 @@ class App(
             session += window.pretty_str(indent="")
         return session
 
-    def _search_for_session_id(self, session_id):
+    def _search_for_session_id(self, session_id, include_buried):
         if session_id == "active":
             return iterm2.session.Session.active_proxy(self.connection)
         if session_id == "all":
@@ -164,6 +168,10 @@ class App(
                 for session in sessions:
                     if session.session_id == session_id:
                         return session
+        if include_buried:
+            for session in self.__buried_sessions:
+                if session.session_id == session_id:
+                    return session
         return None
 
     def _search_for_tab_id(self, tab_id):
@@ -196,15 +204,20 @@ class App(
 
     def get_session_by_id(
             self,
-            session_id: str) -> typing.Union[None, iterm2.session.Session]:
+            session_id: str,
+            include_buried: bool = True) -> typing.Union[None, iterm2.session.Session]:
         """Finds a session exactly matching the passed-in id.
 
+        Note: the behavior of this method changed in version 2.3. Earlier
+        versions never returned buried sesions.
+
         :param session_id: The session ID to search for.
+        :param include_buried: OK to return buried sessions?
 
         :returns: A :class:`Session` or `None`.
         """
         assert session_id
-        return self._search_for_session_id(session_id)
+        return self._search_for_session_id(session_id, include_buried)
 
     def get_tab_by_id(self, tab_id: str) -> typing.Union[iterm2.tab.Tab, None]:
         """Finds a tab exactly matching the passed-in id.
@@ -497,6 +510,23 @@ class App(
                 if session in tab.all_sessions:
                     return window, tab
         return None, None
+
+    async def async_move_session(
+            self,
+            session: iterm2.session.Session,
+            destination: iterm2.session.Session,
+            split_vertically: bool,
+            before: bool):
+        """
+        Move a session to be a split pane by splitting another existing session.
+
+        :param split_vertically: If `True`, split the destination session vertically.
+        :param before: If `True`, place `session` left of/above `destionation`.
+        """
+        iterm2.capabilities.check_supports_move_session(self.connection)
+        await async_invoke_function(
+            self.connection,
+            f'iterm2.move_session(session: {json.dumps(session.session_id)}, destination: {json.dumps(destination.session_id)}, vertical: {json.dumps(split_vertically)}, before: {json.dumps(before)})')
 
     async def _async_listen(self):
         """

@@ -14,7 +14,8 @@ typedef NS_OPTIONS(NSInteger, iTermSavePanelOptions) {
     // If this option is not set, the user will only be asked about replacing.
     kSavePanelOptionAppendOrReplace = (1 << 0),
     kSavePanelOptionFileFormatAccessory = (1 << 1),
-    kSavePanelOptionLogPlainTextAccessory = (1 << 2)
+    kSavePanelOptionLogPlainTextAccessory = (1 << 2),
+    kSavePanelOptionIncludeTimestampsAccessory= (1 << 3)
 };
 
 typedef NS_ENUM(NSInteger, iTermSavePanelReplaceOrAppend) {
@@ -31,19 +32,14 @@ typedef NS_ENUM(NSInteger, iTermSavePanelReplaceOrAppend) {
 // Path the user selected.
 @property(nonatomic, readonly) NSString *path;
 @property (nonatomic, readonly) iTermLoggingStyle loggingStyle;
+@property(nonatomic, readonly) BOOL timestamps;
 
-// Prompts the user and returns a new iTermSavePanel.
-+ (iTermSavePanel *)showWithOptions:(NSInteger)options
-                         identifier:(NSString *)identifier
-                   initialDirectory:(NSString *)initialDirectory
-                    defaultFilename:(NSString *)defaultFilename
-                             window:(NSWindow *)window;
-
-+ (iTermSavePanel *)showWithOptions:(NSInteger)options
-                         identifier:(NSString *)identifier
-                   initialDirectory:(NSString *)initialDirectory
-                    defaultFilename:(NSString *)defaultFilename
-                   allowedFileTypes:(NSArray<NSString *> *)allowedFileTypes
-                             window:(NSWindow *)window;
++ (void)asyncShowWithOptions:(NSInteger)options
+                  identifier:(NSString *)identifier
+            initialDirectory:(NSString *)initialDirectory
+             defaultFilename:(NSString *)defaultFilename
+            allowedFileTypes:(NSArray<NSString *> *)allowedFileTypes
+                      window:(NSWindow *)window
+                  completion:(void (^)(iTermSavePanel *panel))completion;
 
 @end

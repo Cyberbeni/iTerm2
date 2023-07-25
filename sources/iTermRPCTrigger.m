@@ -10,7 +10,7 @@
 #import "iTermScriptFunctionCall.h"
 #import "iTermVariableScope.h"
 #import "NSArray+iTerm.h"
-#import "PTYSession.h"
+#import "ScreenChar.h"
 
 static NSString *const iTermRPCTriggerPathCapturedStrings = @"trigger.captured_strings";
 static NSString *const iTermRPCTriggerPathCapturedRanges = @"trigger.captured_ranges";
@@ -39,31 +39,26 @@ static NSString *const iTermRPCTriggerPathLineNumber = @"trigger.line_number";
               iTermRPCTriggerPathLineNumber ];
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
     NSString *invocation = self.param;
 
-    NSArray<NSString *> *captureStringArray = [[NSArray alloc] initWithObjects:capturedStrings
-                                                                         count:captureCount];
     NSMutableArray<NSArray<NSNumber *> *> *captureRangeArray = [NSMutableArray array];
-    for (NSInteger i = 0; i < captureCount; i++) {
+    for (NSInteger i = 0; i < stringArray.count; i++) {
         [captureRangeArray addObject:@[ @(capturedRanges[i].location), @(capturedRanges[i].length) ]];
     }
 
-    NSDictionary *temporaryVariables = @{ iTermRPCTriggerPathCapturedStrings: captureStringArray,
+    NSDictionary *temporaryVariables = @{ iTermRPCTriggerPathCapturedStrings: stringArray,
                                           iTermRPCTriggerPathCapturedRanges: captureRangeArray,
                                           iTermRPCTriggerPathInput: stringLine.stringValue ?: @"",
                                           iTermRPCTriggerPathLineNumber: @(lineNumber) };
-    iTermVariableScope *scope = [self variableScope:aSession.variablesScope
-                             byAddingBackreferences:captureStringArray];
-    [scope setValuesFromDictionary:temporaryVariables];
-    [aSession invokeFunctionCall:invocation scope:scope origin:@"Trigger"];
+    [aSession triggerSession:self invoke:invocation withVariables:temporaryVariables captures:stringArray];
+
 
     return YES;
 }

@@ -8,6 +8,7 @@
 #import "iTermMetalPerFrameState.h"
 
 #import "DebugLogging.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermAlphaBlendingHelper.h"
 #import "iTermBoxDrawingBezierCurveFactory.h"
@@ -64,9 +65,8 @@ typedef struct {
     BOOL image;
 } iTermBackgroundColorKey;
 
-static vector_float4 VectorForColor(NSColor *srgb, NSColorSpace *colorSpace) {
-#warning TODO: This needs to be cached.
-    NSColor *color = [srgb colorUsingColorSpace:colorSpace];
+static vector_float4 VectorForColor(NSColor *colorInUnknownSpace, NSColorSpace *colorSpace) {
+    NSColor *color = [colorInUnknownSpace colorUsingColorSpace:colorSpace];
     return (vector_float4) { color.redComponent, color.greenComponent, color.blueComponent, color.alphaComponent };
 }
 
@@ -116,6 +116,9 @@ typedef struct {
     NSArray<iTermHighlightedRow *> *_highlightedRows;
     NSTimeInterval _startTime;
     NSEdgeInsets _extraMargins;
+    BOOL _haveOffscreenCommandLine;
+
+    VT100GridRange _linesToSuppressDrawing;
 }
 @end
 
@@ -164,8 +167,7 @@ typedef struct {
     [self loadIndicatorsFromTextView:textView];
     [self loadHighlightedRowsFromTextView:textView];
     [self loadAnnotationRangesFromTextView:textView];
-
-    [textView.dataSource setUseSavedGridIfAvailable:NO];
+    [self loadOffscreenCommandLine:textView];
 }
 
 - (void)loadSettingsWithDrawingHelper:(iTermTextDrawingHelper *)drawingHelper
@@ -194,6 +196,9 @@ typedef struct {
     _relativeFrame = textView.delegate.textViewRelativeFrame;
     _containerRect = textView.delegate.textViewContainerRect;
     _extraMargins = textView.delegate.textViewExtraMargins;
+
+    _linesToSuppressDrawing = textView.drawingHelper.linesToSuppress;
+    _linesToSuppressDrawing.location -= _visibleRange.start.y;
 }
 
 - (void)loadLinesWithDrawingHelper:(iTermTextDrawingHelper *)drawingHelper
@@ -214,14 +219,13 @@ typedef struct {
     _badgeImage = drawingHelper.badgeImage;
     if (_badgeImage) {
         _badgeDestinationRect = [iTermTextDrawingHelper rectForBadgeImageOfSize:_badgeImage.size
-                                                                destinationRect:textView.textDrawingHelperVisibleRect
                                                            destinationFrameSize:textView.frame.size
-                                                                    visibleSize:textView.textDrawingHelperVisibleRect.size
                                                                   sourceRectPtr:&_badgeSourceRect
                                                                         margins:NSEdgeInsetsMake(drawingHelper.badgeTopMargin,
                                                                                                  0,
                                                                                                  0,
-                                                                                                 drawingHelper.badgeRightMargin)];
+                                                                                                 drawingHelper.badgeRightMargin)
+                                                                 verticalOffset:0];
     }
 }
 
@@ -237,9 +241,27 @@ typedef struct {
     glue.oldCursorScreenCoord = cursorScreenCoord;
 }
 
+- (vector_float4)backgroundColorForCharacter:(screen_char_t)c
+                                selected:(BOOL)selected
+                               findMatch:(BOOL)findMatch{
+    iTermBackgroundColorKey backgroundKey = {
+        .bgColor = c.backgroundColor,
+        .bgGreen = c.bgGreen,
+        .bgBlue = c.bgBlue,
+        .bgColorMode = c.backgroundColorMode,
+        .selected = selected,
+        .isMatch = findMatch,
+        .image = c.image != 0
+    };
+    BOOL isDefaultBackgroundColor = NO;
+    const vector_float4 unprocessedBackgroundColor = [self unprocessedColorForBackgroundColorKey:&backgroundKey
+                                                                   isDefault:&isDefaultBackgroundColor];
+    return [_configuration->_colorMap fastProcessedBackgroundColorForBackgroundColor:unprocessedBackgroundColor];
+
+}
 - (void)loadCursorInfoWithDrawingHelper:(iTermTextDrawingHelper *)drawingHelper
                                textView:(PTYTextView *)textView {
-    _cursorVisible = drawingHelper.cursorVisible;
+    _cursorVisible = drawingHelper.isCursorVisible;
     const int offset = _visibleRange.start.y - _numberOfScrollbackLines;
     _cursorInfo = [[iTermMetalCursorInfo alloc] init];
     _cursorInfo.password = drawingHelper.passwordInput;
@@ -260,20 +282,23 @@ typedef struct {
         _cursorInfo.type = drawingHelper.cursorType;
         _cursorInfo.cursorColor = [self backgroundColorForCursor];
         {
-            iTermData *lineData = _rows[_cursorInfo.coord.y]->_screenCharLine;
-            const screen_char_t *const line = (const screen_char_t *const)lineData.bytes;
-            const screen_char_t screenChar = line[_cursorInfo.coord.x];
+            const screen_char_t *const line = _rows[_cursorInfo.coord.y]->_screenCharLine.line;
+            const screen_char_t screenChar = _cursorInfo.coord.x < _rows[_cursorInfo.coord.y]->_screenCharLine.length ? line[_cursorInfo.coord.x] : (screen_char_t){0};
+            
             if (screenChar.code) {
-                if (screenChar.code == DWC_RIGHT) {
+                if (ScreenCharIsDWC_RIGHT(screenChar)) {
                     _cursorInfo.doubleWidth = NO;
                 } else {
                     const int column = _cursorInfo.coord.x;
-                    _cursorInfo.doubleWidth = (column < _configuration->_gridSize.width - 1) && (line[column + 1].code == DWC_RIGHT);
+                    _cursorInfo.doubleWidth = (column < _configuration->_gridSize.width - 1) && ScreenCharIsDWC_RIGHT(line[column + 1]);
                 }
             } else {
                 _cursorInfo.doubleWidth = NO;
             }
-
+            iTermMetalPerFrameStateRow *row = _rows[_cursorInfo.coord.y];
+            _cursorInfo.backgroundColor = [self backgroundColorForCharacter:screenChar
+                                                                   selected:[row->_selectedIndexSet containsIndex:_cursorInfo.coord.x]
+                                                                  findMatch:row->_matches && CheckFindMatchAtIndex(row->_matches, _cursorInfo.coord.x)];
             if (_cursorInfo.type == CURSOR_BOX) {
                 _cursorInfo.shouldDrawText = YES;
                 const BOOL focused = ((_configuration->_isInKeyWindow && _configuration->_textViewIsActiveSession) || _configuration->_shouldDrawFilledInCursor);
@@ -308,7 +333,7 @@ typedef struct {
                                                              components[3]);
                 } else {
                     if (_configuration->_reverseVideo) {
-                        _cursorInfo.textColor = [_configuration->_colorMap fastColorForKey:kColorMapBackground];
+                        _cursorInfo.textColor = [_configuration->_colorMap fastColorForKey:kColorMapForeground];
                     } else {
                         _cursorInfo.textColor = [self colorForCode:ALTSEM_CURSOR
                                                              green:0
@@ -320,7 +345,6 @@ typedef struct {
                     }
                 }
             }
-            [lineData checkForOverrun];
         }
     } else {
         _cursorInfo.cursorVisible = NO;
@@ -343,7 +367,8 @@ typedef struct {
                normalization:drawingHelper.normalization
               unicodeVersion:drawingHelper.unicodeVersion
                    gridWidth:drawingHelper.gridSize.width
-            numberOfIMELines:drawingHelper.numberOfIMELines];
+            numberOfIMELines:drawingHelper.numberOfIMELines
+         softAlternateScreen:drawingHelper.softAlternateScreenMode];
     }
 }
 
@@ -351,10 +376,13 @@ typedef struct {
     _highlightedRows = [textView.highlightedRows copy];
 }
 
+- (BOOL)haveOffscreenCommandLine {
+    return _haveOffscreenCommandLine;
+}
+
 - (iTermCharacterSourceDescriptor *)characterSourceDescriptorForASCIIWithGlyphSize:(CGSize)glyphSize
                                                                        asciiOffset:(CGSize)asciiOffset {
-    return [iTermCharacterSourceDescriptor characterSourceDescriptorWithAsciiFont:_configuration->_asciiFont
-                                                                     nonAsciiFont:_configuration->_nonAsciiFont
+    return [iTermCharacterSourceDescriptor characterSourceDescriptorWithFontTable:_configuration->_fontTable
                                                                       asciiOffset:asciiOffset
                                                                         glyphSize:glyphSize
                                                                          cellSize:_configuration->_cellSize
@@ -395,6 +423,26 @@ typedef struct {
     return _configuration->_scale;
 }
 
+- (vector_float4)offscreenCommandLineOutlineColor {
+    const float a = (float)_configuration->_offscreenCommandLineOutlineColor.alphaComponent;
+    return simd_make_float4((float)_configuration->_offscreenCommandLineOutlineColor.redComponent * a,
+                            (float)_configuration->_offscreenCommandLineOutlineColor.greenComponent * a,
+                            (float)_configuration->_offscreenCommandLineOutlineColor.blueComponent * a,
+                            a);
+}
+
+- (vector_float4)offscreenCommandLineBackgroundColor {
+    const float a = (float)_configuration->_offscreenCommandLineBackgroundColor.alphaComponent;
+    return simd_make_float4((float)_configuration->_offscreenCommandLineBackgroundColor.redComponent * a,
+                            (float)_configuration->_offscreenCommandLineBackgroundColor.greenComponent * a,
+                            (float)_configuration->_offscreenCommandLineBackgroundColor.blueComponent * a,
+                            a);
+}
+
+- (VT100GridRange)linesToSuppressDrawing {
+    return _linesToSuppressDrawing;
+}
+
 // Populate _rowToAnnotationRanges.
 - (void)loadAnnotationRangesFromTextView:(PTYTextView *)textView {
     NSRange rangeOfRows = NSMakeRange(_visibleRange.start.y, _visibleRange.end.y - _visibleRange.start.y + 1);
@@ -413,14 +461,18 @@ typedef struct {
     }];
 }
 
+- (void)loadOffscreenCommandLine:(PTYTextView *)textView {
+    _haveOffscreenCommandLine = textView.drawingHelper.offscreenCommandLine != nil;
+    if (_haveOffscreenCommandLine) {
+        _rows[0]->_screenCharLine = textView.drawingHelper.offscreenCommandLine.characters;
+        _rows[0]->_selectedIndexSet = [[NSIndexSet alloc] init];
+        _rows[0]->_matches = nil;
+        _rows[0]->_date = textView.drawingHelper.offscreenCommandLine.date;
+    }
+}
+
 - (void)loadIndicatorsFromTextView:(PTYTextView *)textView {
     _indicators = [NSMutableArray array];
-    CGFloat vmargin;
-    if (@available(macOS 10.14, *)) {
-        vmargin = 0;
-    } else {
-        vmargin = [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins];
-    }
     NSRect frame = textView.drawingHelper.indicatorFrame;
     frame.origin.y -= MAX(0, textView.virtualOffset);
     
@@ -443,6 +495,25 @@ typedef struct {
     [textView.indicatorsHelper didDraw];
 }
 
+- (screen_char_t)screenCharStyledForMarkedText:(screen_char_t)input {
+    screen_char_t c = input;
+    c.foregroundColor = ALTSEM_DEFAULT;
+    c.fgGreen = 0;
+    c.fgBlue = 0;
+    c.foregroundColorMode = ColorModeAlternate;
+
+    c.backgroundColor = ALTSEM_DEFAULT;
+    c.bgGreen = 0;
+    c.bgBlue = 0;
+    c.backgroundColorMode = ColorModeAlternate;
+
+    c.underline = YES;
+    c.underlineStyle = VT100UnderlineStyleSingle;
+    c.strikethrough = NO;
+
+    return c;
+}
+
 - (void)copyMarkedText:(NSString *)str
         cursorLocation:(int)cursorLocation
                     to:(VT100GridCoord)startCoord
@@ -450,7 +521,8 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
          normalization:(iTermUnicodeNormalization)normalization
         unicodeVersion:(NSInteger)unicodeVersion
              gridWidth:(int)gridWidth
-      numberOfIMELines:(int)numberOfIMELines {
+      numberOfIMELines:(int)numberOfIMELines
+   softAlternateScreen:(BOOL)softAlternateScreen {
     const int maxLen = [str length] * kMaxParts;
     screen_char_t buf[maxLen];
     screen_char_t fg = {0}, bg = {0};
@@ -465,7 +537,8 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
                         &cursorIndex,
                         NULL,
                         normalization,
-                        unicodeVersion);
+                        unicodeVersion,
+                        softAlternateScreen);
     VT100GridCoord coord = startCoord;
     coord.y -= numberOfIMELines;
     BOOL foundCursor = NO;
@@ -477,56 +550,32 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
         justWrapped = YES;
     }
 
-    // If the screen contents are getting moved up to make room for a multi-row IME line, clear out the lines at the bottom it adds.
-    for (int i = 0; i < numberOfIMELines; i++) {
-        const int y = _rows.count - i - 1;
-        const iTermData *lineData = _rows[y]->_screenCharLine;
-        screen_char_t *line = (screen_char_t *)lineData.mutableBytes;
-        memset(line, 0, sizeof(screen_char_t) * gridWidth);
-    }
     _imeInfo = [[iTermMetalIMEInfo alloc] init];
+    // i indexes into buf.
     for (int i = 0; i < len; i++) {
         if (coord.y >= 0 && coord.y < _rows.count) {
             if (i == cursorIndex) {
                 foundCursor = YES;
                 _imeInfo.cursorCoord = coord;
             }
-            const iTermData *lineData = _rows[coord.y]->_screenCharLine;
-            screen_char_t *line = (screen_char_t *)lineData.mutableBytes;
-            screen_char_t c = buf[i];
-            c.foregroundColor = ALTSEM_DEFAULT;
-            c.fgGreen = 0;
-            c.fgBlue = 0;
-            c.foregroundColorMode = ColorModeAlternate;
 
-            c.backgroundColor = ALTSEM_DEFAULT;
-            c.bgGreen = 0;
-            c.bgBlue = 0;
-            c.backgroundColorMode = ColorModeAlternate;
-
-            c.underline = YES;
-            c.underlineStyle = VT100UnderlineStyleSingle;
-            c.strikethrough = NO;
-            
-            if (i + 1 < len &&
-                coord.x == gridWidth -1 &&
-                buf[i+1].code == DWC_RIGHT &&
-                !buf[i+1].complexChar) {
+            const BOOL wouldSplit = (i + 1 < len &&
+                                     coord.x == gridWidth - 1 &&
+                                     ScreenCharIsDWC_RIGHT(buf[i+1]) &&
+                                     !buf[i+1].complexChar);
+            if (wouldSplit) {
                 // Bump DWC to start of next line instead of splitting it
-                c.code = ' ';
-                c.complexChar = NO;
                 i--;
             } else {
                 if (!foundStart) {
                     foundStart = YES;
                     [_imeInfo setRangeStart:coord];
                 }
-                const NSInteger offset = coord.x * sizeof(screen_char_t);
-                assert(offset < (NSInteger)lineData.length);
-                line[coord.x] = c;
+                ScreenCharArray *sca = _rows[coord.y]->_screenCharLine;
+                const screen_char_t styled = [self screenCharStyledForMarkedText:buf[i]];
+                _rows[coord.y]->_screenCharLine = [sca screenCharArrayBySettingCharacterAtIndex:coord.x
+                                                                                             to:styled];
             }
-            [lineData checkForOverrun];
-
         }
         justWrapped = NO;
         coord.x++;
@@ -615,10 +664,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
 }
 
 - (CGRect)badgeDestinationRect {
-    CGRect rect = _badgeDestinationRect;
-    rect.origin.x -= _documentVisibleRect.origin.x;
-    rect.origin.y -= _documentVisibleRect.origin.y;
-    return rect;
+    return _badgeDestinationRect;
 }
 
 - (NSImage *)badgeImage {
@@ -651,16 +697,16 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
         }
     } else {
         // Can assume transparencyAlpha is 1
-        if (@available(macOS 10.14, *)) {
-            alpha = iTermAlphaValueForTopView(0, _configuration->_backgroundImageBlend);
-        } else {
-            alpha = _backgroundImage ? 1 - _configuration->_backgroundColorAlpha : 1;
-        }
+        alpha = iTermAlphaValueForTopView(0, _configuration->_backgroundImageBlend);
     }
     return simd_make_float4((float)_configuration->_processedDefaultBackgroundColor.redComponent,
                             (float)_configuration->_processedDefaultBackgroundColor.greenComponent,
                             (float)_configuration->_processedDefaultBackgroundColor.blueComponent,
                             alpha);
+}
+
+- (iTermLineStyleMarkColors)lineStyleMarkColors {
+    return _configuration->_lineStyleMarkColors;
 }
 
 // Private queue
@@ -683,6 +729,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
                background:(iTermMetalBackgroundColorRLE *)backgroundRLE
                  rleCount:(int *)rleCount
                 markStyle:(out iTermMarkStyle *)markStylePtr
+            lineStyleMark:(out nonnull BOOL *)lineStyleMarkPtr
                       row:(int)row
                     width:(int)width
            drawableGlyphs:(int *)drawableGlyphsPtr
@@ -691,20 +738,27 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
     if (_configuration->_timestampsEnabled) {
         *datePtr = _rows[row]->_date;
     }
-    const iTermData *lineData = _rows[row]->_screenCharLine;
-    const screen_char_t *const line = (const screen_char_t *const)lineData.bytes;
-    iTermExternalAttributeIndex *eaIndex = _rows[row]->_eaIndex;
-    NSIndexSet *selectedIndexes = _rows[row]->_selectedIndexSet;
+    ScreenCharArray *lineData = [_rows[row]->_screenCharLine paddedToAtLeastLength:width];
     NSData *findMatches = _rows[row]->_matches;
+    NSIndexSet *selectedIndexes = _rows[row]->_selectedIndexSet;
+    NSRange underlinedRange = _rows[row]->_underlinedRange;
+    NSIndexSet *annotatedIndexes = _rowToAnnotationRanges[@(row)];
+    if (VT100GridRangeContains(_linesToSuppressDrawing, row)) {
+        lineData = [ScreenCharArray emptyLineOfLength:width];
+        findMatches = nil;
+        selectedIndexes = nil;
+        underlinedRange = NSMakeRange(NSNotFound, 0);
+        annotatedIndexes = nil;
+    }
+    const screen_char_t *const line = (const screen_char_t *const)lineData.line;
+    iTermExternalAttributeIndex *eaIndex = _rows[row]->_eaIndex;
     iTermTextColorKey keys[2];
     iTermTextColorKey *currentColorKey = &keys[0];
     iTermTextColorKey *previousColorKey = &keys[1];
     iTermBackgroundColorKey lastBackgroundKey;
-    NSRange underlinedRange = _rows[row]->_underlinedRange;
     int rles = 0;
     int previousImageCode = -1;
     VT100GridCoord previousImageCoord;
-    NSIndexSet *annotatedIndexes = _rowToAnnotationRanges[@(row)];
     vector_float4 lastUnprocessedBackgroundColor = simd_make_float4(0, 0, 0, 0);
     BOOL lastSelected = NO;
     const BOOL underlineHyperlinks = [iTermAdvancedSettingsModel underlineHyperlinks];
@@ -712,6 +766,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
     memset(&caches, 0, sizeof(caches));
 
     *markStylePtr = [_rows[row]->_markStyle intValue];
+    *lineStyleMarkPtr = _rows[row]->_lineStyleMark;
     int lastDrawableGlyph = -1;
     for (int x = 0; x < width; x++) {
         BOOL selected = [selectedIndexes containsIndex:x];
@@ -719,11 +774,11 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
         if (findMatches && !selected) {
             findMatch = CheckFindMatchAtIndex(findMatches, x);
         }
-        if (lastSelected && line[x].code == DWC_RIGHT && !line[x].complexChar) {
+        if (lastSelected && ScreenCharIsDWC_RIGHT(line[x])) {
             // If the left half of a DWC was selected, extend the selection to the right half.
             lastSelected = selected;
             selected = YES;
-        } else if (!lastSelected && selected && line[x].code == DWC_RIGHT && !line[x].complexChar) {
+        } else if (!lastSelected && selected && ScreenCharIsDWC_RIGHT(line[x])) {
             // If the right half of a DWC is selected but the left half is not, un-select the right half.
             lastSelected = YES;
             selected = NO;
@@ -904,7 +959,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
             const int italicBit = line[x].italic ? (1 << 1) : 0;
             glyphKeys[x].typeface = (boldBit | italicBit);
             glyphKeys[x].drawable = YES;
-            if (x < width &&
+            if (x + 1 < width &&
                 line[x + 1].complexChar &&
                 !(!line[x].complexChar && line[x].code < 128) &&
                 ComplexCharCodeIsSpacingCombiningMark(line[x + 1].code)) {
@@ -947,7 +1002,6 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
             attributes[_cursorInfo.coord.x].foregroundColor.w = 1;
         }
     }
-    [lineData checkForOverrun];
 }
 
 - (BOOL)useThinStrokesWithAttributes:(iTermMetalGlyphAttributes *)attributes {
@@ -1067,7 +1121,8 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
         vector_float4 color = VectorForColor([_configuration->_colorMap colorForKey:key],
                                              _configuration->_colorSpace);
         if (isFaint) {
-            color.w = 0.5;
+            // TODO: I think this is wrong and the color components need premultiplied alpha.
+            color.w = _configuration->_colorMap.faintTextAlpha;
         }
         return color;
     }
@@ -1134,9 +1189,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
 }
 
 - (id)metalASCIICreationIdentifierWithOffset:(CGSize)asciiOffset {
-    return @{ @"font": _configuration->_asciiFont.font ?: [NSNull null],
-              @"boldFont": _configuration->_asciiFont.boldVersion ?: [NSNull null],
-              @"boldItalicFont": _configuration->_asciiFont.boldItalicVersion ?: [NSNull null],
+    return @{ @"font": _configuration->_fontTable.uniqueIdentifier ?: [NSNull null],
               @"useBold": @(_configuration->_useBoldFont),
               @"useItalic": @(_configuration->_useItalicFont),
               @"asciiAntialiased": @(_configuration->_asciiAntialias),
@@ -1155,8 +1208,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
 
     const int radius = iTermTextureMapMaxCharacterParts / 2;
     iTermCharacterSourceDescriptor *descriptor =
-    [iTermCharacterSourceDescriptor characterSourceDescriptorWithAsciiFont:_configuration->_asciiFont
-                                                              nonAsciiFont:_configuration->_nonAsciiFont
+    [iTermCharacterSourceDescriptor characterSourceDescriptorWithFontTable:_configuration->_fontTable
                                                                asciiOffset:asciiOffset
                                                                  glyphSize:size
                                                                   cellSize:_configuration->_cellSize
@@ -1239,8 +1291,9 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
 }
 
 - (void)setDebugString:(NSString *)debugString {
-    iTermData *data = _rows[0]->_screenCharLine;
-    screen_char_t *line = data.mutableBytes;
+    NSMutableData *mutableData NS_VALID_UNTIL_END_OF_SCOPE;
+    mutableData = [_rows[0]->_screenCharLine mutableLineData];
+    screen_char_t *line = (screen_char_t *)mutableData.mutableBytes;
     for (int i = 0, o = MAX(0, _configuration->_gridSize.width - (int)debugString.length);
          i < debugString.length && o < _configuration->_gridSize.width;
          i++, o++) {
@@ -1251,10 +1304,12 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
                   gridSize:_configuration->_gridSize];
         line[o].code = [debugString characterAtIndex:i];
     }
-    [data checkForOverrun];
+    _rows[0]->_screenCharLine = [[ScreenCharArray alloc] initWithData:mutableData
+                                                             metadata:_rows[0]->_screenCharLine.metadata
+                                                         continuation:_rows[0]->_screenCharLine.continuation];
 }
 
-- (const iTermData *const)lineForRow:(int)y {
+- (id)screenCharArrayForRow:(int)y {
     return _rows[y]->_screenCharLine;
 }
 
@@ -1324,7 +1379,7 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
         rawColor = VectorForColor([_configuration->_colorMap colorForKey:kColorMapLink],
                                   _configuration->_colorSpace);
         caches->havePreviousCharacterAttributes = NO;
-    } else if (selected) {
+    } else if (selected && _configuration->_useSelectedTextColor) {
         // Selected text.
         rawColor = VectorForColor([colorMap colorForKey:kColorMapSelectedText],
                                   _configuration->_colorSpace);
@@ -1400,13 +1455,13 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
     return [iTermSmartCursorColor neighborsForCursorAtCoord:_cursorInfo.coord
                                                    gridSize:_configuration->_gridSize
                                                  lineSource:^const screen_char_t *(int y) {
-                                                     const int i = y + self->_numberOfScrollbackLines - self->_visibleRange.start.y;
-                                                     if (i >= 0 && i < self->_rows.count) {
-                                                         return (const screen_char_t *)self->_rows[i]->_screenCharLine.bytes;
-                                                     } else {
-                                                         return nil;
-                                                     }
-                                                 }];
+        const int i = y + self->_numberOfScrollbackLines - self->_visibleRange.start.y;
+        if (i >= 0 && i < self->_rows.count) {
+            return (const screen_char_t *)self->_rows[i]->_screenCharLine.line;
+        } else {
+            return nil;
+        }
+    }];
 }
 
 - (vector_float4)fastCursorColorForCharacter:(screen_char_t)screenChar

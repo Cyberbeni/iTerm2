@@ -19,6 +19,7 @@ extern NSString *const iTermDidToggleSecureInputNotification;
 
 @property (nonatomic, readonly) BOOL isDesired;
 @property (nonatomic, readonly, getter=isEnabled) BOOL enabled;
+@property (nonatomic, readonly) BOOL enabledByUserDefault;
 
 + (instancetype)sharedInstance;
 
@@ -26,6 +27,7 @@ extern NSString *const iTermDidToggleSecureInputNotification;
 - (void)didStealFocus;
 - (void)didReleaseFocus;
 - (void)update;
+- (void)disableUntilDeactivated;
 
 @end
 

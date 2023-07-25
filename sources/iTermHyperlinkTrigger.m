@@ -5,13 +5,9 @@
 //  Created by leppich on 09.05.18.
 //
 
-#import "PTYScrollView.h"
-#import "PTYSession.h"
-#import "VT100Screen.h"
-#import "iTermURLMark.h"
-#import "iTermURLStore.h"
 #import "NSURL+iTerm.h"
 #import "iTermHyperlinkTrigger.h"
+#import "ScreenChar.h"
 
 #import <CoreServices/CoreServices.h>
 #import <QuartzCore/QuartzCore.h>
@@ -41,51 +37,46 @@
     return @"https://\\0";
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
     const NSRange rangeInString = capturedRanges[0];
-    
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *urlString) {
-                                             [self performActionWithURLString:urlString
-                                                                        range:rangeInString
-                                                                      session:aSession
-                                                           absoluteLineNumber:lineNumber];
-                                         }];
+    const NSRange rangeOnScreen = [stringLine rangeOfScreenCharsForRangeInString:rangeInString];
+
+    // Need to stop the world to get scope, provided it is needed. This is potentially going to be a performance problem for a small number of users.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull urlString) {
+        [scheduler scheduleTriggerCallback:^{
+            [self performActionWithURLString:urlString
+                                       range:rangeOnScreen
+                                     session:aSession
+                          absoluteLineNumber:lineNumber];
+        }];
+    }];
     return YES;
 }
 
 - (void)performActionWithURLString:(NSString *)urlString
                              range:(NSRange)rangeInString
-                           session:(PTYSession *)aSession
+                           session:(id<iTermTriggerSession>)aSession
                 absoluteLineNumber:(long long)lineNumber {
     NSURL *url = urlString.length ? [NSURL URLWithUserSuppliedString:urlString] : nil;
     if (!url) {
         return;
     }
 
-    // add URL to URL Store and retrieve URL code for later reference
-    unsigned int code = [[iTermURLStore sharedInstance] codeForURL:url withParams:@""];
-    
-    // add url link to screen
-    [[aSession screen] linkTextInRange:rangeInString
-             basedAtAbsoluteLineNumber:lineNumber
-                               URLCode:code];
-    
-    // add invisible URL Mark so the URL can automatically freed
-    iTermURLMark *mark = [aSession.screen addMarkStartingAtAbsoluteLine:lineNumber
-                                                                oneLine:YES
-                                                                ofClass:[iTermURLMark class]];
-    mark.code = code;
+    [aSession triggerSession:self
+          makeHyperlinkToURL:url
+                     inRange:rangeInString
+                        line:lineNumber];
 }
 
 @end

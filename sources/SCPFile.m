@@ -435,7 +435,8 @@ static NSError *SCPFileError(NSString *description) {
                 } else {
                     [keyPaths addObjectsFromArray:@[ @"~/.ssh/id_rsa",
                                                      @"~/.ssh/id_dsa",
-                                                     @"~/.ssh/id_ecdsa" ]];
+                                                     @"~/.ssh/id_ecdsa",
+                                                     @"~/.ssh/id_ed25519" ]];
                 }
                 NSFileManager *fileManager = [NSFileManager defaultManager];
                 for (NSString *iteratedKeyPath in keyPaths) {
@@ -581,14 +582,22 @@ static NSError *SCPFileError(NSString *description) {
             dispatch_sync(dispatch_get_main_queue(), ^() {
                 finalDestination = [self finalDestinationForPath:baseName
                                             destinationDirectory:downloadDirectory];
-                [[NSFileManager defaultManager] moveItemAtPath:tempfile
-                                                        toPath:finalDestination
-                                                         error:&error];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:finalDestination]) {
+                    [[NSFileManager defaultManager] replaceItemAtURL:[NSURL fileURLWithPath:finalDestination]
+                                                       withItemAtURL:[NSURL fileURLWithPath:tempfile]
+                                                      backupItemName:nil
+                                                             options:0
+                                                    resultingItemURL:nil
+                                                               error:&error];
+                } else {
+                    [[NSFileManager defaultManager] moveItemAtPath:tempfile
+                                                            toPath:finalDestination
+                                                             error:&error];
+                }
             });
             if (error) {
-                self.error = [NSString stringWithFormat:@"Couldn't move %@ to %@",
-                              tempfile, finalDestination];
-                DLog(@"%@", self.error);
+                self.error = error.localizedDescription;
+                DLog(@"%@", error);
             }
             [[NSFileManager defaultManager] removeItemAtPath:tempfile error:NULL];
             self.destination = finalDestination;

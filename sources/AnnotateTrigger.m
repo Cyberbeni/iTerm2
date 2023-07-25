@@ -6,7 +6,8 @@
 //
 
 #import "AnnotateTrigger.h"
-#import "PTYSession.h"
+#import "ScreenChar.h"
+#import "PTYAnnotation.h"
 
 @implementation AnnotateTrigger
 
@@ -25,10 +26,9 @@
 }
 
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
@@ -39,21 +39,26 @@
     if (length == 0) {
         return YES;
     }
-    const long long width = aSession.screen.width;
-    VT100GridAbsCoordRange absRange = VT100GridAbsCoordRangeMake(rangeInScreenChars.location,
-                                                                 lineNumber,
-                                                                 (rangeInScreenChars.location + length) % width,
-                                                                 lineNumber + (rangeInScreenChars.location + length - 1) / width);
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *annotation) {
-                                             if (!annotation.length) {
-                                                 return;
-                                             }
-                                             [aSession addNoteWithText:annotation inAbsoluteRange:absRange];
-                                         }];
+    // Need to stop the world to get scope, provided it is needed. This is potentially going to be a performance problem for a small number of users.
+    id<PTYAnnotationReading> annotation =
+        [aSession triggerSession:self
+           makeAnnotationInRange:rangeInScreenChars
+                            line:lineNumber];
+    if (!annotation) {
+        return YES;
+    }
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull text) {
+        [scheduler scheduleTriggerCallback:^{
+            [aSession triggerSession:self
+                       setAnnotation:annotation
+                            stringTo:text];
+        }];
+    }];
     return YES;
 }
 

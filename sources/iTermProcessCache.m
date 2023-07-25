@@ -8,6 +8,7 @@
 #import <Cocoa/Cocoa.h>
 
 #import "DebugLogging.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermLSOF.h"
 #import "iTermProcessCache.h"
 #import "iTermProcessMonitor.h"
@@ -19,7 +20,7 @@
 
 // Maps process id to deepest foreground job. _lockQueue
 @property (nonatomic) NSDictionary<NSNumber *, iTermProcessInfo *> *cachedDeepestForegroundJobLQ;
-
+@property (atomic) BOOL forcingLQ;
 @end
 
 @implementation iTermProcessCache {
@@ -31,7 +32,6 @@
     BOOL _needsUpdateFlagLQ;  // _lockQueue
     iTermRateLimitedUpdate *_rateLimit;  // Main queue. keeps updateIfNeeded from eating all the CPU
     NSMutableIndexSet *_dirtyPIDsLQ;  // _lockQueue
-    BOOL _forcingLQ;
 }
 
 + (instancetype)sharedInstance {
@@ -48,28 +48,54 @@
     if (self) {
         _lockQueue = dispatch_queue_create("com.iterm2.process-cache-lock", DISPATCH_QUEUE_SERIAL);
         _workQueue = dispatch_queue_create("com.iterm2.process-cache-work", DISPATCH_QUEUE_SERIAL);
-        _rateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Process cache"
-                                                  minimumInterval:0.5];
         _trackedPidsLQ = [NSMutableDictionary dictionary];
         _dirtyPIDsLQ = [NSMutableIndexSet indexSet];
-        [self setNeedsUpdate:YES];
         _blocksLQ = [NSMutableArray array];
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(applicationDidBecomeActive:)
-                                                     name:NSApplicationDidBecomeActiveNotification
-                                                   object:nil];
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(applicationDidResignActive:)
-                                                     name:NSApplicationDidResignActiveNotification
-                                                   object:nil];
+
+        // I'm not fond of this pattern (code that sometimes is synchronous and sometimes not) but
+        // I don't want to break -setNeedsUpdate when called on the main queue and that requires
+        // synchronous initialization. Job managers use the process cache on their own queues and
+        // sometimes they win a race and call init before anyone else, so it has to work in this
+        // case.
+        if (dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) != dispatch_queue_get_label(dispatch_get_main_queue())) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self finishInitialization];
+            });
+        } else {
+            [self finishInitialization];
+        }
     }
     return self;
+}
+
+- (void)finishInitialization {
+    // Perform main-thread-only initialization.
+    _rateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Process cache"
+                                              minimumInterval:0.5];
+    [self setNeedsUpdate:YES];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applicationDidBecomeActive:)
+                                                 name:NSApplicationDidBecomeActiveNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applicationDidResignActive:)
+                                                 name:NSApplicationDidResignActiveNotification
+                                               object:nil];
 }
 
 #pragma mark - APIs
 
 // Main queue
 - (void)setNeedsUpdate:(BOOL)needsUpdate {
+    if (dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) != dispatch_queue_get_label(dispatch_get_main_queue())) {
+        DLog(@"Try again on main queue");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DLog(@"Trying again on main queue");
+            [self setNeedsUpdate:needsUpdate];
+        });
+        return;
+    }
+
     DLog(@"setNeedsUpdate:%@", @(needsUpdate));
     dispatch_sync(_lockQueue, ^{
         self->_needsUpdateFlagLQ = needsUpdate;
@@ -96,6 +122,26 @@
         [self->_blocksLQ addObject:[wrapper copy]];
         needsUpdate = self->_blocksLQ.count == 1;
     });
+    if (!needsUpdate) {
+        DLog(@"request immediate update just added block to queue");
+        return;
+    }
+    DLog(@"request immediate update scheduling update");
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_workQueue, ^{
+        [weakSelf collectBlocksAndUpdate];
+    });
+}
+
+
+// lockQueue
+- (void)queueRequestUpdateWithCompletionQueue:(dispatch_queue_t)queue block:(void (^)(void))completion {
+    __block BOOL needsUpdate;
+    void (^wrapper)(void) = ^{
+        dispatch_async(queue, completion);
+    };
+    [self->_blocksLQ addObject:[wrapper copy]];
+    needsUpdate = self->_blocksLQ.count == 1;
     if (!needsUpdate) {
         DLog(@"request immediate update just added block to queue");
         return;
@@ -162,23 +208,48 @@
                                   ^(iTermProcessMonitor * monitor, dispatch_source_proc_flags_t flags) {
             [weakSelf processMonitor:monitor didChangeFlags:flags];
         }];
-        monitor.processInfo = [self->_collectionLQ infoForProcessID:pid];
+        iTermProcessInfo *info = [self->_collectionLQ infoForProcessID:pid];
+        if (!info) {
+            DLog(@"Request update for %@", @(pid));
+            [self queueRequestUpdateWithCompletionQueue:self->_lockQueue block:^{
+                DLog(@"Got update for %@", @(pid));
+                [weakSelf didUpdateForPid:pid];
+            }];
+        } else {
+            monitor.processInfo = info;
+        }
         self->_trackedPidsLQ[@(pid)] = monitor;
     });
+}
+
+// lockQueue
+- (void)didUpdateForPid:(pid_t)pid {
+    iTermProcessInfo *info = [self->_collectionLQ infoForProcessID:pid];
+    if (!info) {
+        DLog(@":( no info for %@", @(pid));
+        return;
+    }
+    iTermProcessMonitor *monitor = self->_trackedPidsLQ[@(pid)];
+    if (!monitor || monitor.processInfo != nil) {
+        DLog(@":( no monitor for %@", @(pid));
+        return;
+    }
+    DLog(@"Set info in monitor to %@", info);
+    monitor.processInfo = info;
 }
 
 // lockQueue
 - (void)processMonitor:(iTermProcessMonitor *)monitor didChangeFlags:(dispatch_source_proc_flags_t)flags {
     DLog(@"Flags changed for %@.", @(monitor.processInfo.processID));
     _needsUpdateFlagLQ = YES;
-    const BOOL wasForced = _forcingLQ;
-    _forcingLQ = YES;
+    const BOOL wasForced = self.forcingLQ;
+    self.forcingLQ = YES;
     if (!wasForced) {
         dispatch_async(dispatch_get_main_queue(), ^{
             DLog(@"Forcing update");
             [self->_rateLimit performRateLimitedSelector:@selector(updateIfNeeded) onTarget:self withObject:nil];
             [self->_rateLimit performWithinDuration:0.0167];
-            self->_forcingLQ = NO;
+            self.forcingLQ = NO;
         });
     }
 }
@@ -203,6 +274,10 @@
     });
 }
 
+- (void)sendSignal:(int32_t)signal toPID:(int32_t)pid {
+    kill(pid, signal);
+}
+
 #pragma mark - Private
 
 // Any queue
@@ -222,12 +297,11 @@
     });
 }
 
-// _workQueue
 + (iTermProcessCollection *)newProcessCollection {
     NSArray<NSNumber *> *allPids = [iTermLSOF allPids];
     // pid -> ppid
     NSMutableDictionary<NSNumber *, NSNumber *> *parentmap = [NSMutableDictionary dictionary];
-    iTermProcessCollection *collection = [[iTermProcessCollection alloc] init];
+    iTermProcessCollection *collection = [[iTermProcessCollection alloc] initWithDataSource:[iTermLSOF processDataSource]];
     for (NSNumber *pidNumber in allPids) {
         pid_t pid = pidNumber.intValue;
 
@@ -262,25 +336,27 @@
 - (void)reallyUpdate {
     DLog(@"* DOING THE EXPENSIVE THING * Process cache reallyUpdate starting");
 
-    // Do expensive stuff
-    iTermProcessCollection *collection = [self.class newProcessCollection];
+    @autoreleasepool {
+        // Do expensive stuff
+        iTermProcessCollection *collection = [self.class newProcessCollection];
 
-    // Save the tracked PIDs in the cache
-    NSDictionary<NSNumber *, iTermProcessInfo *> *cachedDeepestForegroundJob = [self newDeepestForegroundJobCacheWithCollection:collection];
+        // Save the tracked PIDs in the cache
+        NSDictionary<NSNumber *, iTermProcessInfo *> *cachedDeepestForegroundJob = [self newDeepestForegroundJobCacheWithCollection:collection];
 
-    // Flip to the new state.
-    dispatch_sync(_lockQueue, ^{
-        self->_cachedDeepestForegroundJobLQ = cachedDeepestForegroundJob;
-        self->_collectionLQ = collection;
-        self->_needsUpdateFlagLQ = NO;
-        [_trackedPidsLQ enumerateKeysAndObjectsUsingBlock:^(NSNumber * _Nonnull key, iTermProcessMonitor * _Nonnull monitor, BOOL * _Nonnull stop) {
-            iTermProcessInfo *info = [collection infoForProcessID:key.intValue];
-            if ([monitor setProcessInfo:info]) {
-                DLog(@"%@ changed! Set dirty", @(info.processID));
-                [_dirtyPIDsLQ addIndex:key.intValue];
-            }
-        }];
-    });
+        // Flip to the new state.
+        dispatch_sync(_lockQueue, ^{
+            self->_cachedDeepestForegroundJobLQ = cachedDeepestForegroundJob;
+            self->_collectionLQ = collection;
+            self->_needsUpdateFlagLQ = NO;
+            [_trackedPidsLQ enumerateKeysAndObjectsUsingBlock:^(NSNumber * _Nonnull key, iTermProcessMonitor * _Nonnull monitor, BOOL * _Nonnull stop) {
+                iTermProcessInfo *info = [collection infoForProcessID:key.intValue];
+                if ([monitor setProcessInfo:info]) {
+                    DLog(@"%@ changed! Set dirty", @(info.processID));
+                    [_dirtyPIDsLQ addIndex:key.intValue];
+                }
+            }];
+        });
+    }
 }
 
 #pragma mark - Notifications

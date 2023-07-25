@@ -47,7 +47,7 @@ NS_INLINE void CVectorAppend(CVector *vector, void *value) {
     if (vector->count + 1 == vector->capacity) {
         assert(vector->capacity >= 0 && vector->capacity < (1 << 27));
         vector->capacity *= 2;
-        vector->elements = iTermRealloc(vector->elements, vector->capacity, sizeof(void *));
+        vector->elements = (void **)iTermRealloc(vector->elements, vector->capacity, sizeof(void *));
     }
     vector->elements[vector->count++] = value;
 }
@@ -58,6 +58,9 @@ NS_INLINE id CVectorLastObject(const CVector *vector) {
     }
     return (__bridge id)(CVectorGet(vector, vector->count - 1));
 }
+
+// Call -release on all objects in `vector`.
+void CVectorReleaseObjects(const CVector *vector);
 
 // Hacky but fast templates in C.
 //

@@ -295,13 +295,16 @@ haveSpacersOnBothSidesOfIndex:(NSInteger)index
     // Allocate minimum widths
     [views enumerateObjectsUsingBlock:^(iTermStatusBarContainerView * _Nonnull view, NSUInteger idx, BOOL * _Nonnull stop) {
         const CGFloat oldWidth = view.desiredWidth;
-        CGFloat newWidth = oldWidth;
+        CGFloat newWidth;
         if ([view.component isKindOfClass:[iTermStatusBarFixedSpacerComponent class]]) {
             newWidth = view.minimumWidthIncludingIcon;
         } else {
             const CGFloat maxSize = [self maximumWidthForComponent:view.component];
             const CGFloat minSize = [self minimumWidthForComponent:view.component];
             newWidth = MIN(MAX(minSize, maxSize), oldWidth + apportionment * view.component.statusBarComponentSpringConstant);
+            if (oldWidth == 0) {
+                newWidth = MAX(newWidth, minSize);
+            }
         }
         if (round(oldWidth) != round(newWidth)) {
             *changed = YES;

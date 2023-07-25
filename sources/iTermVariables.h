@@ -59,6 +59,7 @@ extern NSString *const iTermVariableKeySessionTmuxWindowPane;  // NSNumber. Wind
 extern NSString *const iTermVariableKeySessionTmuxWindowPaneIndex;  // NSString. #{pane_index} for a particular session. Only available on tmux 3.2+.
 extern NSString *const iTermVariableKeySessionJobPid;  // NSNumber. Process id of foreground job.
 extern NSString *const iTermVariableKeySessionChildPid;  // NSNumber. Process id of child of session task.
+extern NSString *const iTermVariableKeySessionEffectiveSessionRootPid;  // NSNumber. Process id of child of session task or of ssh.
 extern NSString *const iTermVariableKeySessionTmuxStatusLeft;  // String. Only set when in tmux integration mode.
 extern NSString *const iTermVariableKeySessionTmuxStatusRight;  // String. Only set when in tmux integration mode.
 extern NSString *const iTermVariableKeySessionMouseReportingMode;  // NSNumber (MouseMode)
@@ -72,6 +73,10 @@ extern NSString *const iTermVariableKeySessionBellCount;  // NSNumber. Number of
 extern NSString *const iTermVariableKeySessionLogFilename;  // NSString. Path to log file. Unset if not logging.
 extern NSString *const iTermVariableKeySessionMouseInfo;  // [x=NSNumber, y=NSNumber, button=NSNumber, count=NSNumber, modifiers=NSNumber, sideEffects=NSNumber, state=NSNumber]. Info about last lcick.
 extern NSString *const iTermVariableKeySessionApplicationKeypad;  // NSNumber. Boolean - in application keypad mode?
+extern NSString *const iTermVariableKeySessionHomeDirectory;  // NSString. Value of $HOME, including remote host when ssh integration+framer used.
+extern NSString *const iTermVariableKeySSHIntegrationLevel;  // NSNumber. 0=none, 1=basic, 2=framer
+extern NSString *const iTermVariableKeyShell;  // NSString. Value of last path component of $SHELL
+extern NSString *const iTermVariableKeyUname;  // NSString. Value of uname -a
 
 extern NSString *const iTermVariableKeyWindowTitleOverrideFormat;
 extern NSString *const iTermVariableKeyWindowCurrentTab;
@@ -80,6 +85,7 @@ extern NSString *const iTermVariableKeyWindowID;
 extern NSString *const iTermVariableKeyWindowFrame;
 extern NSString *const iTermVariableKeyWindowStyle;
 extern NSString *const iTermVariableKeyWindowNumber;
+extern NSString *const iTermVariableKeyWindowIsHotkeyWindow;
 
 @protocol iTermObject;
 @class iTermVariables;

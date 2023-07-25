@@ -14,6 +14,7 @@
 #import "NSResponder+iTerm.h"
 #import "NSStringITerm.h"
 #import "NSView+iTerm.h"
+#import "PasteboardHistory.h"
 #import "SolidColorView.h"
 #import "VT100RemoteHost.h"
 #import "WindowControllerInterface.h"
@@ -21,198 +22,32 @@
 #import "iTermPopupWindowController.h"
 #import "iTermShellHistoryController.h"
 #import "iTermSlowOperationGateway.h"
+#import "iTermTextPopoverViewController.h"
 #import "iTermWarning.h"
 
 @interface iTermComposerView : NSView
 @end
-
-@interface iTermComposerTextView()
-@property (nonatomic, readonly) BOOL isSettingSuggestion;
-@end
-
-@implementation iTermComposerTextView {
-    NSString *_suggestion;
-    NSRange _suggestionRange;
-}
-
-- (void)viewDidMoveToWindow {
-    if (self.window == nil) {
-        [[self undoManager] removeAllActionsWithTarget:[self textStorage]];
-    }
-}
-
-- (BOOL)it_preferredFirstResponder {
-    return YES;
-}
-
-- (void)keyDown:(NSEvent *)event {
-    const BOOL pressedEsc = ([event.characters isEqualToString:@"\x1b"]);
-    const BOOL pressedShiftEnter = ([event.characters isEqualToString:@"\r"] &&
-                                    (event.it_modifierFlags & NSEventModifierFlagShift) == NSEventModifierFlagShift);
-    if (pressedShiftEnter || pressedEsc) {
-        [self setSuggestion:nil];
-        [self.composerDelegate composerTextViewDidFinishWithCancel:pressedEsc];
-        return;
-    }
-    [super keyDown:event];
-}
-
-- (BOOL)resignFirstResponder {
-    if ([self.composerDelegate respondsToSelector:@selector(composerTextViewDidResignFirstResponder)]) {
-        [self.composerDelegate composerTextViewDidResignFirstResponder];
-    }
-    return [super resignFirstResponder];
-}
-
-- (instancetype)initWithCoder:(NSCoder *)coder {
-    self = [super initWithCoder:coder];
-    if (self) {
-        self.continuousSpellCheckingEnabled = NO;
-        self.grammarCheckingEnabled = NO;
-        self.automaticLinkDetectionEnabled = NO;
-        self.automaticQuoteSubstitutionEnabled = NO;
-        self.automaticDashSubstitutionEnabled = NO;
-        self.automaticDataDetectionEnabled = NO;
-        self.automaticTextReplacementEnabled = NO;
-        self.smartInsertDeleteEnabled = NO;
-    }
-    return self;
-}
-
-- (NSAttributedString *)attributedStringForSuggestion:(NSString *)suggestion {
-    NSDictionary *typingAttributes = [self typingAttributes];
-    NSDictionary *attributes = [typingAttributes dictionaryBySettingObject:[NSColor colorWithWhite:0.5 alpha:1]
-                                                                    forKey:NSForegroundColorAttributeName];
-    return [[NSAttributedString alloc] initWithString:suggestion attributes:attributes];
-}
-
-- (NSAttributedString *)attributedStringFromString:(NSString *)suggestion {
-    return [[NSAttributedString alloc] initWithString:suggestion attributes:[self typingAttributes]];
-}
-
-- (BOOL)hasSuggestion {
-    return _suggestion != nil;
-}
-
-- (void)setSuggestion:(NSString *)suggestion {
-    assert(!_isSettingSuggestion);
-    _isSettingSuggestion = YES;
-    [self reallySetSuggestion:suggestion];
-    _isSettingSuggestion = NO;
-}
-
-// Return lhs - rhs. We are deleting text in rhs and need to return a new value that refers to the
-// same characters as lhs does before the deletion.
-static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
-    if (rhs.length == 0) {
-        return lhs;
-    }
-    if (rhs.location >= NSMaxRange(lhs)) {
-        // All of lhs is before rhs, so do nothing.
-        return lhs;
-    }
-    if (lhs.location >= NSMaxRange(rhs)) {
-        // All of lhs is after rhs, so shift it back by rhs.
-        return NSMakeRange(lhs.location - rhs.length, lhs.length);
-    }
-    if (lhs.length == 0) {
-        // We know that lhs.location > rhs.location, lhs.location < max(rhs).
-        // xxxxxxxxxxx
-        //  |--rhs--|
-        //   ???????   lhs is somewhere in here and of length 0.
-        return NSMakeRange(rhs.location, 0);
-    }
-    const NSRange intersection = NSIntersectionRange(lhs, rhs);
-    assert(intersection.location != NSNotFound);
-    assert(intersection.length > 0);
-    if (NSEqualRanges(lhs, intersection)) {
-        // Remove all of lhs.
-        return NSMakeRange(rhs.location, 0);
-    }
-    if (lhs.location == intersection.location) {
-        // Remove prefix of lhs but not the whole thing.
-        return NSMakeRange(lhs.location, lhs.length - intersection.length);
-    }
-    // Remove starting in middle of lhs.
-    return NSMakeRange(lhs.location, lhs.length - intersection.length);
-}
-
-- (void)reallySetSuggestion:(NSString *)suggestion {
-    if (suggestion) {
-        if (self.hasSuggestion) {
-            // Replace existing suggestion with a different one.
-            [self.textStorage replaceCharactersInRange:_suggestionRange
-                                  withAttributedString:[self attributedStringForSuggestion:suggestion]];
-            _suggestion = [suggestion copy];
-            _suggestionRange = NSMakeRange(_suggestionRange.location, suggestion.length);
-            [self setSelectedRange:NSMakeRange(_suggestionRange.location, 0)];
-            return;
-        }
-
-        // Didn't have suggestion before but will have one now
-        const NSInteger location = NSMaxRange(self.selectedRange);
-        [self.textStorage replaceCharactersInRange:NSMakeRange(location, 0)
-                              withAttributedString:[self attributedStringForSuggestion:suggestion]];
-        _suggestion = [suggestion copy];
-        _suggestionRange = NSMakeRange(location, suggestion.length);
-        [self setSelectedRange:NSMakeRange(_suggestionRange.location, 0)];
-        return;
-    }
-
-    if (!self.hasSuggestion) {
-        return;
-    }
-
-    // Remove existing suggestion:
-    // 1. Find the ranges of suggestion-looking text by examining the color.
-    NSAttributedString *temp = [self.attributedString copy];
-    NSMutableArray<NSValue *> *rangesToRemove = [NSMutableArray array];
-    [temp enumerateAttribute:NSForegroundColorAttributeName
-                     inRange:NSMakeRange(0, temp.length)
-                     options:NSAttributedStringEnumerationReverse
-                  usingBlock:^(NSColor *color, NSRange range, BOOL * _Nonnull stop) {
-        if (![color isEqual:[NSColor textColor]]) {
-            [rangesToRemove addObject:[NSValue valueWithRange:range]];
-        }
-    }];
-
-    // 2. Delete those ranges, adjusting the cursor location as needed to keep it in the same place.
-    __block NSRange selectedRange = self.selectedRange;
-    [rangesToRemove enumerateObjectsUsingBlock:^(NSValue * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
-        const NSRange range = [obj rangeValue];
-        selectedRange = iTermRangeMinus(selectedRange, range);
-        [self.textStorage deleteCharactersInRange:range];
-    }];
-
-    // 3. Position the cursor and clean up internal state.
-    self.selectedRange = selectedRange;
-    _suggestion = nil;
-    _suggestionRange = NSMakeRange(NSNotFound, 0);
-}
-
-- (void)acceptSuggestion {
-    [self.textStorage setAttributes:[self typingAttributes] range:_suggestionRange];
-    self.selectedRange = NSMakeRange(NSMaxRange(_suggestionRange), 0);
-    _suggestion = nil;
-    _suggestionRange = NSMakeRange(NSNotFound, 0);
-}
-
-@end
-
 @implementation iTermComposerView {
     NSView *_backgroundView;
+    IBOutlet NSTextView *_textView;
+}
+
+// I have no idea at all why I have to do this, but I tried everything and it's the only way for
+// Select Matches to be enabled. See also -performFindPanelAction: below. It has to be in this
+// class and only this class. Can't go in the text view or even in a custom field editor for
+// the search field.
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    return [_textView validateMenuItem:menuItem];
+}
+
+- (IBAction)performFindPanelAction:(id)sender {
+    [_textView performFindPanelAction:sender];
 }
 
 - (NSView *)newBackgroundViewWithFrame:(NSRect)frame {
-    if (@available(macOS 10.14, *)) {
-        NSVisualEffectView *myView = [[NSVisualEffectView alloc] initWithFrame:frame];
-        myView.appearance = self.appearance;
-        return myView;
-    }
-
-    SolidColorView *solidColorView = [[SolidColorView alloc] initWithFrame:frame
-                                                                     color:[NSColor controlBackgroundColor]];
-    return solidColorView;
+    NSVisualEffectView *myView = [[NSVisualEffectView alloc] initWithFrame:frame];
+    myView.appearance = self.appearance;
+    return myView;
 }
 
 - (void )viewDidMoveToWindow {
@@ -254,13 +89,18 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
 
 @implementation iTermStatusBarLargeComposerViewController {
     IBOutlet NSButton *_help;
+    IBOutlet NSView *_accessories;
+    IBOutlet NSScrollView *_scrollView;
     CommandHistoryPopupWindowController *_historyWindowController;
     NSInteger _completionGeneration;
+    iTermTextPopoverViewController *_popoverVC;
+    AITermControllerObjC *_aitermController;
 }
 
 - (void)awakeFromNib {
     [super awakeFromNib];
     self.textView.textColor = [NSColor textColor];
+    self.textView.insertionPointColor = [NSColor textColor];
     self.textView.font = [NSFont fontWithName:@"Menlo" size:11];
 }
 
@@ -273,9 +113,18 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
     return cache;
 }
 
-- (void)setShell:(NSString *)shell {
-    _shell = [shell copy];
+- (IBAction)pasteOptions:(id)sender {
+    NSString *content = self.textView.string;
+    if (!content) {
+        return;
+    }
+    [self.textView.composerDelegate composerTextViewSendToAdvancedPaste:content];
+}
 
+- (void)setScope:(iTermVariableScope *)scope {
+    _scope = scope;
+
+    NSString *shell = [scope valueForVariableName:@"shell"] ?: @"zsh";
     iTermSearchPathsCacheEntry *entry = self.cache[shell];
     if (entry) {
         if ([NSDate it_timeSinceBoot] - entry.timestamp < 60) {
@@ -297,14 +146,9 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
     }];
 }
 
-- (void)viewWillLayout {
-    _help.enabled = [self helpShouldBeAvailable];
-    [super viewWillLayout];
-}
-
 - (NSString *)lineBeforeCursor {
-    NSString *content = self.textView.string;
-    const NSRange selectedRange = [self.textView selectedRange];
+    NSString *content = self.textView.stringExcludingPrefix;
+    const NSRange selectedRange = [self.textView selectedRangeExcludingPrefix];
     if (selectedRange.location > content.length) {
         return @"";
     }
@@ -317,8 +161,19 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
     } else {
         lowerBound += 1;
     }
-    const NSInteger upperBound = self.textView.selectedRange.location;
+    const NSInteger upperBound = selectedRange.location;
     return [content substringWithRange:NSMakeRange(lowerBound, upperBound - lowerBound)];
+}
+
+- (NSString *)textAfterCursor {
+    NSString *content = self.textView.string;
+    const NSRange selectedRange = [self.textView selectedRange];
+    if (selectedRange.location > content.length) {
+        return @"";
+    }
+
+    const NSInteger upperBound = self.textView.selectedRange.location;
+    return [content substringFromIndex:upperBound];
 }
 
 - (NSString *)lineAtCursor {
@@ -352,8 +207,8 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
     }
     if ([[iTermShellHistoryController sharedInstance] commandHistoryHasEverBeenUsed]) {
         NSString *prefix;
-        NSString *content = self.textView.string;
-        const NSRange selectedRange = [self.textView selectedRange];
+        NSString *content = self.textView.stringExcludingPrefix;
+        const NSRange selectedRange = self.textView.selectedRangeExcludingPrefix;
         if (selectedRange.location > content.length) {
             return;
         }
@@ -369,56 +224,93 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
         [_historyWindowController loadCommands:[_historyWindowController commandsForHost:self.host
                                                                           partialCommand:prefix
                                                                                   expand:YES]
-                                partialCommand:prefix];
+                                partialCommand:prefix
+                           sortChronologically:NO];
     } else {
         [iTermShellHistoryController showInformationalMessage];
     }
 }
 
-- (BOOL)helpShouldBeAvailable {
-    return [[self lineAtCursor] length] > 0 && [[self browserName] length] > 0;
+- (NSString *)aiPrompt {
+    if (self.textView.selectedRange.length > 0) {
+        return [self.textView.string substringWithRange:self.textView.selectedRange];
+    } else {
+        return self.textView.string;
+    }
 }
 
-- (NSString *)browserName {
-    NSURL *appUrl = [[NSWorkspace sharedWorkspace] URLForApplicationToOpenURL:[NSURL URLWithString:@"https://explainshell.com/explain?cmd=example"]];
-    if (!appUrl) {
-        return nil;
-    }
-    NSBundle *bundle = [NSBundle bundleWithURL:appUrl];
-    return [bundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: [bundle objectForInfoDictionaryKey:@"CFBundleName"] ?: [[appUrl URLByDeletingPathExtension] lastPathComponent];
+- (IBAction)performNaturalLanguageQuery:(id)sender {
+    __weak __typeof(self) weakSelf = self;
+
+    _aitermController = [[AITermControllerObjC alloc] initWithQuery:self.aiPrompt
+                                                              scope:self.scope
+                                                           inWindow:self.view.window
+                                                         completion:^(NSArray<NSString *> *choices, NSString *error) {
+        if (choices.count >= 1) {
+            [weakSelf acceptSuggestion:choices[0]];
+        } else {
+            [iTermWarning showWarningWithTitle:[NSString stringWithFormat:@"There was a problem with the AI query: %@", error]
+                                       actions:@[ @"OK" ]
+                                     accessory:nil
+                                    identifier:nil
+                                   silenceable:kiTermWarningTypePersistent
+                                       heading:@"AI Error"
+                                        window:weakSelf.view.window];
+        }
+    }];
+}
+
+- (void)acceptSuggestion:(NSString *)string {
+    // It likes to spam whitespace around the command.
+    NSMutableCharacterSet *trim = [NSMutableCharacterSet whitespaceAndNewlineCharacterSet];
+
+    // Sometimes it'll give a command wrapped in markdown backticks. This could be too aggressive in some edge cases.
+    [trim addCharactersInString:@"`"];
+
+    [self.textView replaceSelectionOrWholeStringWithString:[string stringByTrimmingCharactersInSet:trim]];
 }
 
 - (IBAction)help:(id)sender {
-    NSString *command = [self lineAtCursor];
-    if (!command.length) {
-        return;
-    }
-    NSString *browserName = [self browserName];
-    if (!browserName.length) {
-        return;
-    }
-    NSURLComponents *components = [[NSURLComponents alloc] init];
-    components.host = @"explainshell.com";
-    components.scheme = @"https";
-    components.path = @"/explain";
-    components.queryItems = @[ [NSURLQueryItem queryItemWithName:@"cmd" value:command] ];
-    NSURL *url = components.URL;
+    [_popoverVC.popover close];
+    _popoverVC = [[iTermTextPopoverViewController alloc] initWithNibName:@"iTermTextPopoverViewController"
+                                                                  bundle:[NSBundle bundleForClass:self.class]];
+    _popoverVC.popover.behavior = NSPopoverBehaviorTransient;
+    [_popoverVC view];
+    _popoverVC.textView.font = [NSFont systemFontOfSize:[NSFont systemFontSize]];
+    _popoverVC.textView.drawsBackground = NO;
+    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+    const CGFloat tabStop = 75;
+    style.tabStops = @[ [[NSTextTab alloc] initWithType:NSLeftTabStopType location:tabStop],
+                        [[NSTextTab alloc] initWithType:NSLeftTabStopType location:tabStop * 2] ];
+    style.defaultTabInterval = tabStop;
+    _popoverVC.textView.defaultParagraphStyle = style;
 
-    const iTermWarningSelection selection = [iTermWarning showWarningWithTitle:[NSString stringWithFormat:@"This will open %@ in %@.", url.absoluteString, browserName]
-                                                                       actions:@[ @"OK", @"Cancel" ]
-                                                                 actionMapping:nil
-                                                                     accessory:nil
-                                                                    identifier:@"NoSyncExplainShell"
-                                                                   silenceable:kiTermWarningTypePermanentlySilenceable
-                                                                       heading:@"Open ExplainShell?"
-                                                                        window:self.view.window];
-    if (selection == kiTermWarningSelection0) {
-        [[NSWorkspace sharedWorkspace] openURL:url];
-    }
+    [_popoverVC appendString:
+         @"^⇧↑\tAdd cursor above\n"
+         @"^⇧↓\tAdd cursor below\n"
+         @"^⇧-click\tAdd cursor\n"
+         @"⌥-drag\tAdd cursors\n"
+         @"⌘B\tNatural language AI lookup\n"
+         @"⌘F\tOpen Find bar\n"
+         @"⌥⌘V\tOpen in Advanced Paste\n"
+         @"⌘-click\tOpen in explainshell.com\n"
+         @"⇧↩\tSend command\n"
+         @"⌥⇧↩\tSend command at cursor\n"
+         @"⌥↩\tEnqueue command at cursor\n"
+         @"⇧⌘;\tView command history"
+    ];
+    [_popoverVC.textView.textStorage addAttribute:NSParagraphStyleAttributeName value:style range:NSMakeRange(0, _popoverVC.textView.textStorage.string.length)];
+    [_popoverVC sizeToFit];
+    [_popoverVC.popover showRelativeToRect:_help.bounds
+                                    ofView:_help
+                             preferredEdge:NSRectEdgeMaxY];
 }
 
-
 #pragma mark - PopupDelegate
+
+- (BOOL)popupWindowShouldAvoidChangingWindowOrderOnClose {
+    return NO;
+}
 
 - (NSRect)popupScreenVisibleFrame {
     return self.view.window.screen.visibleFrame;
@@ -434,6 +326,9 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
 
 - (void)popupInsertText:(NSString *)text {
     [self.textView insertText:text replacementRange:self.textView.selectedRange];
+}
+
+- (void)popupPreview:(NSString *)text {
 }
 
 - (void)popupKeyDown:(NSEvent *)event {
@@ -457,6 +352,16 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
 }
 
 - (void)popupIsSearching:(BOOL)searching {
+}
+
+- (BOOL)popupShouldTakePrefixFromScreen {
+    return NO;
+}
+
+- (NSArray<NSString *> *)popupWordsBeforeInsertionPoint:(int)count {
+    const NSRange insertionPoint = self.textView.selectedRangeExcludingPrefix;
+    NSString *string = [[self.textView stringExcludingPrefix] substringToIndex:insertionPoint.location];
+    return [string componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
 #pragma mark - iTermPopupWindowPresenter
@@ -493,18 +398,31 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
 // NOTE: This must not change the suggestion directly. It has to do it in dispatch_async because
 // otherwise NSTextView throws exceptions.
 - (void)textDidChange:(NSNotification *)notification {
+    DLog(@"textDidChange - pre");
+    [_delegate largeComposerViewControllerTextDidChange:self];
+    DLog(@"textDidChange - post");
     _completionGeneration += 1;
     if (self.textView.isSettingSuggestion) {
         return;
     }
     [self.textView setSuggestion:nil];
-    _help.enabled = [self helpShouldBeAvailable];
+    if (!self.textView.isDoingSyntaxHighlighting) {
+        [self.textView doSyntaxHighlighting];
+    }
 
     NSString *command = [self lineBeforeCursor];
     if (command.length == 0) {
         return;
     }
-    NSString *historySuggestion = [self historySuggestionForPrefix:command];
+    NSString *textAfterCursor = [self textAfterCursor];
+    if (command.length > 0 &&
+        ![command endsWithWhitespace] &&
+        textAfterCursor.length > 0 &&
+        ![textAfterCursor beginsWithWhitespace]) {
+        return;
+    }
+    NSString *historySuggestion = [[self historySuggestionForPrefix:command] stringByTrimmingTrailingCharactersFromCharacterSet:[NSCharacterSet newlineCharacterSet]];
+
     if (historySuggestion) {
         __weak __typeof(self) weakSelf = self;
         const NSInteger generation = ++_completionGeneration;
@@ -516,21 +434,20 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
         return;
     }
 
-    if (![self.host isLocalhost] || self.tmuxController) {
-        // Don't try to complete filenames if not on localhost. Completion on tmux is possible in
-        // theory but likely to be very slow because of the amount of data that would need to be
-        // exchanged.
+    if (![self.delegate largeComposerViewControllerShouldFetchSuggestions:self forHost:self.host tmuxController:self.tmuxController]) {
         [self.textView setSuggestion:nil];
         return;
     }
 
     NSArray<NSString *> *words = [command componentsInShellCommand];
     const BOOL onFirstWord = words.count < 2;
-    NSString *const prefix = words.lastObject;
+    NSString *const prefix = [command hasSuffix:@" "] ? @"" : words.lastObject;
     const NSInteger generation = ++_completionGeneration;
     NSArray<NSString *> *directories;
     if (onFirstWord) {
-        iTermSearchPathsCacheEntry *entry = self.cache[self.shell];
+        // TODO: Get search paths from remote host when ssh integration is in use.
+        NSString *shell = [self.scope valueForVariableName:iTermVariableKeyTabID] ?: @"zsh";
+        iTermSearchPathsCacheEntry *entry = self.cache[shell];
         NSArray<NSString *> *paths = nil;
         if (entry.ready) {
             paths = entry.paths;
@@ -540,18 +457,16 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
         directories = @[self.workingDirectory ?: NSHomeDirectory()];
     }
     __weak __typeof(self) weakSelf = self;
-    [[iTermSlowOperationGateway sharedInstance] findCompletionsWithPrefix:prefix
-                                                            inDirectories:directories
-                                                                      pwd:self.workingDirectory
-                                                                 maxCount:1
-                                                               executable:onFirstWord
-                                                               completion:^(NSArray<NSString *> * _Nonnull completions) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf didFindCompletions:completions
-                           forGeneration:generation
-                                  escape:YES];
-        });
+    iTermSuggestionRequest *request = [[iTermSuggestionRequest alloc] initWithPrefix:prefix
+                                                                         directories:directories
+                                                                    workingDirectory:self.workingDirectory
+                                                                          executable:onFirstWord
+                                                                          completion:^(NSArray<NSString *> *completions) {
+        [weakSelf didFindCompletions:completions
+                       forGeneration:generation
+                              escape:YES];
     }];
+    [self.delegate largeComposerViewController:self fetchSuggestions:request];
 }
 
 - (void)didFindCompletions:(NSArray<NSString *> *)completions
@@ -591,9 +506,33 @@ static NSRange iTermRangeMinus(NSRange lhs, NSRange rhs) {
         commandSelector == @selector(deleteToEndOfParagraph:) ||
         commandSelector == @selector(deleteToMark:)) {
         [self.textView setSuggestion:nil];
+        [self.textView doSyntaxHighlighting];
     }
 
     return NO;
+}
+
+- (void)setHideAccessories:(BOOL)hideAccessories {
+    _hideAccessories = hideAccessories;
+    _accessories.hidden = hideAccessories;
+    _textView.autoMode = hideAccessories;
+
+    if (hideAccessories) {
+        const CGFloat sideMargin = 0;
+        const CGFloat topMargin = 0;
+        _scrollView.frame = NSMakeRect(sideMargin,
+                                       topMargin,
+                                       self.view.frame.size.width - sideMargin * 2,
+                                       self.view.frame.size.height - topMargin * 2);
+    } else {
+        const CGFloat sideMargin = 5;
+        const CGFloat topMargin = 11;
+        const CGFloat bottomMargin = 19;
+        _scrollView.frame = NSMakeRect(sideMargin,
+                                       bottomMargin,
+                                       self.view.frame.size.width - sideMargin * 2,
+                                       self.view.frame.size.height - topMargin - bottomMargin);
+    }
 }
 
 @end

@@ -7,11 +7,20 @@
 //
 
 #import "LineBufferHelpers.h"
+#import "NSObject+iTerm.h"
 
 @implementation ResultRange
 
 - (NSString *)description {
     return [NSString stringWithFormat:@"<%@: %p [%@...%@]>", NSStringFromClass(self.class), self, @(position), @(position + length - 1)];
+}
+
+- (BOOL)isEqual:(id)object {
+    ResultRange *other = [ResultRange castFrom:object];
+    if (!other) {
+        return NO;
+    }
+    return position == other->position && length == other->length;
 }
 
 @end
@@ -32,7 +41,10 @@
 }
 - (int)yEnd {
     return yEnd;
+}
 
+- (VT100GridCoordRange)coordRange {
+    return VT100GridCoordRangeMake(xStart, yStart, xEnd, yEnd);
 }
 
 @end

@@ -24,6 +24,14 @@
 #error ITERM_SERVER not defined. Build process is broken.
 #endif
 
+#if !DEBUG
+#  if defined(__has_feature)
+#    if __has_feature(undefined_behavior_sanitizer)
+#error This file should not be built with UBSAN - doing so adds an implicit dependency on Xcode.
+#    endif
+#  endif
+#endif
+
 const char *gMultiServerSocketPath;
 
 // On entry there should be three file descriptors:
@@ -570,7 +578,7 @@ static void HexDump(iTermClientServerProtocolMessage *message) {
             addr = i;
             offset = 0;
         }
-        offset += sprintf(buffer + offset, "%02x ", bytes[i]);
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%02x ", bytes[i]);
     }
     if (offset > 0) {
         FDLog(LOG_DEBUG, "%04d  %s", addr, buffer);

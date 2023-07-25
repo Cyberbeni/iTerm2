@@ -10,9 +10,11 @@
 
 #import "iTermMalloc.h"
 #import "iTermTuple.h"
+#import "iTermWeakBox.h"
 #import "NSData+iTerm.h"
 #import "NSLocale+iTerm.h"
 #import "NSMutableAttributedString+iTerm.h"
+#import "NSObject+iTerm.h"
 #import "NSStringITerm.h"
 
 @implementation NSArray (iTerm)
@@ -105,17 +107,6 @@
             [temp addObject:mappedObject];
         }
     }];
-    return temp;
-}
-
-- (NSArray *)mapWithBlock:(id (^NS_NOESCAPE)(id anObject))block {
-    NSMutableArray *temp = [NSMutableArray array];
-    for (id anObject in self) {
-        id mappedObject = block(anObject);
-        if (mappedObject) {
-            [temp addObject:mappedObject];
-        }
-    }
     return temp;
 }
 
@@ -292,16 +283,6 @@
 
 - (NSArray *)subarrayToIndexInclusive:(NSUInteger)index {
     return [self subarrayToIndex:index + 1];
-}
-
-- (NSArray *)subarrayFromIndex:(NSUInteger)index {
-    NSUInteger length;
-    if (self.count >= index) {
-        length = self.count - index;
-    } else {
-        return @[];
-    }
-    return [self subarrayWithRange:NSMakeRange(index, length)];
 }
 
 - (NSArray *)arrayByRemovingObject:(id)objectToRemove {
@@ -695,6 +676,23 @@ void iTermFreeeNullTerminatedCStringArray(const char **array) {
         return self[count - i - 1];
     }];
 }
+
+- (NSArray *)arrayByStrongifyingWeakBoxes {
+    if (self.count == 0) {
+        return @[];
+    }
+    return [self mapWithBlock:^id(id anObject) {
+        iTermWeakBox *box = [iTermWeakBox castFrom:anObject];
+        return box.object;
+    }];
+}
+
+- (NSArray *)arrayByRemovingNulls {
+    return [self filteredArrayUsingBlock:^BOOL(id anObject) {
+        return ![anObject isKindOfClass:[NSNull class]];
+    }];
+}
+
 @end
 
 @implementation NSMutableArray (iTerm)
@@ -723,3 +721,4 @@ void iTermFreeeNullTerminatedCStringArray(const char **array) {
 }
 
 @end
+

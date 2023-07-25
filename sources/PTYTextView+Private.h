@@ -7,6 +7,7 @@
 
 #import "PTYTextView.h"
 
+#import "PTYNoteViewController.h"
 #import "iTermTextViewContextMenuHelper.h"
 #import "iTermSelection.h"
 #import "iTermSemanticHistoryController.h"
@@ -21,11 +22,17 @@
 #import "iTermSelectionScrollHelper.h"
 #import "iTermTextPopoverViewController.h"
 
+@protocol iTermCancelable;
+@class iTermContentNavigationShortcut;
+@class iTermIdempotentOperationJoiner;
 @class iTermShellIntegrationWindowController;
 @class iTermURLActionHelper;
+@protocol Porthole;
 @class PTYMouseHandler;
+@protocol PTYTrackingChildWindow;
 
 @interface PTYTextView () <
+PTYNoteViewControllerDelegate,
 iTermBadgeLabelDelegate,
 iTermTextViewAccessibilityHelperDelegate,
 iTermFindCursorViewDelegate,
@@ -41,6 +48,9 @@ NSPopoverDelegate> {
     iTermShellIntegrationWindowController *_shellIntegrationInstallerWindow;
     iTermTextViewContextMenuHelper *_contextMenuHelper;
     iTermTextPopoverViewController* _indicatorMessagePopoverViewController;
+    // Child windows that need to have their frames adjusted as you scroll.
+    NSMutableArray<id<PTYTrackingChildWindow>> *_trackingChildWindows;
+    CGFloat _lastVirtualOffset;
 }
 
 @property(nonatomic, strong) iTermSelection *selection;
@@ -50,8 +60,14 @@ NSPopoverDelegate> {
 @property(nonatomic, strong) iTermQuickLookController *quickLookController;
 @property(strong, readwrite) NSTouchBar *touchBar NS_AVAILABLE_MAC(10_12_2);
 @property(nonatomic, readonly) BOOL hasUnderline;
+@property(nonatomic, strong) id<iTermCancelable> lastUrlActionCanceler;
+@property(nonatomic, readonly, strong) NSMutableArray<id<Porthole>> *portholes;
+@property(nonatomic, strong) iTermIdempotentOperationJoiner *portholesNeedUpdatesJoiner;
+@property(nonatomic) int lastPortholeWidth;  // in cells
+@property(nonatomic, strong) NSMutableArray<iTermContentNavigationShortcut *> *contentNavigationShortcuts;
 
 - (void)addNote;
+- (void)updateAlphaValue;
 - (NSString *)selectedTextCappedAtSize:(int)maxBytes;
 - (BOOL)_haveShortSelection;
 - (BOOL)haveReasonableSelection;
@@ -60,6 +76,15 @@ NSPopoverDelegate> {
 - (BOOL)withRelativeCoordRange:(VT100GridAbsCoordRange)range
                          block:(void (^ NS_NOESCAPE)(VT100GridCoordRange))block;
 - (NSRect)adjustedDocumentVisibleRect;
+
+// exposed for tests
+- (void)setDrawingHelperIsRetina:(BOOL)isRetina;
+- (void)copySelectionWithStyles:(iTermSelection *)selection;
+- (void)copySelection:(iTermSelection *)selection;
+- (void)scrollToCenterLine:(int)line;
+
+- (BOOL)showCommandInfoForEvent:(NSEvent *)event;
+- (IBAction)performFindPanelAction:(id)sender;
 
 @end
 

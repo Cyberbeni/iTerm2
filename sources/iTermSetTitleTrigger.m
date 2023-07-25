@@ -9,7 +9,6 @@
 #import "iTermSetTitleTrigger.h"
 
 #import "iTermSessionNameController.h"
-#import "PTYSession.h"
 
 @implementation iTermSetTitleTrigger
 
@@ -31,23 +30,24 @@
     return YES;
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *newName) {
-                                             if (newName) {
-                                                 [aSession triggerDidChangeNameTo:newName];
-                                             }
-                                         }];
+    // Need to stop the world to get scope, provided it is needed. Title changes are slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull newName) {
+        [scheduler scheduleTriggerCallback:^{
+            [aSession triggerSession:self didChangeNameTo:newName];
+        }];
+    }];
     return YES;
 }
 

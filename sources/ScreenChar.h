@@ -35,31 +35,43 @@
 
 @class iTermImage;
 @class iTermImageInfo;
+@protocol iTermImageInfoReading;
+
+#define ITERM2_PRIVATE_BEGIN 0x0001
+#define ITERM2_PRIVATE_END 0x0007
 
 // This is used in the rightmost column when a double-width character would
 // have been split in half and was wrapped to the next line. It is nonprintable
 // and not selectable. It is not copied into the clipboard. A line ending in this
 // character should always have EOL_DWC. These are stripped when adding a line
 // to the scrollback buffer.
-#define DWC_SKIP 0xf000
+#define DWC_SKIP (ITERM2_PRIVATE_BEGIN + 0)
 
 // When a tab is received, we insert some number of TAB_FILLER characters
 // preceded by a \t character. This allows us to reconstruct the tab for
 // copy-pasting.
-#define TAB_FILLER 0xf001
+#define TAB_FILLER (ITERM2_PRIVATE_BEGIN + 1)
 
 // If DWC_SKIP appears in the input, we convert it to this to avoid causing confusion.
 // NOTE: I think this isn't used because DWC_SKIP is caught early and converted to a '?'.
-#define BOGUS_CHAR 0xf002
+#define BOGUS_CHAR (ITERM2_PRIVATE_BEGIN + 2)
 
 // Double-width characters have their "real" code in one cell and this code in
 // the right-hand cell.
-#define DWC_RIGHT 0xf003
+#define DWC_RIGHT (ITERM2_PRIVATE_BEGIN + 3)
+
+// Placed in searchings while searching to match ^ or $
+#define REGEX_START (ITERM2_PRIVATE_BEGIN + 4)
+#define REGEX_END (ITERM2_PRIVATE_BEGIN + 5)
+
+// This never occurs in a string.
+#define IMPOSSIBLE_CHAR (ITERM2_PRIVATE_BEGIN + 6)
 
 // The range of private codes we use, with specific instances defined
 // above here.
-#define ITERM2_PRIVATE_BEGIN 0xf000
-#define ITERM2_PRIVATE_END 0xf003
+#define ITERM2_LEGACY_PRIVATE_BEGIN 0xf000
+#define ITERM2_LEGACY_PRIVATE_END 0xf003
+
 
 // These codes go in the continuation character to the right of the
 // rightmost column.
@@ -101,7 +113,12 @@ typedef NS_ENUM(NSUInteger, kiTermScreenCharAnsiColor) {
     kiTermScreenCharAnsiColorBrightWhite
 };
 
-
+typedef NS_ENUM(int, iTermTriState) {
+    iTermTriStateFalse,
+    iTermTriStateTrue,
+    iTermTriStateOther
+};
+iTermTriState iTermTriStateFromBool(BOOL b);
 
 // Max unichars in a glyph.
 static const int kMaxParts = 20;
@@ -282,30 +299,29 @@ typedef struct screen_char_t {
 
 
 // Standard unicode replacement string. Is a double-width character.
-static inline NSString* ReplacementString()
-{
+static inline NSString* ReplacementString(void) {
     const unichar kReplacementCharacter = UNICODE_REPLACEMENT_CHAR;
     return [NSString stringWithCharacters:&kReplacementCharacter length:1];
 }
 
-static inline BOOL ScreenCharacterAttributesEqual(screen_char_t *c1, screen_char_t *c2) {
-    return (c1->foregroundColor == c2->foregroundColor &&
-            c1->fgGreen == c2->fgGreen &&
-            c1->fgBlue == c2->fgBlue &&
-            c1->backgroundColor == c2->backgroundColor &&
-            c1->bgGreen == c2->bgGreen &&
-            c1->bgBlue == c2->bgBlue &&
-            c1->foregroundColorMode == c2->foregroundColorMode &&
-            c1->backgroundColorMode == c2->backgroundColorMode &&
-            c1->bold == c2->bold &&
-            c1->faint == c2->faint &&
-            c1->italic == c2->italic &&
-            c1->blink == c2->blink &&
-            c1->invisible == c2->invisible &&
-            c1->underline == c2->underline &&
-            c1->underlineStyle == c2->underlineStyle &&
-            c1->strikethrough == c2->strikethrough &&
-            c1->image == c2->image);
+static inline BOOL ScreenCharacterAttributesEqual(const screen_char_t c1, const screen_char_t c2) {
+    return (c1.foregroundColor == c2.foregroundColor &&
+            c1.fgGreen == c2.fgGreen &&
+            c1.fgBlue == c2.fgBlue &&
+            c1.backgroundColor == c2.backgroundColor &&
+            c1.bgGreen == c2.bgGreen &&
+            c1.bgBlue == c2.bgBlue &&
+            c1.foregroundColorMode == c2.foregroundColorMode &&
+            c1.backgroundColorMode == c2.backgroundColorMode &&
+            c1.bold == c2.bold &&
+            c1.faint == c2.faint &&
+            c1.italic == c2.italic &&
+            c1.blink == c2.blink &&
+            c1.invisible == c2.invisible &&
+            c1.underline == c2.underline &&
+            c1.underlineStyle == c2.underlineStyle &&
+            c1.strikethrough == c2.strikethrough &&
+            c1.image == c2.image);
 }
 
 // Copy foreground color from one char to another.
@@ -388,7 +404,7 @@ static inline BOOL ScreenCharHasDefaultAttributesAndColors(const screen_char_t s
 // the screen, though.
 + (instancetype)stringLineWithString:(NSString *)string;
 
-- (instancetype)initWithScreenChars:(screen_char_t *)screenChars
+- (instancetype)initWithScreenChars:(const screen_char_t *)screenChars
                              length:(NSInteger)length;
 
 - (NSRange)rangeOfScreenCharsForRangeInString:(NSRange)rangeInString;
@@ -404,15 +420,9 @@ BOOL ComplexCharCodeIsSpacingCombiningMark(unichar code);
 NSString* ScreenCharToStr(const screen_char_t *const sct);
 NSString* CharToStr(unichar code, BOOL isComplex);
 
-// Performs the appropriate normalization.
-NSString *StringByNormalizingString(NSString *theString, iTermUnicodeNormalization normalization);
-
 // This is a faster version of ScreenCharToStr if what you want is an array of
 // unichars. Returns the number of code points appended to dest.
-int ExpandScreenChar(screen_char_t* sct, unichar* dest);
-
-// Convert a code into a utf-32 char.
-UTF32Char CharToLongChar(unichar code, BOOL isComplex);
+int ExpandScreenChar(const screen_char_t *sct, unichar* dest);
 
 // Add a code point to the end of an existing complex char. A replacement key is
 // returned.
@@ -436,7 +446,7 @@ BOOL IsHighSurrogate(unichar c);
 // the result string to indices in the original array.
 // In other words:
 // part or all of [result characterAtIndex:i] refers to all or part of screenChars[i - (*deltasPtr)[i]].
-NSString* ScreenCharArrayToString(screen_char_t* screenChars,
+NSString* ScreenCharArrayToString(const screen_char_t *screenChars,
                                   int start,
                                   int end,
                                   unichar** backingStorePtr,
@@ -445,7 +455,7 @@ NSString* ScreenCharArrayToString(screen_char_t* screenChars,
 // Number of chars before a sequence of nuls at the end of the line.
 int EffectiveLineLength(screen_char_t* theLine, int totalLength);
 
-NSString* ScreenCharArrayToStringDebug(screen_char_t* screenChars,
+NSString* ScreenCharArrayToStringDebug(const screen_char_t* screenChars,
                                        int lineLength);
 
 NSString *DebugStringForScreenChar(screen_char_t c);
@@ -475,7 +485,8 @@ void StringToScreenChars(NSString *s,
                          int *cursorIndex,
                          BOOL *foundDwc,
                          iTermUnicodeNormalization normalization,
-                         NSInteger unicodeVersion);
+                         NSInteger unicodeVersion,
+                         BOOL softAlternateScreenMode);
 
 // Copy attributes from fg and bg, and zero out other fields. Text attributes like bold, italic, etc.
 // come from fg.
@@ -511,7 +522,8 @@ void SetDecodedImage(unichar code, iTermImage *image, NSData *data);
 void ReleaseImage(unichar code);
 
 // Returns image info for a code found in a screen_char_t with field image==1.
-iTermImageInfo *GetImageInfo(unichar code);
+id<iTermImageInfoReading> GetImageInfo(unichar code);
+iTermImageInfo* GetMutableImageInfo(unichar code);
 
 // Returns the position of a character within an image in cells with the origin
 // at the top left.
@@ -526,3 +538,55 @@ void ScreenCharClearProvisionalFlagForImageWithCode(int code);
 
 NSString *ScreenCharDescription(screen_char_t c);
 void ScreenCharInvert(screen_char_t *c);
+
+NS_INLINE BOOL ScreenCharIsDWC_SKIP(screen_char_t c) {
+    if (c.complexChar) {
+        return NO;
+    }
+    if (c.image) {
+        return NO;
+    }
+    return c.code == DWC_SKIP;
+}
+
+NS_INLINE BOOL ScreenCharIsDWC_RIGHT(screen_char_t c) {
+    // These tests are arranged in order of most- to least-likely for performance.
+    if (c.code != DWC_RIGHT) {
+        return NO;
+    }
+    if (c.complexChar) {
+        return NO;
+    }
+    if (c.image) {
+        return NO;
+    }
+    return YES;
+}
+
+NS_INLINE BOOL ScreenCharIsTAB_FILLER(screen_char_t c) {
+    if (c.complexChar) {
+        return NO;
+    }
+    if (c.image) {
+        return NO;
+    }
+    return c.code == TAB_FILLER;
+}
+
+NS_INLINE void ScreenCharSetDWC_SKIP(screen_char_t *c) {
+    c->complexChar = NO;
+    c->image = NO;
+    c->code = DWC_SKIP;
+}
+
+NS_INLINE void ScreenCharSetTAB_FILLER(screen_char_t *c) {
+    c->complexChar = NO;
+    c->image = NO;
+    c->code = TAB_FILLER;
+}
+
+NS_INLINE void ScreenCharSetDWC_RIGHT(screen_char_t *c) {
+    c->complexChar = NO;
+    c->image = NO;
+    c->code = DWC_RIGHT;
+}

@@ -9,6 +9,7 @@
 #import "Coprocess.h"
 
 #import "NSArray+iTerm.h"
+#import "NSDictionary+iTerm.h"
 
 const int kMaxInputBufferSize = 1024;
 const int kMaxOutputBufferSize = 1024;
@@ -18,6 +19,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
 
 @interface Coprocess()
 @property (nonatomic, copy) NSString *command;
+@property (atomic, copy) NSString *savedErrors;
 @end
 
 @implementation Coprocess {
@@ -27,6 +29,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     BOOL writePipeClosed_;
 
     NSMutableString *_errors;
+    dispatch_group_t _stderrGroup;
 }
 
 @synthesize pid = pid_;
@@ -45,7 +48,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     NSArray *oldMru = [[NSUserDefaults standardUserDefaults] stringArrayForKey:kCoprocessMruKey];
     NSMutableArray *newMru;
     if (oldMru) {
-        newMru = [[oldMru mutableCopy] autorelease];
+        newMru = [oldMru mutableCopy];
     } else {
         newMru = [NSMutableArray array];
     }
@@ -58,13 +61,23 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     [[NSUserDefaults standardUserDefaults] setObject:newMru forKey:kCoprocessMruKey];
 }
 
-+ (NSArray *)mostRecentlyUsedCommands
-{
++ (NSArray *)mostRecentlyUsedCommands {
     return [[NSUserDefaults standardUserDefaults] stringArrayForKey:kCoprocessMruKey];
 }
 
 + (Coprocess *)launchedCoprocessWithCommand:(NSString *)command
-{
+                                environment:(NSDictionary<NSString *, NSString *> *)environment {
+    const char **replacementEnvironment = NULL;
+    if (environment) {
+        NSMutableDictionary *combined = [[[NSProcessInfo processInfo] environment] mutableCopy];
+        [environment enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull key, NSString * _Nonnull obj, BOOL * _Nonnull stop) {
+            combined[key] = obj;
+        }];
+        NSArray<NSString *> *kvps = [combined.allKeys mapWithBlock:^id _Nonnull(id  _Nonnull key) {
+            return [NSString stringWithFormat:@"%@=%@", key, combined[key]];
+        }];
+        replacementEnvironment = [kvps nullTerminatedCStringArray];
+    }
     [Coprocess addCommandToMostRecentlyUsed:command];
     int inputPipe[2];
     int outputPipe[2];
@@ -97,6 +110,10 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
             }
         }
 
+        if (replacementEnvironment) {
+            extern const char **environ;
+            environ = replacementEnvironment;
+        }
         signal(SIGCHLD, SIG_DFL);
         execl("/bin/sh", "/bin/sh", "-c", [command UTF8String], 0);
 
@@ -104,7 +121,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
         fprintf(stderr, "## exec failed %s for command /bin/sh -c %s##\n", strerror(errno), [command UTF8String]);
         _exit(-1);
     } else if (pid < (pid_t)0) {
-        NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+        NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"Failed to launch coprocess.";
         [alert addButtonWithTitle:@"OK"];
         [alert runModal];
@@ -114,6 +131,9 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     close(inputPipe[0]);
     close(outputPipe[1]);
     close(errorPipe[1]);
+    if (replacementEnvironment) {
+        iTermFreeeNullTerminatedCStringArray(replacementEnvironment);
+    }
 
     return [Coprocess coprocessWithPid:pid
                                command:command
@@ -127,7 +147,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
                        outputFd:(int)outputFd
                         inputFd:(int)inputFd
                         errorFd:(int)errorFd {
-    Coprocess *result = [[[Coprocess alloc] init] autorelease];
+    Coprocess *result = [[Coprocess alloc] init];
     result.pid = pid;
     result.outputFd = outputFd;
     result.inputFd = inputFd;
@@ -137,7 +157,7 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     fcntl(outputFd, F_SETFL, flags | O_NONBLOCK);
     flags = fcntl(inputFd, F_GETFL);
     fcntl(inputFd, F_SETFL, flags | O_NONBLOCK);
-
+    result->_stderrGroup = dispatch_group_create();
     [result monitorErrorsOnFileDescriptor:errorFd];
     result.command = command;
     return result;
@@ -170,21 +190,11 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
     return self;
 }
 
-- (void)dealloc
-{
-    [inputBuffer_ release];
-    [outputBuffer_ release];
-    [_errors release];
-    [_delegate release];
-    [_command release];
-    
-    [super dealloc];
-}
-
 - (void)monitorErrorsOnFileDescriptor:(int)errorFd {
     dispatch_queue_t queue = dispatch_queue_create("com.iterm2.coprocess-errors", 0);
     _errors = [[NSMutableString alloc] init];
-
+    dispatch_group_t group = _stderrGroup;
+    dispatch_group_enter(group);
     dispatch_async(queue, ^{
         FILE *f = fdopen(errorFd, "r");
         while (1) {
@@ -195,21 +205,19 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
             }
             if (size > 0) {
                 NSData *data = [NSData dataWithBytes:line length:size];
-                NSString *string = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
-                NSLog(@"Error from coprocess: %@", string);
+                NSString *string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                 @synchronized (self) {
-                    if (_errors.length < 100000) {
-                        [_errors appendFormat:@"%@\n", string];
-                        if (_errors.length >= 100000) {
-                            [_errors appendString:@"\n-- output truncated --\n"];
+                    if (self->_errors.length < 100000) {
+                        [self->_errors appendFormat:@"%@\n", string];
+                        if (self->_errors.length >= 100000) {
+                            [self->_errors appendString:@"\n-- output truncated --\n"];
                         }
                     }
                 }
             }
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            dispatch_release(queue);
-        });
+        self.savedErrors = self->_errors;
+        dispatch_group_leave(group);
     });
 }
 
@@ -288,11 +296,11 @@ static NSString *const iTermCoprocessCommandsToIgnoreErrorOutputPrefsKey = @"NoS
         self.inputFd = -1;
         self.pid = -1;
         @synchronized (self) {
-            if (_errors.length > 0) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self.delegate coprocess:self didTerminateWithErrorOutput:_errors];
-                });
-            }
+            dispatch_group_notify(_stderrGroup, dispatch_get_main_queue(), ^{
+                if (self.savedErrors.length > 0) {
+                    [self.delegate coprocess:self didTerminateWithErrorOutput:self.savedErrors];
+                }
+            });
         }
     }
 }

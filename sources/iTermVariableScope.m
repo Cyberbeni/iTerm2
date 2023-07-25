@@ -192,9 +192,10 @@ NS_ASSUME_NONNULL_BEGIN
         if (value == nil) {
             return nil;
         }
-        ITAssertWithMessage([value isKindOfClass:[iTermVariables class]],
-                            @"Value is not iTermVariables. It is %@. The path is %@. The remaining parts are %@",
-                            value, path, parts);
+        if (![value isKindOfClass:[iTermVariables class]]) {
+            // You can get here if when checking for cycles in the presence of a bogus path that is a child of a terminal (e.g., currentSession.path.s)
+            return nil;
+        }
         assert([value isKindOfClass:[iTermVariables class]]);
         owner = value;
         parts = [parts subarrayFromIndex:1];
@@ -333,6 +334,15 @@ NS_ASSUME_NONNULL_BEGIN
                                               forWriting:NO
                                                 terminal:&terminal];
     return [[iTermVariableDesignator alloc] initWithVariables:owner path:terminal];
+}
+
+- (iTermVariableScope *)variableScopeByAddingBackreferences:(NSArray<NSString *> *)backreferences
+                                                      owner:(id<iTermObject>)owner {
+    iTermVariables *matchesFrame = [[iTermVariables alloc] initWithContext:iTermVariablesSuggestionContextNone owner:owner];
+    iTermVariableScope *myScope = [self copy];
+    [myScope addVariables:matchesFrame toScopeNamed:nil];
+    [myScope setValue:backreferences forVariableNamed:@"matches"];
+    return myScope;
 }
 
 @end

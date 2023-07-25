@@ -10,6 +10,7 @@
 #import "DebugLogging.h"
 #import "iTermAPIHelper.h"
 #import "iTermExpressionParser.h"
+#import "iTermGCD.h"
 #import "iTermScriptFunctionCall+Private.h"
 #import "iTermScriptHistory.h"
 #import "iTermVariableScope.h"
@@ -92,8 +93,7 @@
 }
 
 static NSMutableArray *iTermExpressionEvaluatorGlobalStore(void) {
-    ITBetaAssert(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) == dispatch_queue_get_label(dispatch_get_main_queue()),
-                 @"Expression evaluation should only occur on the main queue.");
+    [iTermGCD assertMainQueueSafe:@"Expression evaluation must be main-queue safe"];
     static NSMutableArray *array;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -110,21 +110,43 @@ static NSMutableArray *iTermExpressionEvaluatorGlobalStore(void) {
 
     [iTermExpressionEvaluatorGlobalStore() addObject:self];
 
-    __weak __typeof(self) weakSelf = self;
     BOOL debug = _debug;
+    [self reallyEvaluateWithTimeout:timeout debug:debug completion:completion];
+}
+
+- (void)reallyEvaluateWithTimeout:(NSTimeInterval)timeout
+                            debug:(BOOL)debug
+                       completion:(void (^)(iTermExpressionEvaluator *))completion {
     NSString *descr = [NSString stringWithFormat:@"%@: %@", self, _invocation];
     if (debug) {
         NSLog(@"Evaluate %@", _parsedExpression);
     }
+    __weak __typeof(self) weakSelf = self;
     [self evaluateParsedExpression:_parsedExpression
                         invocation:_invocation
                        withTimeout:timeout
                         completion:^(id result, NSError *error, NSSet<NSString *> *missing) {
-                            if (debug) {
-                                NSLog(@"%@ result=%@, error=%@, missing=%@", descr, result, error, missing);
-                            }
-                            [weakSelf didCompleteWithResult:result error:error missing:missing completion:completion];
-                        }];
+        DLog(@"%@ result=%@, error=%@, missing=%@", descr, result, error, missing);
+        if (debug) {
+            NSLog(@"%@ result=%@, error=%@, missing=%@", descr, result, error, missing);
+        }
+        if (self.retryUntil.timeIntervalSinceNow > 0 &&
+            [error.domain isEqual:iTermAPIHelperErrorDomain] &&
+            error.code == iTermAPIHelperErrorCodeUnregisteredFunction) {
+            DLog(@"Schedule retry of %@", descr);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                DLog(@"Retrying");
+                [weakSelf reallyEvaluateWithTimeout:timeout debug:debug completion:completion];
+            });
+            return;
+        }
+
+        if (debug) {
+            NSLog(@"Return result=%@ error=%@", result, error);
+        }
+        DLog(@"Return result=%@ error=%@", result, error);
+        [weakSelf didCompleteWithResult:result error:error missing:missing completion:completion];
+    }];
 }
 
 - (void)didCompleteWithResult:(id)result
@@ -203,6 +225,17 @@ static NSMutableArray *iTermExpressionEvaluatorGlobalStore(void) {
             return;
         }
 
+        case iTermParsedExpressionTypeFunctionCalls: {
+            assert(parsedExpression.functionCalls);
+            [iTermScriptFunctionCall executeFunctionCalls:parsedExpression.functionCalls
+                                               invocation:invocation
+                                                 receiver:nil
+                                                  timeout:timeout
+                                                    scope:_scope
+                                               completion:completion];
+            return;
+        }
+
         case iTermParsedExpressionTypeInterpolatedString: {
             [self evaluateInterpolatedStringParts:parsedExpression.interpolatedStringParts
                                        invocation:invocation
@@ -221,6 +254,7 @@ static NSMutableArray *iTermExpressionEvaluatorGlobalStore(void) {
         case iTermParsedExpressionTypeArrayOfValues:
         case iTermParsedExpressionTypeString:
         case iTermParsedExpressionTypeNumber:
+        case iTermParsedExpressionTypeBoolean:
             completion(parsedExpression.object, nil, nil);
             return;
 

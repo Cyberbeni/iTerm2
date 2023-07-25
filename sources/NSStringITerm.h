@@ -36,6 +36,7 @@
 
 #import "iTermOrderedDictionary.h"
 #import "iTermTuple.h"
+#import "NSString+CommonAdditions.h"
 
 @class iTermVariableScope;
 
@@ -65,7 +66,8 @@ int decode_utf8_char(const unsigned char * restrict datap,
 + (NSString *)stringWithInt:(int)num;
 + (BOOL)isDoubleWidthCharacter:(int)unicode
         ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
-                unicodeVersion:(NSInteger)version;
+                unicodeVersion:(NSInteger)version
+                fullWidthFlags:(BOOL)fullWidthFlags;
 + (NSString *)stringWithLongCharacter:(UTF32Char)longCharacter;
 
 // Returns the current string on the pasteboard (if any).
@@ -97,7 +99,7 @@ int decode_utf8_char(const unsigned char * restrict datap,
 //   foo ~root "~"    bar\ baz   ""
 // and returns an array like:
 //   @[ @"foo", @"/Users/root", @"~", @"bar baz", @"" ]
-- (NSArray *)componentsInShellCommand;
+- (NSArray<NSString *> *)componentsInShellCommand;
 
 // Same as componentsInShellCommand but \r, \n, \t, and \a map to the letters r, n, t, and a,
 // not to controls.
@@ -157,7 +159,6 @@ int decode_utf8_char(const unsigned char * restrict datap,
 //    "*http://example.com" -> "http://example.com"
 - (NSRange)rangeOfURLInString;
 
-- (NSString *)stringByRemovingEnclosingBrackets;
 - (NSString *)stringByRemovingSuffix:(NSString *)suffix;
 - (NSString *)stringByRemovingPrefix:(NSString *)prefix;
 
@@ -185,6 +186,7 @@ int decode_utf8_char(const unsigned char * restrict datap,
 
 // Expands a vim-style string's special characters
 - (NSString *)stringByExpandingVimSpecialCharacters;
+- (NSString *)stringByExpandingTildeInPathPreservingSlash;
 
 // How tall is this string when rendered within a fixed width?
 - (CGFloat)heightWithAttributes:(NSDictionary *)attributes constrainedToWidth:(CGFloat)maxWidth;
@@ -314,7 +316,6 @@ int decode_utf8_char(const unsigned char * restrict datap,
 // If this is a 2+ part version number, return a 2 part version number. Otherwise, nil.
 - (NSString *)it_twoPartVersionNumber;
 - (NSString *)stringByEscapingForSandboxLiteral;
-- (NSString *)stringByDroppingLastCharacters:(NSInteger)count;
 - (NSString *)stringByKeepingLastCharacters:(NSInteger)count;
 - (NSString *)stringByTrimmingOrphanedSurrogates;
 
@@ -342,7 +343,20 @@ int decode_utf8_char(const unsigned char * restrict datap,
 - (NSString *)removingHTMLFromTabTitleIfNeeded;
 // nil if this is not scannable as an integer.
 - (NSNumber *)integerNumber;
-- (BOOL)getHashColorRed:(int *)red green:(int *)green blue:(int *)blue;
+- (BOOL)getHashColorRed:(unsigned int *)red green:(unsigned int *)green blue:(unsigned int *)blue;
+- (BOOL)interpolatedStringContainsNonliteral;
+- (NSString *)it_stringByAppendingCharacter:(unichar)theChar;
+- (NSDictionary<NSString *, NSString *> *)it_keyValuePairsSeparatedBy:(NSString *)separator;
+
+- (UTF32Char)longCharacterAtIndex:(NSInteger)i;
+- (NSString *)stringByReplacingBaseCharacterWith:(UTF32Char)base;
+
+@property (nonatomic, readonly) BOOL beginsWithWhitespace;
+@property (nonatomic, readonly) BOOL endsWithWhitespace;
+
+- (NSArray<NSString *> *)lastWords:(NSUInteger)count;
+@property (nonatomic, readonly) NSString *firstNonEmptyLine;
+- (NSString *)truncatedToLength:(NSInteger)maxLength ellipsis:(NSString *)ellipsis;
 
 @end
 

@@ -12,7 +12,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@class iTermImageInfo;
+@protocol iTermCancelable;
+@protocol iTermImageInfoReading;
+@protocol iTermObject;
 @class iTermSelection;
 @class iTermSemanticHistoryController;
 @class iTermTextExtractor;
@@ -22,11 +24,11 @@ NS_ASSUME_NONNULL_BEGIN
 @class SCPPath;
 @class SmartMatch;
 @class URLAction;
-@class VT100RemoteHost;
+@protocol VT100RemoteHostReading;
 
 @protocol iTermURLActionHelperDelegate<NSObject>
 - (BOOL)urlActionHelperShouldIgnoreHardNewlines:(iTermURLActionHelper *)helper;
-- (iTermImageInfo *)urlActionHelper:(iTermURLActionHelper *)helper imageInfoAt:(VT100GridCoord)coord;
+- (id<iTermImageInfoReading>)urlActionHelper:(iTermURLActionHelper *)helper imageInfoAt:(VT100GridCoord)coord;
 - (iTermTextExtractor *)urlActionHelperNewTextExtractor:(iTermURLActionHelper *)helper;
 - (void)urlActionHelper:(iTermURLActionHelper *)helper workingDirectoryOnLine:(int)line completion:(void (^)(NSString *workingDirectory))completion;
 
@@ -43,7 +45,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (long long)urlActionTotalScrollbackOverflow:(iTermURLActionHelper *)helper;
 
-- (VT100RemoteHost *)urlActionHelper:(iTermURLActionHelper *)helper remoteHostOnLine:(int)line;
+- (id<VT100RemoteHostReading>)urlActionHelper:(iTermURLActionHelper *)helper remoteHostOnLine:(int)line;
 
 - (NSDictionary<NSNumber *, NSString *> *)urlActionHelperSmartSelectionActionSelectorDictionary:(iTermURLActionHelper *)helper;
 - (NSArray<NSDictionary<NSString *, id> *> *)urlActionHelperSmartSelectionRules:(iTermURLActionHelper *)helper;
@@ -54,9 +56,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (CGFloat)urlActionHelperLineHeight:(iTermURLActionHelper *)helper;
 - (void)urlActionHelper:(iTermURLActionHelper *)helper launchProfileInCurrentTerminal:(Profile *)profile withURL:(NSURL *)url;
 - (iTermVariableScope *)urlActionHelperScope:(iTermURLActionHelper *)helper;
+- (id<iTermObject>)urlActionHelperOwner:(iTermURLActionHelper *)helper;
 - (void)urlActionHelperCopySelectionIfNeeded:(iTermURLActionHelper *)helper;
 - (iTermSelection *)urlActionHelperSelection:(iTermURLActionHelper *)helper;
-
 @end
 
 @interface iTermURLActionHelper : NSObject
@@ -69,12 +71,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (BOOL)ignoreHardNewlinesInURLs;
 
-- (void)urlActionForClickAtCoord:(VT100GridCoord)coord
-                      completion:(void (^)(URLAction * _Nullable))completion;
+- (id<iTermCancelable>)urlActionForClickAtCoord:(VT100GridCoord)coord
+                                     completion:(void (^)(URLAction * _Nullable))completion;
 
-- (void)urlActionForClickAtCoord:(VT100GridCoord)coord
-          respectingHardNewlines:(BOOL)respectHardNewlines
-                      completion:(void (^)(URLAction * _Nullable))completion;
+- (id<iTermCancelable>)urlActionForClickAtCoord:(VT100GridCoord)coord
+                         respectingHardNewlines:(BOOL)respectHardNewlines
+                                      alternate:(BOOL)alternate
+                                     completion:(void (^)(URLAction * _Nullable))completion;
 
 - (void)openTargetWithEvent:(NSEvent *)event inBackground:(BOOL)openInBackground;
 
@@ -84,11 +87,11 @@ NS_ASSUME_NONNULL_BEGIN
                          displayName:(NSString *)name
                       locationInView:(VT100GridCoordRange)range;
 
-- (SmartMatch *)smartSelectAtAbsoluteCoord:(VT100GridAbsCoord)coord
-                                        to:(VT100GridAbsWindowedRange *)rangePtr
-                          ignoringNewlines:(BOOL)ignoringNewlines
-                            actionRequired:(BOOL)actionRequired
-                           respectDividers:(BOOL)respectDividers;
+- (SmartMatch * _Nullable)smartSelectAtAbsoluteCoord:(VT100GridAbsCoord)coord
+                                                  to:(VT100GridAbsWindowedRange *)rangePtr
+                                    ignoringNewlines:(BOOL)ignoringNewlines
+                                      actionRequired:(BOOL)actionRequired
+                                     respectDividers:(BOOL)respectDividers;
 
 - (void)smartSelectWithEvent:(NSEvent *)event;
 

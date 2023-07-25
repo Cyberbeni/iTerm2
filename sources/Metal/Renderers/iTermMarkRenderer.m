@@ -1,5 +1,6 @@
 #import "iTermMarkRenderer.h"
 
+#import "DebugLogging.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermPreferences.h"
 #import "iTermTextDrawingHelper.h"
@@ -100,34 +101,41 @@
 }
 
 - (void)initializeTransientState:(iTermMarkRendererTransientState *)tState {
+    DLog(@"Initialize transient state");
     const CGFloat scale = tState.configuration.scale;
 
+    DLog(@"Side margin size is %@, scale is %@, cell size is %@, cell size without spacing is %@",
+         @([iTermPreferences intForKey:kPreferenceKeySideMargins]),
+         @(scale),
+         NSStringFromSize(tState.cellConfiguration.cellSize),
+         NSStringFromSize(tState.cellConfiguration.cellSizeWithoutSpacing));
     CGRect leftMarginRect = CGRectMake(1,
                                        0,
                                        ([iTermPreferences intForKey:kPreferenceKeySideMargins] - 1) * scale,
                                        tState.cellConfiguration.cellSize.height);
+    DLog(@"leftMarginRect=%@", NSStringFromRect(leftMarginRect));
     CGRect markRect = [iTermTextDrawingHelper frameForMarkContainedInRect:leftMarginRect
                                                                  cellSize:tState.cellConfiguration.cellSize
                                                    cellSizeWithoutSpacing:tState.cellConfiguration.cellSizeWithoutSpacing
                                                                     scale:scale];
+    DLog(@"markRect=%@, _markSize=%@", NSStringFromRect(markRect), NSStringFromSize(_markSize));
+
     if (!CGSizeEqualToSize(markRect.size, _markSize) || ![NSObject object:tState.configuration.colorSpace isEqualToObject:_colorSpace]) {
-        // Mark size or colorspace has changed
+        DLog(@"Mark size or colorspace has changed");
         _markSize = markRect.size;
         _colorSpace = tState.configuration.colorSpace;
         if (_markSize.width > 0 && _markSize.height > 0) {
-            _marksArrayTexture = [[iTermTextureArray alloc] initWithTextureWidth:_markSize.width
-                                                                   textureHeight:_markSize.height
-                                                                     arrayLength:3
-                                                                     pixelFormat:MTLPixelFormatRGBA16Float  // lockFocus gives this
-                                                                          device:_cellRenderer.device];
-
+            DLog(@"Size is positive, make images of size %@", NSStringFromSize(_markSize));
             NSColor *successColor = [iTermTextDrawingHelper successMarkColor];
             NSColor *otherColor = [iTermTextDrawingHelper otherMarkColor];
             NSColor *failureColor = [iTermTextDrawingHelper errorMarkColor];
-
-            [_marksArrayTexture addSliceWithImage:[self newImageWithMarkOfColor:successColor size:_markSize]];
-            [_marksArrayTexture addSliceWithImage:[self newImageWithMarkOfColor:failureColor size:_markSize]];
-            [_marksArrayTexture addSliceWithImage:[self newImageWithMarkOfColor:otherColor size:_markSize]];
+            NSImage *successImage = [self newImageWithMarkOfColor:successColor size:_markSize];
+            NSImage *failureImage = [self newImageWithMarkOfColor:failureColor size:_markSize];
+            NSImage *otherImage = [self newImageWithMarkOfColor:otherColor size:_markSize];
+            _marksArrayTexture = [[iTermTextureArray alloc] initWithImages:@[successImage,
+                                                                             failureImage,
+                                                                             otherImage]
+                                                                    device:_cellRenderer.device];
         }
     }
 
@@ -156,15 +164,16 @@
                                            0,
                                            tState.markSize.width,
                                            tState.markSize.height);
+    DLog(@"Using texture frame of %@", NSStringFromRect(textureFrame));
     const iTermVertex vertices[] = {
         // Pixel Positions                              Texture Coordinates
-        { { CGRectGetMaxX(quad), CGRectGetMinY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMinY(textureFrame) } },
-        { { CGRectGetMinX(quad), CGRectGetMinY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMinY(textureFrame) } },
-        { { CGRectGetMinX(quad), CGRectGetMaxY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMaxY(textureFrame) } },
+        { { CGRectGetMaxX(quad), CGRectGetMinY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMaxY(textureFrame) } },
+        { { CGRectGetMinX(quad), CGRectGetMinY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMaxY(textureFrame) } },
+        { { CGRectGetMinX(quad), CGRectGetMaxY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMinY(textureFrame) } },
 
-        { { CGRectGetMaxX(quad), CGRectGetMinY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMinY(textureFrame) } },
-        { { CGRectGetMinX(quad), CGRectGetMaxY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMaxY(textureFrame) } },
-        { { CGRectGetMaxX(quad), CGRectGetMaxY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMaxY(textureFrame) } },
+        { { CGRectGetMaxX(quad), CGRectGetMinY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMaxY(textureFrame) } },
+        { { CGRectGetMinX(quad), CGRectGetMaxY(quad) }, { CGRectGetMinX(textureFrame), CGRectGetMinY(textureFrame) } },
+        { { CGRectGetMaxX(quad), CGRectGetMaxY(quad) }, { CGRectGetMaxX(textureFrame), CGRectGetMinY(textureFrame) } },
     };
     tState.vertexBuffer = [_cellRenderer.verticesPool requestBufferFromContext:tState.poolContext
                                                                       withBytes:vertices
@@ -189,12 +198,7 @@
 #pragma mark - Private
 
 - (NSImage *)newImageWithMarkOfColor:(NSColor *)color size:(CGSize)pixelSize {
-    NSSize pointSize = pixelSize;
-    const CGFloat scale = 2;
-    pointSize.width /= scale;
-    pointSize.height /= scale;
-
-    return [iTermTextDrawingHelper newImageWithMarkOfColor:color size:pointSize];
+    return [iTermTextDrawingHelper newImageWithMarkOfColor:color pixelSize:pixelSize];
 }
 
 @end

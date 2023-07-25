@@ -9,8 +9,6 @@
 #import "SetDirectoryTrigger.h"
 
 #import "DebugLogging.h"
-#import "PTYSession.h"
-#import "VT100Screen.h"
 
 @implementation SetDirectoryTrigger
 
@@ -30,23 +28,25 @@
     return YES;
 }
 
-- (BOOL)performActionWithCapturedStrings:(NSString *const *)capturedStrings
+- (BOOL)performActionWithCapturedStrings:(NSArray<NSString *> *)stringArray
                           capturedRanges:(const NSRange *)capturedRanges
-                            captureCount:(NSInteger)captureCount
-                               inSession:(PTYSession *)aSession
+                               inSession:(id<iTermTriggerSession>)aSession
                                 onString:(iTermStringLine *)stringLine
                     atAbsoluteLineNumber:(long long)lineNumber
                         useInterpolation:(BOOL)useInterpolation
                                     stop:(BOOL *)stop {
-    [self paramWithBackreferencesReplacedWithValues:capturedStrings
-                                              count:captureCount
-                                              scope:aSession.variablesScope
-                                   useInterpolation:useInterpolation
-                                         completion:^(NSString *currentDirectory) {
+    // Need to stop the world to get scope, provided it is needed. Directory changes slow & rare that this is ok.
+    id<iTermTriggerScopeProvider> scopeProvider = [aSession triggerSessionVariableScopeProvider:self];
+    id<iTermTriggerCallbackScheduler> scheduler = [scopeProvider triggerCallbackScheduler];
+    [[self paramWithBackreferencesReplacedWithValues:stringArray
+                                             absLine:lineNumber
+                                               scope:scopeProvider
+                                    useInterpolation:useInterpolation] then:^(NSString * _Nonnull currentDirectory) {
         DLog(@"SetDirectoryTrigger completed substitution with %@", currentDirectory);
         if (currentDirectory.length) {
-            [aSession didUpdateCurrentDirectory];
-            [aSession.screen terminalCurrentDirectoryDidChangeTo:currentDirectory];
+            [scheduler scheduleTriggerCallback:^{
+                [aSession triggerSession:self setCurrentDirectory:currentDirectory];
+            }];
         }
     }];
     return YES;

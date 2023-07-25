@@ -9,6 +9,8 @@
 #import <Foundation/Foundation.h>
 #import "NSObject+iTerm.h"
 
+NS_ASSUME_NONNULL_BEGIN
+
 typedef struct {
     int x;
     int y;
@@ -51,7 +53,7 @@ typedef struct {
 
 typedef struct {
     VT100GridCoordRange coordRange;  // inclusive of y, half-open on x
-    VT100GridRange columnWindow;
+    VT100GridRange columnWindow;  // 0s if you don't care
 } VT100GridWindowedRange;
 
 typedef struct {
@@ -60,6 +62,7 @@ typedef struct {
 } VT100GridAbsWindowedRange;
 
 extern const VT100GridCoord VT100GridCoordInvalid;
+extern const VT100GridCoordRange VT100GridCoordRangeInvalid;
 
 @interface NSValue (VT100Grid)
 
@@ -207,6 +210,24 @@ NS_INLINE VT100GridAbsWindowedRange VT100GridAbsWindowedRangeMake(VT100GridAbsCo
     return windowedRange;
 }
 
+NS_INLINE VT100GridRect VT100GridWindowedRangeBoundingRect(VT100GridWindowedRange range) {
+    if (range.coordRange.start.y != range.coordRange.end.y) {
+        // Spans multiple lines so it covers the full width of the column window.
+        return VT100GridRectMake(range.columnWindow.location,
+                                 range.coordRange.start.y,
+                                 range.columnWindow.length,
+                                 range.coordRange.end.y - range.coordRange.start.y + 1);
+    }
+    const int minX = MAX(range.columnWindow.location, range.coordRange.start.x);
+    const int maxX = MIN(range.columnWindow.location + range.columnWindow.length,
+                         range.coordRange.end.x);
+
+    return VT100GridRectMake(minX,
+                             range.coordRange.start.y,
+                             maxX - minX + 1,
+                             range.coordRange.end.y - range.coordRange.start.y + 1);
+}
+
 NS_INLINE VT100GridCoord VT100GridWindowedRangeStart(VT100GridWindowedRange range) {
     VT100GridCoord coord = range.coordRange.start;
     if (range.columnWindow.length) {
@@ -348,6 +369,14 @@ NS_INLINE VT100GridWindowedRange VT100GridWindowedRangeFromAbsWindowedRange(VT10
                                       absrange.columnWindow.length);
 }
 
+NS_INLINE BOOL VT100GridAbsCoordIsValid(VT100GridAbsCoord coord) {
+    return coord.x >= 0 && coord.y >= 0;
+}
+
+NS_INLINE BOOL VT100GridAbsCoordRangeIsValid(VT100GridAbsCoordRange range) {
+    return VT100GridAbsCoordIsValid(range.start) && VT100GridAbsCoordIsValid(range.end);
+}
+
 NS_INLINE VT100GridAbsCoordRange VT100GridAbsCoordRangeFromCoordRange(VT100GridCoordRange range,
                                                                       long long offset) {
     return VT100GridAbsCoordRangeMake(range.start.x, range.start.y + offset, range.end.x, range.end.y + offset);
@@ -408,7 +437,7 @@ NS_INLINE VT100GridAbsCoord VT100GridAbsCoordFromCoord(VT100GridCoord coord, lon
 
 NS_INLINE VT100GridCoord VT100GridCoordFromAbsCoord(VT100GridAbsCoord absCoord,
                                                     long long totalOverflow,
-                                                    BOOL *ok) {
+                                                    BOOL * _Nullable ok) {
     const long long y = absCoord.y - totalOverflow;
     if (y < 0 || y > INT_MAX) {
         if (ok) {
@@ -439,6 +468,12 @@ NS_INLINE NSString *VT100GridAbsCoordDescription(VT100GridAbsCoord c) {
 
 NS_INLINE NSString *VT100GridCoordDescription(VT100GridCoord c) {
     return [NSString stringWithFormat:@"(%d, %d)", c.x, c.y];
+}
+
+NS_INLINE NSString *VT100GridRectDescription(VT100GridRect rect) {
+    return [NSString stringWithFormat:@"{%@ %@}",
+            VT100GridCoordDescription(rect.origin),
+            VT100GridSizeDescription(rect.size)];
 }
 
 NS_INLINE NSString *VT100GridRunDescription(VT100GridRun run) {
@@ -479,6 +514,16 @@ NS_INLINE VT100GridAbsCoord VT100GridAbsCoordRangeMax(VT100GridAbsCoordRange ran
     } else {
         return range.start;
     }
+}
+
+NS_INLINE BOOL VT100GridAbsCoordRangeContainsAbsCoord(VT100GridAbsCoordRange range, VT100GridAbsCoord coord) {
+  NSComparisonResult order = VT100GridAbsCoordOrder(VT100GridAbsCoordRangeMin(range), coord);
+  if (order == NSOrderedDescending) {
+    return NO;
+  }
+
+  order = VT100GridAbsCoordOrder(VT100GridAbsCoordRangeMax(range), coord);
+  return (order == NSOrderedDescending);
 }
 
 NS_INLINE BOOL VT100GridCoordRangeContainsCoord(VT100GridCoordRange range, VT100GridCoord coord) {
@@ -551,6 +596,10 @@ NS_INLINE long long VT100GridCoordRangeLength(VT100GridCoordRange range, int gri
     return VT100GridCoordDistance(range.start, range.end, gridWidth);
 }
 
+NS_INLINE long long VT100GridCoordRangeHeight(VT100GridCoordRange range) {
+    return range.end.y - range.start.y + 1;
+}
+
 NS_INLINE long long VT100GridAbsCoordRangeLength(VT100GridAbsCoordRange range, int gridWidth) {
     return VT100GridAbsCoordDistance(range.start, range.end, gridWidth);
 }
@@ -579,6 +628,22 @@ NS_INLINE BOOL VT100GridCoordInRect(VT100GridCoord coord, VT100GridRect rect) {
             coord.y < rect.origin.y + rect.size.height);
 }
 
+NS_INLINE VT100GridCoord VT100GridRectTopLeft(VT100GridRect rect) {
+    return VT100GridCoordMake(rect.origin.x, rect.origin.y);
+}
+
+NS_INLINE VT100GridCoord VT100GridRectTopRight(VT100GridRect rect) {
+    return VT100GridCoordMake(rect.origin.x + rect.size.width - 1, rect.origin.y);
+}
+
+NS_INLINE VT100GridCoord VT100GridRectBottomLeft(VT100GridRect rect) {
+    return VT100GridCoordMake(rect.origin.x, rect.origin.y + rect.size.height - 1);
+}
+
+NS_INLINE VT100GridCoord VT100GridRectBottomRight(VT100GridRect rect) {
+    return VT100GridCoordMake(rect.origin.x + rect.size.width - 1, rect.origin.y + rect.size.height - 1);
+}
+
 // Creates a run between two coords, not inclusive of end.
 VT100GridRun VT100GridRunFromCoords(VT100GridCoord start,
                                     VT100GridCoord end,
@@ -588,7 +653,7 @@ NS_INLINE NSDictionary *VT100GridCoordToDictionary(VT100GridCoord coord) {
     return @{ @"x": @(coord.x), @"y": @(coord.y) };
 }
 
-NS_INLINE BOOL VT100GridCoordFromDictionary(NSDictionary *dict, VT100GridCoord *coord) {
+NS_INLINE BOOL VT100GridCoordFromDictionary(NSDictionary * _Nullable dict, VT100GridCoord *coord) {
     if (!dict) {
         return NO;
     }
@@ -611,3 +676,4 @@ NS_INLINE BOOL VT100GridCoordFromDictionary(NSDictionary *dict, VT100GridCoord *
     return YES;
 }
 
+NS_ASSUME_NONNULL_END

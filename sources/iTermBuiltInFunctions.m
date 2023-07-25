@@ -7,6 +7,7 @@
 
 #import "iTermBuiltInFunctions.h"
 
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAlertBuiltInFunction.h"
 #import "iTermReflection.h"
 #import "iTermSetStatusBarComponentUnreadCountBuiltInFunction.h"
@@ -16,6 +17,19 @@
 #import "NSObject+iTerm.h"
 
 #import <objc/runtime.h>
+
+NSArray<NSString *> *iTermAllFunctionSignaturesFromNamespaceAndNameAndArguments(NSString *namespace,
+                                                                                NSString *name,
+                                                                                NSArray<NSString *> *argumentNames,
+                                                                                NSSet<NSString *> *optionalArguments) {
+    NSArray<NSString *> *requiredArgs = [argumentNames filteredArrayUsingBlock:^BOOL(NSString *name) {
+        return ![optionalArguments containsObject:name];
+    }];
+    return [[[optionalArguments allCombinations] allObjects] mapWithBlock:^id _Nullable(NSSet<NSString *> *optionals) {
+        NSArray<NSString *> *amendedArgumentNames = [requiredArgs arrayByAddingObjectsFromArray:optionals.allObjects];
+        return iTermFunctionSignatureFromNamespaceAndNameAndArguments(namespace, name, amendedArgumentNames);
+    }];
+}
 
 NSString *iTermFunctionSignatureFromNamespaceAndNameAndArguments(NSString *namespace, NSString *name, NSArray<NSString *> *argumentNames) {
     NSString *combinedArguments = [[argumentNames sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","];
@@ -63,9 +77,7 @@ NSString *iTermNamespaceFromSignature(NSString *signature) {
 - (nullable NSError *)typeCheckParameters:(NSDictionary<NSString *, id> *)parameters;
 @end
 
-@implementation iTermBuiltInFunction {
-    NSSet<NSString *> *_optionalArguments;
-}
+@implementation iTermBuiltInFunction
 
 - (instancetype)initWithName:(NSString *)name
                    arguments:(NSDictionary<NSString *,Class> *)argumentsAndTypes
@@ -92,7 +104,8 @@ NSString *iTermNamespaceFromSignature(NSString *signature) {
 - (nullable NSError *)typeCheckParameters:(NSDictionary<NSString *, id> *)parameters {
     for (NSString *name in parameters) {
         Class actual = [parameters[name] class];
-        if ([actual isKindOfClass:[NSNull class]] && [_optionalArguments containsObject:name]) {
+        if ([parameters[name] isKindOfClass:[NSNull class]] &&
+            [_optionalArguments containsObject:name]) {
             continue;
         }
         Class expected = _argumentsAndTypes[name];
@@ -149,7 +162,11 @@ NSString *iTermNamespaceFromSignature(NSString *signature) {
     [iTermArrayCountBuiltInFunction registerBuiltInFunction];
     [iTermAlertBuiltInFunction registerBuiltInFunction];
     [iTermGetStringBuiltInFunction registerBuiltInFunction];
+    [iTermFocusBuiltInFunction registerBuiltInFunction];
     [iTermSetStatusBarComponentUnreadCountBuiltInFunction registerBuiltInFunction];
+    [iTermOpenPanelBuiltInFunction registerBuiltInFunction];
+    [iTermPasteBuiltInFunction registerBuiltInFunction];
+    [iTermSavePanelBuiltInFunction registerBuiltInFunction];
 }
 
 + (instancetype)sharedInstance {
@@ -170,9 +187,11 @@ NSString *iTermNamespaceFromSignature(NSString *signature) {
 }
 
 - (void)registerFunction:(iTermBuiltInFunction *)function namespace:(NSString *)namespace {
-    NSString *signature = iTermFunctionSignatureFromNamespaceAndNameAndArguments(namespace, function.name, function.argumentsAndTypes.allKeys);
-    assert(!_functions[signature]);
-    _functions[signature] = function;
+    NSArray<NSString *> *signatures = iTermAllFunctionSignaturesFromNamespaceAndNameAndArguments(namespace, function.name, function.argumentsAndTypes.allKeys, function.optionalArguments);
+    for (NSString *signature in signatures) {
+        assert(!_functions[signature]);
+        _functions[signature] = function;
+    }
 }
 
 - (BOOL)haveFunctionWithName:(NSString *)name

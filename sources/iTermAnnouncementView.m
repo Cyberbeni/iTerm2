@@ -7,6 +7,7 @@
 //
 
 #import "iTermAnnouncementView.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "DebugLogging.h"
 #import "NSMutableAttributedString+iTerm.h"
 #import "NSStringITerm.h"
@@ -59,7 +60,7 @@ static const CGFloat kMargin = 8;
 
 @implementation iTermAnnouncementView {
     CGFloat _buttonWidth;
-    NSTextView *_textView;
+    iTermAutoResizingTextView *_textView;
     NSImageView *_icon;
     NSButton *_closeButton;
     NSMutableArray *_actionButtons;
@@ -82,10 +83,9 @@ static const CGFloat kMargin = 8;
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        if (@available(macOS 10.14, *)) {
-            // This forces the button text to be dark. This view is always light regardless of theme.
-            self.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantLight];
-        }
+        // This forces the button text to be dark. This view is always light regardless of theme.
+        self.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantLight];
+
         frameRect.size.height -= 10;
         frameRect.origin.y = 10;
         frameRect.origin.x = 0;
@@ -217,14 +217,6 @@ static const CGFloat kMargin = 8;
 }
 
 - (void)updateAppearance {
-    if (@available(macOS 10.14, *)) {
-        return;
-    }
-    if ([self.window.appearance.name isEqual:NSAppearanceNameVibrantDark]) {
-        for (NSButton *button in _actionButtons) {
-            button.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantLight];
-        }
-    }
 }
 
 - (void)windowAppearanceDidChange:(NSNotification *)notification {
@@ -278,7 +270,7 @@ static const CGFloat kMargin = 8;
         rect.size.width -= rect.origin.x;
 
         rect.size.width -= _buttonWidth;
-        NSTextView *textView = [[NSTextView alloc] initWithFrame:rect];
+        iTermAutoResizingTextView *textView = [[iTermAutoResizingTextView alloc] initWithFrame:rect];
         NSDictionary *attributes = @{ NSFontAttributeName: [NSFont systemFontOfSize:12] };
         NSAttributedString *attributedString = [[NSAttributedString alloc] initWithString:title
                                                                                attributes:attributes];
@@ -303,6 +295,10 @@ static const CGFloat kMargin = 8;
         [self updateTextViewFrame];
 
         [_internalView addSubview:textView];
+
+        _textView.toolTip = title;
+        _textView.enableAutoResizing = YES;
+        [_textView adjustFontSizes];
     }
 }
 
@@ -354,8 +350,12 @@ static const CGFloat kMargin = 8;
 }
 
 - (void)updateTextViewFrame {
-    NSRect rect = _textView.frame;
-    CGFloat height = [_textView.attributedString heightForWidth:rect.size.width];
+    NSRect rect = _internalView.frame;
+    rect.origin.x += kMargin + _icon.frame.size.width + _icon.frame.origin.x;
+    rect.size.width -= rect.origin.x;
+    rect.size.width -= _buttonWidth;
+
+    CGFloat height = [_textView.originalAttributedString heightForWidth:rect.size.width];
     CGFloat maxHeight = [self maximumHeightForWidth:rect.size.width];
     CGFloat minHeight = [self minimumHeightForWidth:rect.size.width];
     height = MAX(minHeight, MIN(height, maxHeight));
@@ -413,13 +413,14 @@ static const CGFloat kMargin = 8;
 }
 
 - (void)addDismissOnKeyDownLabel {
-    NSMutableAttributedString *string = [_textView.attributedString mutableCopy];
+    NSMutableAttributedString *string = [_textView.originalAttributedString mutableCopy];
     NSDictionary *attributes = @{ NSFontAttributeName: [NSFont systemFontOfSize:10],
                                   NSForegroundColorAttributeName: [NSColor darkGrayColor] };
     NSAttributedString *notice = [[NSAttributedString alloc] initWithString:@"\nPress any key to dismiss this message."
                                                                  attributes:attributes];
     [string appendAttributedString:notice];
     _textView.textStorage.attributedString = string;
+    _textView.originalAttributedString = string;
 }
 
 @end

@@ -24,6 +24,11 @@ NS_INLINE iTermParserContext iTermParserContextMake(unsigned char *datap, int le
     return context;
 }
 
+NS_INLINE NSString *iTermParserDebugString(iTermParserContext *context) {
+    NSData *data = [NSData dataWithBytes:context->datap length:context->datalen];
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
 NS_INLINE BOOL iTermParserCanAdvance(iTermParserContext *context) {
     return context->datalen > 0;
 }
@@ -100,7 +105,7 @@ NS_INLINE void iTermParserBacktrack(iTermParserContext *context) {
 }
 
 NS_INLINE int iTermParserNumberOfBytesUntilCharacter(iTermParserContext *context, unsigned char c) {
-    unsigned char *pointer = memchr(context->datap, c, context->datalen);
+    unsigned char *pointer = (unsigned char *)memchr(context->datap, c, context->datalen);
     if (!pointer) {
         return -1;
     } else {
@@ -224,4 +229,14 @@ static inline int iTermParserGetAllCSISubparametersForParameter(CSIParam *csi, i
 NS_INLINE void iTermParserSetCSIParameterIfDefault(CSIParam *csiParam, int n, int value) {
     csiParam->p[n] = csiParam->p[n] < 0 ? value : csiParam->p[n];
     csiParam->count = MAX(csiParam->count, n + 1);
+}
+
+NS_INLINE BOOL iTermAddCSIParameter(CSIParam *csiParam, int value) {
+    int index = csiParam->count;
+    if (csiParam->count + 1 >= VT100CSIPARAM_MAX) {
+        return NO;
+    }
+    csiParam->p[index] = value;
+    csiParam->count += 1;
+    return YES;
 }

@@ -7,8 +7,11 @@
 //
 
 #import <Cocoa/Cocoa.h>
+#import "iTermPopupWindowController.h"
 
-@interface NSTextField (iTerm)
+NS_ASSUME_NONNULL_BEGIN
+
+@interface NSTextField (iTerm) <iTermPopupWindowHosting>
 
 // NOTE: this one uses a small font
 + (instancetype)it_textFieldForTableViewWithIdentifier:(NSString *)identifier;
@@ -34,3 +37,6 @@
 - (NSTextField *)replaceWithHyperlinkTo:(NSURL *)url;
 
 @end
+
+NS_ASSUME_NONNULL_END
+

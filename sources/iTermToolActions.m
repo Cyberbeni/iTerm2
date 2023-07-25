@@ -8,6 +8,7 @@
 #import "iTermToolActions.h"
 
 #import "DebugLogging.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermActionsModel.h"
 #import "iTermCompetentTableRowView.h"
 #import "iTermEditKeyActionWindowController.h"
@@ -21,7 +22,7 @@
 
 static const CGFloat kButtonHeight = 23;
 static const CGFloat kMargin = 4;
-static NSString *const iTermToolActionsPasteboardType = @"iTermToolActionsPasteboardType";
+static NSString *const iTermToolActionsPasteboardType = @"com.googlecode.iterm2.iTermToolActionsPasteboardType";
 
 
 @interface iTermToolActions() <NSTableViewDataSource, NSTableViewDelegate>
@@ -87,52 +88,19 @@ static NSButton *iTermToolActionsNewButton(NSString *imageName, NSString *title,
         [self addSubview:_removeButton];
         [self addSubview:_editButton];
 
-        _scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height - kButtonHeight - kMargin)];
-        _scrollView.hasVerticalScroller = YES;
-        _scrollView.hasHorizontalScroller = NO;
-        if (@available(macOS 10.16, *)) {
-            _scrollView.borderType = NSLineBorder;
-            _scrollView.scrollerStyle = NSScrollerStyleOverlay;
-        } else {
-            _scrollView.borderType = NSBezelBorder;
-        }
-        NSSize contentSize = [_scrollView contentSize];
-        [_scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-        _scrollView.drawsBackground = NO;
-
-        _tableView = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, contentSize.width, contentSize.height)];
-#ifdef MAC_OS_X_VERSION_10_16
-        if (@available(macOS 10.16, *)) {
-            _tableView.style = NSTableViewStyleInset;
-        }
-#endif
-        NSTableColumn *col;
-        col = [[NSTableColumn alloc] initWithIdentifier:@"contents"];
-        [col setEditable:NO];
-        [_tableView addTableColumn:col];
-        _tableView.headerView = nil;
-        _tableView.dataSource = self;
-        _tableView.delegate = self;
-        _tableView.intercellSpacing = NSMakeSize(_tableView.intercellSpacing.width, 0);
-        _tableView.rowHeight = 15;
+        _scrollView = [NSScrollView scrollViewWithTableViewForToolbeltWithContainer: self
+                                                                             insets:NSEdgeInsetsMake(0, 0, 0, kButtonHeight + kMargin)
+                                                                          rowHeight:[NSTableView heightForTextCellUsingFont:[NSFont it_toolbeltFont]]];
+        _tableView = _scrollView.documentView;
+        _tableView.doubleAction = @selector(doubleClickOnTableView:);
         _tableView.allowsMultipleSelection = YES;
         [_tableView registerForDraggedTypes:@[ iTermToolActionsPasteboardType ]];
-
         [_tableView setDoubleAction:@selector(doubleClickOnTableView:)];
-        [_tableView setAutoresizingMask:NSViewWidthSizable];
-
-        [_scrollView setDocumentView:_tableView];
-        [self addSubview:_scrollView];
-
-        [_tableView sizeToFit];
-        [_tableView setColumnAutoresizingStyle:NSTableViewSequentialColumnAutoresizingStyle];
 
         [_tableView performSelector:@selector(scrollToEndOfDocument:) withObject:nil afterDelay:0];
         _actions = [[[iTermActionsModel sharedInstance] actions] copy];
         [_tableView reloadData];
-        if (@available(macOS 10.14, *)) {
-            _tableView.backgroundColor = [NSColor clearColor];
-        }
+        _tableView.backgroundColor = [NSColor clearColor];
         
         __weak __typeof(self) weakSelf = self;
         [iTermActionsDidChangeNotification subscribe:self
@@ -303,8 +271,9 @@ static NSButton *iTermToolActionsNewButton(NSString *imageName, NSString *title,
         windowController.isNewMapping = YES;
         windowController.escaping = iTermSendTextEscapingCommon;
     }
-    windowController.parameterValue = action.parameter;
-    windowController.action = action.action;
+    [windowController setAction:action.action
+                      parameter:action.parameter
+                      applyMode:action.applyMode];
     [self.window beginSheet:windowController.window completionHandler:^(NSModalResponse returnCode) {
         [self editActionDidComplete:action];
     }];
@@ -363,26 +332,14 @@ static NSButton *iTermToolActionsNewButton(NSString *imageName, NSString *title,
 
 #pragma mark - NSTableViewDelegate
 
-- (NSTableRowView *)tableView:(NSTableView *)tableView rowViewForRow:(NSInteger)row {
-    if (@available(macOS 10.16, *)) {
-        return [[iTermBigSurTableRowView alloc] initWithFrame:NSZeroRect];
-    }
-    return [[iTermCompetentTableRowView alloc] initWithFrame:NSZeroRect];
-}
-
 - (NSView *)tableView:(NSTableView *)tableView
    viewForTableColumn:(NSTableColumn *)tableColumn
                   row:(NSInteger)row {
     static NSString *const identifier = @"ToolAction";
-    NSTextField *result = [tableView makeViewWithIdentifier:identifier owner:self];
-    if (result == nil) {
-        result = [NSTextField it_textFieldForTableViewWithIdentifier:identifier];
-    }
-    result.font = [NSFont it_toolbeltFont];
-    NSString *value = [self stringForTableColumn:tableColumn row:row];
-    result.stringValue = value;
-
-    return result;
+    NSTableCellView *cell = [tableView newTableCellViewWithTextFieldUsingIdentifier:identifier
+                                                                               font:[NSFont it_toolbeltFont]
+                                                                             string:[self stringForTableColumn:tableColumn row:row]];
+    return cell;
 }
 
 
@@ -398,18 +355,10 @@ static NSButton *iTermToolActionsNewButton(NSString *imageName, NSString *title,
 
 #pragma mark Drag-Drop
 
-- (BOOL)tableView:(NSTableView *)tableView
-writeRowsWithIndexes:(NSIndexSet *)rowIndexes
-     toPasteboard:(NSPasteboard*)pboard {
-    [pboard declareTypes:@[ iTermToolActionsPasteboardType ]
-                   owner:self];
-
-    NSArray<NSNumber *> *plist = [rowIndexes.it_array mapWithBlock:^id(NSNumber *anObject) {
-        return @(_actions[anObject.integerValue].identifier);
-    }];
-    [pboard setPropertyList:plist
-                    forType:iTermToolActionsPasteboardType];
-    return YES;
+-(id<NSPasteboardWriting>)tableView:(NSTableView *)tableView pasteboardWriterForRow:(NSInteger)row {
+    NSPasteboardItem *pbItem = [[NSPasteboardItem alloc] init];
+    [pbItem setPropertyList:@(_actions[row].identifier) forType:iTermToolActionsPasteboardType];
+    return pbItem;
 }
 
 - (NSDragOperation)tableView:(NSTableView *)aTableView
@@ -438,8 +387,16 @@ writeRowsWithIndexes:(NSIndexSet *)rowIndexes
               row:(NSInteger)row
     dropOperation:(NSTableViewDropOperation)operation {
     [self pushUndo];
-    NSPasteboard *pboard = [info draggingPasteboard];
-    NSArray<NSNumber *> *identifiers = [pboard propertyListForType:iTermToolActionsPasteboardType];
+
+    NSMutableArray<NSNumber *> *identifiers = [NSMutableArray array];
+    [info enumerateDraggingItemsWithOptions:0
+                                    forView:aTableView
+                                    classes:@[ [NSPasteboardItem class]]
+                              searchOptions:@{}
+                                 usingBlock:^(NSDraggingItem * _Nonnull draggingItem, NSInteger idx, BOOL * _Nonnull stop) {
+        NSPasteboardItem *item = draggingItem.item;
+        [identifiers addObject:[item propertyListForType:iTermToolActionsPasteboardType]];
+    }];
     [[iTermActionsModel sharedInstance] moveActionsWithIdentifiers:identifiers
                                                            toIndex:row];
     return YES;

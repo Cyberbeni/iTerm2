@@ -11,6 +11,7 @@
 #import "ITAddressBookMgr.h"
 #import "iTermPasteSpecialViewController.h"
 #import "iTermSnippetsModel.h"
+#import "NSArray+iTerm.h"
 #import "NSDictionary+iTerm.h"
 #import "PTYTextView.h"  // just for PTYTextViewSelectionExtensionUnit
 #import "ProfileModel.h"
@@ -20,6 +21,7 @@ NSString *const iTermKeyBindingDictionaryKeyParameter = @"Text";
 NSString *const iTermKeyBindingDictionaryKeyLabel = @"Label";
 NSString *const iTermKeyBindingDictionaryKeyVersion = @"Version";
 NSString *const iTermKeyBindingDictionaryKeyEscaping = @"Escaping";
+NSString *const iTermKeyBindingDictionaryKeyApplyMode = @"Apply Mode";
 
 
 static NSString *GetProfileName(NSString *guid) {
@@ -30,36 +32,69 @@ static NSString *GetProfileName(NSString *guid) {
     NSDictionary *_dictionary;
 }
 
++ (instancetype)fromString:(NSString *)string {
+    NSData *decoded = [[NSData alloc] initWithBase64EncodedString:string options:0];
+    if (!decoded) {
+        return nil;
+    }
+    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:decoded options:0 error:nil];
+    if (!dict) {
+        return nil;
+    }
+    return [self withDictionary:dict];
+}
+
+- (NSString *)stringValue {
+    NSDictionary *dict = [self dictionaryValue];
+    if (!dict) {
+        return nil;
+    }
+    NSData *json = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+    if (!json) {
+        return nil;
+    }
+    NSData *data = [json base64EncodedDataWithOptions:0];
+    if (!data) {
+        return nil;
+    }
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
 + (instancetype)withDictionary:(NSDictionary *)dictionary {
     return [[self alloc] initWithDictionary:dictionary];
 }
 
 + (instancetype)withAction:(KEY_ACTION)action
                  parameter:(NSString *)parameter
-                  escaping:(iTermSendTextEscaping)escaping {
+                  escaping:(iTermSendTextEscaping)escaping
+                 applyMode:(iTermActionApplyMode)applyMode {
     return [[self alloc] initWithDictionary:@{ iTermKeyBindingDictionaryKeyAction: @(action),
                                                iTermKeyBindingDictionaryKeyParameter: parameter ?: @"",
                                                iTermKeyBindingDictionaryKeyVersion: @2,
-                                               iTermKeyBindingDictionaryKeyEscaping: @(escaping)
+                                               iTermKeyBindingDictionaryKeyEscaping: @(escaping),
+                                               iTermKeyBindingDictionaryKeyApplyMode: @(applyMode)
     }];
 }
 
 + (instancetype)withAction:(KEY_ACTION)action
                  parameter:(NSString *)parameter
                      label:(NSString *)label
-                  escaping:(iTermSendTextEscaping)escaping {
+                  escaping:(iTermSendTextEscaping)escaping
+                 applyMode:(iTermActionApplyMode)applyMode {
     if (label) {
         return [[self alloc] initWithDictionary:@{ iTermKeyBindingDictionaryKeyAction: @(action),
                                                    iTermKeyBindingDictionaryKeyParameter: parameter ?: @"",
                                                    iTermKeyBindingDictionaryKeyLabel: label,
                                                    iTermKeyBindingDictionaryKeyVersion: @2,
-                                                   iTermKeyBindingDictionaryKeyEscaping: @(escaping)
+                                                   iTermKeyBindingDictionaryKeyEscaping: @(escaping),
+                                                   iTermKeyBindingDictionaryKeyApplyMode: @(applyMode)
         }];
     } else {
         return [[self alloc] initWithDictionary:@{ iTermKeyBindingDictionaryKeyAction: @(action),
                                                    iTermKeyBindingDictionaryKeyParameter: parameter ?: @"",
                                                    iTermKeyBindingDictionaryKeyVersion: @2,
-                                                   iTermKeyBindingDictionaryKeyEscaping: @(escaping)
+                                                   iTermKeyBindingDictionaryKeyEscaping: @(escaping),
+                                                   iTermKeyBindingDictionaryKeyApplyMode: @(applyMode)
         }];
     }
 }
@@ -90,6 +125,8 @@ static NSString *GetProfileName(NSString *guid) {
         _keyAction = [dictionary[iTermKeyBindingDictionaryKeyAction] intValue];
         _parameter = [dictionary[iTermKeyBindingDictionaryKeyParameter] ?: @"" copy];
         _label = [dictionary[iTermKeyBindingDictionaryKeyLabel] ?: @"" copy];
+        _applyMode = [dictionary[iTermKeyBindingDictionaryKeyApplyMode] unsignedIntegerValue];
+
         const int version = [dictionary[iTermKeyBindingDictionaryKeyVersion] intValue];
         if (version == 0) {
             _escaping = iTermSendTextEscapingCompatibility;
@@ -128,7 +165,9 @@ static NSString *GetProfileName(NSString *guid) {
                             iTermKeyBindingDictionaryKeyParameter: _parameter ?: @"",
                             iTermKeyBindingDictionaryKeyLabel: _label ?: [NSNull null],
                             iTermKeyBindingDictionaryKeyVersion: @(version),
-                            iTermKeyBindingDictionaryKeyEscaping: escaping };
+                            iTermKeyBindingDictionaryKeyEscaping: escaping,
+                            iTermKeyBindingDictionaryKeyApplyMode: @(_applyMode)
+    };
     return [temp dictionaryByRemovingNullValues];
 }
 
@@ -220,6 +259,9 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_COMPOSE:
             actionString = [NSString stringWithFormat:@"Compose “%@”", _parameter];
             break;
+        case KEY_ACTION_SEND_TMUX_COMMAND:
+            actionString = [NSString stringWithFormat:@"tmux: %@", _parameter];
+            break;
         case KEY_ACTION_RUN_COPROCESS:
             actionString = [NSString stringWithFormat:@"Run Coprocess \"%@\"",
 						    _parameter];
@@ -230,19 +272,39 @@ static NSString *GetProfileName(NSString *guid) {
             break;
         }
         case KEY_ACTION_NEW_WINDOW_WITH_PROFILE:
-            actionString = [NSString stringWithFormat:@"New Window with \"%@\" Profile", GetProfileName(_parameter)];
+            if ([[ProfileModel sharedInstance] bookmarkWithGuid:_parameter]) {
+                actionString = [NSString stringWithFormat:@"New Window with \"%@\" Profile", GetProfileName(_parameter)];
+            } else {
+                actionString = @"New Window with unavailable Profile";
+            }
             break;
         case KEY_ACTION_NEW_TAB_WITH_PROFILE:
-            actionString = [NSString stringWithFormat:@"New Tab with \"%@\" Profile", GetProfileName(_parameter)];
+            if ([[ProfileModel sharedInstance] bookmarkWithGuid:_parameter]) {
+                actionString = [NSString stringWithFormat:@"New Tab with \"%@\" Profile", GetProfileName(_parameter)];
+            } else {
+                actionString = @"New Tab with unavailable Profile";
+            }
             break;
         case KEY_ACTION_SPLIT_HORIZONTALLY_WITH_PROFILE:
-            actionString = [NSString stringWithFormat:@"Split Horizontally with \"%@\" Profile", GetProfileName(_parameter)];
+            if ([[ProfileModel sharedInstance] bookmarkWithGuid:_parameter]) {
+                actionString = [NSString stringWithFormat:@"Split Horizontally with \"%@\" Profile", GetProfileName(_parameter)];
+            } else {
+                actionString = @"Split Horizontally with unavailable Profile";
+            }
             break;
         case KEY_ACTION_SPLIT_VERTICALLY_WITH_PROFILE:
-            actionString = [NSString stringWithFormat:@"Split Vertically with \"%@\" Profile", GetProfileName(_parameter)];
+            if ([[ProfileModel sharedInstance] bookmarkWithGuid:_parameter]) {
+                actionString = [NSString stringWithFormat:@"Split Vertically with \"%@\" Profile", GetProfileName(_parameter)];
+            } else {
+                actionString = @"Split Vertically with unavailable Profile";
+            }
             break;
         case KEY_ACTION_SET_PROFILE:
-            actionString = [NSString stringWithFormat:@"Change Profile to \"%@\"", GetProfileName(_parameter)];
+            if ([[ProfileModel sharedInstance] bookmarkWithGuid:_parameter]) {
+                actionString = [NSString stringWithFormat:@"Change Profile to \"%@\"", GetProfileName(_parameter)];
+            } else {
+                actionString = @"Change Profile to unavailable profile";
+            }
             break;
         case KEY_ACTION_LOAD_COLOR_PRESET:
             actionString = [NSString stringWithFormat:@"Load Color Preset \"%@\"", _parameter];
@@ -370,14 +432,49 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_DUPLICATE_TAB:
             actionString = @"Duplicate Tab";
             break;
+        case KEY_ACTION_SEQUENCE: {
+            NSArray<NSString *> *names = [[_parameter keyBindingActionsFromSequenceParameter] mapWithBlock:^id _Nullable(iTermKeyBindingAction * _Nonnull action) {
+                return [action displayName];
+            }];
+            return [names componentsJoinedByString:@", then "];
+        }
         default:
             actionString = [NSString stringWithFormat: @"%@ %d", @"Unknown Action ID", _keyAction];
             break;
         case KEY_ACTION_MOVE_TO_SPLIT_PANE:
             actionString = @"Move to Split Pane";
             break;
+        case KEY_ACTION_SWAP_WITH_NEXT_PANE:
+            actionString = @"Swap with Next Pane";
+            break;
+        case KEY_ACTION_SWAP_WITH_PREVIOUS_PANE:
+            actionString = @"Swap with Previous Pane";
+            break;
+        case KEY_ACTION_COPY_OR_SEND:
+            actionString = @"Copy Selection or Send ^C";
+            break;
+        case KEY_ACTION_PASTE_OR_SEND:
+            actionString = @"Paste or Send ^V";
+            break;
+        case KEY_ACTION_ALERT_ON_NEXT_MARK:
+            actionString = @"Alert on Next Mark";
+            break;
     }
 
+    switch (self.applyMode) {
+        case iTermActionApplyModeCurrentSession:
+            return actionString;
+        case iTermActionApplyModeAllSessions:
+            return [NSString stringWithFormat:@"In all sessions, %@", actionString];
+        case iTermActionApplyModeUnfocusedSessions:
+            return [NSString stringWithFormat:@"In unfocused sessions, %@", actionString];
+        case iTermActionApplyModeAllInWindow:
+            return [NSString stringWithFormat:@"In all sessions in the window, %@", actionString];
+        case iTermActionApplyModeAllInTab:
+            return [NSString stringWithFormat:@"In all sessions in the tab, %@", actionString];
+        case iTermActionApplyModeBroadcasting:
+            return [NSString stringWithFormat:@"In all broadcasted-to sessions, %@", actionString];
+    }
     return actionString;
 }
 
@@ -388,12 +485,15 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_TEXT:
         case KEY_ACTION_SEND_SNIPPET:
         case KEY_ACTION_COMPOSE:
+        case KEY_ACTION_SEND_TMUX_COMMAND:
         case KEY_ACTION_VIM_TEXT:
         case KEY_ACTION_RUN_COPROCESS:
         case KEY_ACTION_SEND_C_H_BACKSPACE:
         case KEY_ACTION_SEND_C_QM_BACKSPACE:
         case KEY_ACTION_PASTE_SPECIAL:
         case KEY_ACTION_PASTE_SPECIAL_FROM_SELECTION:
+        case KEY_ACTION_COPY_OR_SEND:
+        case KEY_ACTION_PASTE_OR_SEND:
             return YES;
             
         case KEY_ACTION_IGNORE:
@@ -451,7 +551,15 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_INVOKE_SCRIPT_FUNCTION:
         case KEY_ACTION_DUPLICATE_TAB:
         case KEY_ACTION_MOVE_TO_SPLIT_PANE:
+        case KEY_ACTION_SWAP_WITH_NEXT_PANE:
+        case KEY_ACTION_SWAP_WITH_PREVIOUS_PANE:
+        case KEY_ACTION_ALERT_ON_NEXT_MARK:
             break;
+
+        case KEY_ACTION_SEQUENCE:
+            return [[self.parameter keyBindingActionsFromSequenceParameter] anyWithBlock:^BOOL(iTermKeyBindingAction *action) {
+                return action.sendsText;
+            }];
     }
     return NO;
 }
@@ -469,6 +577,7 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_VIM_TEXT:
         case KEY_ACTION_SEND_SNIPPET:
         case KEY_ACTION_COMPOSE:
+        case KEY_ACTION_SEND_TMUX_COMMAND:
         case KEY_ACTION_RUN_COPROCESS:
         case KEY_ACTION_SEND_C_H_BACKSPACE:
         case KEY_ACTION_SEND_C_QM_BACKSPACE:
@@ -526,9 +635,44 @@ static NSString *GetProfileName(NSString *guid) {
         case KEY_ACTION_INVOKE_SCRIPT_FUNCTION:
         case KEY_ACTION_DUPLICATE_TAB:
         case KEY_ACTION_MOVE_TO_SPLIT_PANE:
+        case KEY_ACTION_SWAP_WITH_NEXT_PANE:
+        case KEY_ACTION_SWAP_WITH_PREVIOUS_PANE:
+        case KEY_ACTION_COPY_OR_SEND:
+        case KEY_ACTION_PASTE_OR_SEND:
+        case KEY_ACTION_ALERT_ON_NEXT_MARK:
             break;
+
+        case KEY_ACTION_SEQUENCE:
+            return [[self.parameter keyBindingActionsFromSequenceParameter] anyWithBlock:^BOOL(iTermKeyBindingAction *action) {
+                return action.isActionable;
+            }];
     }
     return YES;
+}
+
+@end
+
+@implementation NSString(iTermKeyBindingAction)
+
++ (instancetype)parameterForKeyBindingActionSequence:(NSArray<iTermKeyBindingAction *> *)actions {
+    NSArray<NSDictionary *> *dicts = [actions mapWithBlock:^id _Nullable(iTermKeyBindingAction * _Nonnull action) {
+        return action.dictionaryValue;
+    }];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:dicts options:0 error:nil];
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+}
+
+- (NSArray<iTermKeyBindingAction *> *)keyBindingActionsFromSequenceParameter {
+    NSArray<NSDictionary *> *dicts = [NSJSONSerialization JSONObjectWithData:[self dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    if (![dicts isKindOfClass:[NSArray class]]) {
+        return @[];
+    }
+    return [dicts mapWithBlock:^id _Nullable(NSDictionary * _Nonnull dict) {
+        if (![dict isKindOfClass:[NSDictionary class]]) {
+            return nil;
+        }
+        return [iTermKeyBindingAction withDictionary:dict];
+    }];
 }
 
 @end

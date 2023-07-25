@@ -32,6 +32,7 @@
 
 #import "DebugLogging.h"
 #import "charmaps.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermImageInfo.h"
 #import "iTermMalloc.h"
@@ -47,27 +48,14 @@ static NSString *const kScreenCharImageMapKey = @"Image Map";
 static NSString *const kScreenCharCCMNextKeyKey = @"Next Key";
 static NSString *const kScreenCharHasWrappedKey = @"Has Wrapped";
 
-static NSInteger gScreenCharGeneration;
-
-// Maps codes to strings
-static NSMutableDictionary* complexCharMap;
-static NSMutableSet<NSNumber *> *spacingCombiningMarkCodeNumbers;
-// Maps strings to codes.
-static NSMutableDictionary* inverseComplexCharMap;
-// Image info. Maps a NSNumber with the image's code to an ImageInfo object.
-static NSMutableDictionary<NSNumber *, iTermImageInfo *> *gImages;
-static NSMutableDictionary* gEncodableImageMap;
-// Next available code.
-static int ccmNextKey = 1;
-// If ccmNextKey has wrapped then this is set to true and we have to delete old
-// strings before creating a new one with a recycled code.
-static BOOL hasWrapped = NO;
-
-typedef NS_ENUM(int, iTermTriState) {
-    iTermTriStateFalse,
-    iTermTriStateTrue,
-    iTermTriStateOther
-};
+static iTermComplexCharRegistry *GetComplexCharRegistry(void) {
+    static iTermComplexCharRegistry *instance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [iTermComplexCharRegistry sharedInstance];
+    });
+    return instance;
+}
 
 iTermTriState iTermTriStateFromBool(BOOL b) {
     return b ? iTermTriStateTrue : iTermTriStateFalse;
@@ -93,7 +81,7 @@ iTermTriState iTermTriStateFromBool(BOOL b) {
     return [[self alloc] initWithScreenChars:screenChars length:string.length];
 }
 
-- (instancetype)initWithScreenChars:(screen_char_t *)screenChars
+- (instancetype)initWithScreenChars:(const screen_char_t *)screenChars
                              length:(NSInteger)length {
     self = [super init];
     if (self) {
@@ -139,84 +127,29 @@ iTermTriState iTermTriStateFromBool(BOOL b) {
 
 @end
 
-static void CreateComplexCharMapIfNeeded() {
-    if (!complexCharMap) {
-        complexCharMap = [[NSMutableDictionary alloc] initWithCapacity:1000];
-        spacingCombiningMarkCodeNumbers = [[NSMutableSet alloc] initWithCapacity:1000];
-        inverseComplexCharMap = [[NSMutableDictionary alloc] initWithCapacity:1000];
-        gScreenCharGeneration++;
-    }
-}
-
 NSString *ComplexCharToStr(int key) {
-    if (key == UNICODE_REPLACEMENT_CHAR) {
-        return ReplacementString();
-    }
-
-    CreateComplexCharMapIfNeeded();
-    return [complexCharMap objectForKey:[NSNumber numberWithInt:key]];
+    return [GetComplexCharRegistry() stringFor:key];
 }
 
 BOOL ComplexCharCodeIsSpacingCombiningMark(unichar code) {
-    return [spacingCombiningMarkCodeNumbers containsObject:@(code)];
+    return [GetComplexCharRegistry() codeIsSpacingCombiningMark:code];
 }
 
 NSString *ScreenCharToStr(const screen_char_t *const sct) {
-    return CharToStr(sct->code, sct->complexChar);
+    return [GetComplexCharRegistry() charToString:*sct];
 }
 
 NSString *CharToStr(unichar code, BOOL isComplex) {
-    if (code == UNICODE_REPLACEMENT_CHAR) {
-        return ReplacementString();
-    }
-
-    if (isComplex) {
-        return ComplexCharToStr(code);
-    } else {
-        return [NSString stringWithCharacters:&code length:1];
-    }
+    return [GetComplexCharRegistry() stringForCode:code isComplex:isComplex];
 }
 
-int ExpandScreenChar(screen_char_t* sct, unichar* dest) {
-    NSString* value = nil;
-    if (sct->code == UNICODE_REPLACEMENT_CHAR) {
-        value = ReplacementString();
-    } else if (sct->complexChar) {
-        value = ComplexCharToStr(sct->code);
-    } else {
-        *dest = sct->code;
+int ExpandScreenChar(const screen_char_t *sct, unichar* dest) {
+    if (!sct[0].complexChar) {
+        // Fast path
+        *dest = sct[0].code;
         return 1;
     }
-    if (!value) {
-        // This can happen if state restoration goes awry.
-        return 0;
-    }
-    [value getCharacters:dest];
-    return (int)[value length];
-}
-
-UTF32Char CharToLongChar(unichar code, BOOL isComplex)
-{
-    NSString* aString = CharToStr(code, isComplex);
-    unichar firstChar = [aString characterAtIndex:0];
-    if (IsHighSurrogate(firstChar) && [aString length] >= 2) {
-        unichar secondChar = [aString characterAtIndex:0];
-        return DecodeSurrogatePair(firstChar, secondChar);
-    } else {
-        return firstChar;
-    }
-}
-
-static BOOL ComplexCharKeyIsReserved(int k) {
-    return k >= iTermBoxDrawingCodeMin && k <= iTermBoxDrawingCodeMax;
-}
-
-static void AllocateImageMapsIfNeeded(void) {
-    if (!gImages) {
-        gImages = [[NSMutableDictionary alloc] init];
-        gEncodableImageMap = [[NSMutableDictionary alloc] init];
-        gScreenCharGeneration++;
-    }
+    return [GetComplexCharRegistry() expandScreenChar:sct[0] to:dest];
 }
 
 screen_char_t ImageCharForNewImage(NSString *name,
@@ -224,11 +157,8 @@ screen_char_t ImageCharForNewImage(NSString *name,
                                    int height,
                                    BOOL preserveAspectRatio,
                                    NSEdgeInsets inset) {
-    AllocateImageMapsIfNeeded();
-    int newKey;
-    do {
-        newKey = ccmNextKey++;
-    } while (ComplexCharKeyIsReserved(newKey));
+    [[iTermScreenCharGeneration counter] advance];
+    const int newKey = [GetComplexCharRegistry() nextCode];
 
     screen_char_t c;
     memset(&c, 0, sizeof(c));
@@ -240,8 +170,7 @@ screen_char_t ImageCharForNewImage(NSString *name,
     imageInfo.preserveAspectRatio = preserveAspectRatio;
     imageInfo.size = NSMakeSize(width, height);
     imageInfo.inset = inset;
-    gImages[@(c.code)] = imageInfo;
-    gScreenCharGeneration++;
+    [[iTermImageRegistry sharedInstance] assignCode:c.code toImageInfo:imageInfo];
     DLog(@"Assign %@ to image code %@", imageInfo, @(c.code));
 
     return c;
@@ -254,25 +183,24 @@ void SetPositionInImageChar(screen_char_t *charPtr, int x, int y)
 }
 
 void SetDecodedImage(unichar code, iTermImage *image, NSData *data) {
-    iTermImageInfo *imageInfo = gImages[@(code)];
-    [imageInfo setImageFromImage:image data:data];
-    gEncodableImageMap[@(code)] = [imageInfo dictionary];
-    gScreenCharGeneration++;
+    [[iTermImageRegistry sharedInstance] setData:data forImage:image code:code];
     if ([iTermAdvancedSettingsModel restoreWindowContents]) {
-        [NSApp invalidateRestorableState];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp invalidateRestorableState];
+        });
     }
-    DLog(@"set decoded image in %@", imageInfo);
 }
 
 void ReleaseImage(unichar code) {
-    DLog(@"ReleaseImage(%@)", @(code));
-    [gImages removeObjectForKey:@(code)];
-    [gEncodableImageMap removeObjectForKey:@(code)];
-    gScreenCharGeneration++;
+    [[iTermImageRegistry sharedInstance] removeCode:code];
 }
 
-iTermImageInfo *GetImageInfo(unichar code) {
-    return gImages[@(code)];
+id<iTermImageInfoReading> GetImageInfo(unichar code) {
+    return [[iTermImageRegistry sharedInstance] infoForCode:code];
+}
+
+iTermImageInfo *GetMutableImageInfo(unichar code) {
+    return [[iTermImageRegistry sharedInstance] infoForCode:code];
 }
 
 VT100GridCoord GetPositionOfImageInChar(screen_char_t c) {
@@ -280,102 +208,18 @@ VT100GridCoord GetPositionOfImageInChar(screen_char_t c) {
                               c.fgGreen);
 }
 
-int GetOrSetComplexChar(NSString *str,
-                        iTermTriState isSpacingCombiningMark) {
-    CreateComplexCharMapIfNeeded();
-    NSNumber *number = inverseComplexCharMap[str];
-    if (number) {
-        return [number intValue];
-    }
-
-    gScreenCharGeneration++;
-    int newKey;
-    do {
-        newKey = ccmNextKey++;
-    } while (ComplexCharKeyIsReserved(newKey));
-
-    number = @(newKey);
-    if (hasWrapped) {
-        NSString* oldStr = complexCharMap[number];
-        if (oldStr) {
-            [inverseComplexCharMap removeObjectForKey:oldStr];
-            [spacingCombiningMarkCodeNumbers removeObject:number];
-        }
-    }
-    switch (isSpacingCombiningMark) {
-        case iTermTriStateTrue:
-            [spacingCombiningMarkCodeNumbers addObject:number];
-            break;
-        case iTermTriStateFalse:
-            break;
-        case iTermTriStateOther: {
-            NSCharacterSet *scmSet = [NSCharacterSet spacingCombiningMarksForUnicodeVersion:12];
-            if ([str rangeOfCharacterFromSet:scmSet].location != NSNotFound) {
-                [spacingCombiningMarkCodeNumbers addObject:number];
-            }
-        }
-    }
-    complexCharMap[number] = str;
-    inverseComplexCharMap[str] = number;
-    if ([iTermAdvancedSettingsModel restoreWindowContents]) {
-        [NSApp invalidateRestorableState];
-    }
-    if (ccmNextKey == 0xf000) {
-        ccmNextKey = 1;
-        hasWrapped = YES;
-    }
-    return newKey;
-}
-
 int AppendToComplexChar(int key, unichar codePoint) {
-    if (key == UNICODE_REPLACEMENT_CHAR) {
-        return UNICODE_REPLACEMENT_CHAR;
-    }
-
-    NSString* str = [complexCharMap objectForKey:[NSNumber numberWithInt:key]];
-    if ([str length] == kMaxParts) {
-        NSLog(@"Warning: char <<%@>> with key %d reached max length %d", str,
-              key, kMaxParts);
-        return key;
-    }
-    assert(str);
-    NSMutableString* temp = [NSMutableString stringWithString:str];
-    [temp appendString:[NSString stringWithCharacters:&codePoint length:1]];
-
-    return GetOrSetComplexChar(temp, iTermTriStateOther);
-}
-
-NSString *StringByNormalizingString(NSString *theString, iTermUnicodeNormalization normalization) {
-    NSString *normalizedString;
-    switch (normalization) {
-        case iTermUnicodeNormalizationNFC:
-            normalizedString = [theString precomposedStringWithCanonicalMapping];
-            break;
-        case iTermUnicodeNormalizationNFD:
-            normalizedString = [theString decomposedStringWithCanonicalMapping];
-            break;
-        case iTermUnicodeNormalizationNone:
-            normalizedString = theString;
-            break;
-        case iTermUnicodeNormalizationHFSPlus:
-            normalizedString = [theString precomposedStringWithHFSPlusMapping];
-            break;
-    }
-    return normalizedString;
+    return [GetComplexCharRegistry() appendCodePoint:codePoint to:key];
 }
 
 void SetComplexCharInScreenChar(screen_char_t *screenChar,
                                 NSString *theString,
                                 iTermUnicodeNormalization normalization,
                                 BOOL isSpacingCombiningMark) {
-    NSString *normalizedString = StringByNormalizingString(theString, normalization);
-    [theString precomposedStringWithCanonicalMapping];
-    if (normalizedString.length == 1 && !isSpacingCombiningMark) {
-        screenChar->code = [normalizedString characterAtIndex:0];
-    } else {
-        screenChar->code = GetOrSetComplexChar(theString, iTermTriStateFromBool(isSpacingCombiningMark));
-        screenChar->complexChar = YES;
-    }
+    return [GetComplexCharRegistry() setComplexCharIn:screenChar
+                                               string:theString
+                                        normalization:normalization
+                               isSpacingCombiningMark:isSpacingCombiningMark];
 }
 
 void AppendToChar(screen_char_t *dest, unichar c) {
@@ -437,7 +281,7 @@ BOOL IsHighSurrogate(unichar c)
     return c >= 0xd800 && c <= 0xdbff;
 }
 
-NSString* ScreenCharArrayToString(screen_char_t* screenChars,
+NSString* ScreenCharArrayToString(const screen_char_t *screenChars,
                                   int start,
                                   int end,
                                   unichar** backingStorePtr,
@@ -482,8 +326,8 @@ NSString* ScreenCharArrayToString(screen_char_t* screenChars,
     int delta = 0;
     int o = 0;
     for (int i = start; i < end; ++i) {
-        unichar c = screenChars[i].code;
-        if (c >= ITERM2_PRIVATE_BEGIN && c <= ITERM2_PRIVATE_END) {
+        const unichar c = screenChars[i].code;
+        if (screenChars[i].image || (!screenChars[i].complexChar && c >= ITERM2_PRIVATE_BEGIN && c <= ITERM2_PRIVATE_END)) {
             // Skip private-use characters which signify things like double-width characters and
             // tab fillers.
             ++delta;
@@ -509,11 +353,7 @@ NSString* CharArrayToString(unichar* charHaystack, int o)
     // with a ppc-only binary. Oddly, testing for defined(LITTLE_ENDIAN) does
     // not produce the correct results under ppc+Rosetta.
     int encoding;
-#if defined(__ppc__) || defined(__ppc64__)
-    encoding = NSUTF16BigEndianStringEncoding;
-#else
     encoding = NSUTF16LittleEndianStringEncoding;
-#endif
     return [[NSString alloc] initWithBytesNoCopy:charHaystack
                                           length:o * sizeof(unichar)
                                         encoding:encoding
@@ -524,15 +364,20 @@ void DumpScreenCharArray(screen_char_t* screenChars, int lineLength) {
     NSLog(@"%@", ScreenCharArrayToStringDebug(screenChars, lineLength));
 }
 
-NSString* ScreenCharArrayToStringDebug(screen_char_t* screenChars,
+NSString* ScreenCharArrayToStringDebug(const screen_char_t *screenChars,
                                        int lineLength) {
     while (lineLength > 0 && screenChars[lineLength - 1].code == 0) {
         --lineLength;
     }
     NSMutableString* result = [NSMutableString stringWithCapacity:lineLength];
     for (int i = 0; i < lineLength; ++i) {
-        unichar c = screenChars[i].code;
-        if (c != 0 && c != DWC_RIGHT) {
+        if (screenChars[i].image) {
+            VT100GridCoord coord = GetPositionOfImageInChar(screenChars[i]);
+            [result appendFormat:@"[img %d %d,%d]", screenChars[i].code, coord.x, coord.y];
+            continue;
+        }
+        const unichar c = screenChars[i].code;
+        if (c != 0 && !ScreenCharIsDWC_RIGHT(screenChars[i])) {
             [result appendString:ScreenCharToStr(&screenChars[i]) ?: @"😮"];
         }
     }
@@ -587,11 +432,14 @@ void StringToScreenChars(NSString *s,
                          int* cursorIndex,
                          BOOL *foundDwc,
                          iTermUnicodeNormalization normalization,
-                         NSInteger unicodeVersion) {
+                         NSInteger unicodeVersion,
+                         BOOL softAlternateScreenMode) {
     __block NSInteger j = 0;
     __block BOOL foundCursor = NO;
     NSCharacterSet *ignorableCharacters = [NSCharacterSet ignorableCharactersForUnicodeVersion:unicodeVersion];
     NSCharacterSet *spacingCombiningMarks = [NSCharacterSet spacingCombiningMarksForUnicodeVersion:12];
+    const BOOL shouldSupportVS16 = [iTermAdvancedSettingsModel vs16Supported] || (!softAlternateScreenMode && [iTermAdvancedSettingsModel vs16SupportedInPrimaryScreen]);
+    const BOOL fullWidthFlags = [iTermAdvancedSettingsModel fullWidthFlags];
 
     [s enumerateComposedCharacters:^(NSRange range,
                                      unichar baseBmpChar,
@@ -637,7 +485,8 @@ void StringToScreenChars(NSString *s,
 
                 isDoubleWidth = [NSString isDoubleWidthCharacter:baseBmpChar
                                           ambiguousIsDoubleWidth:ambiguousIsDoubleWidth
-                                                  unicodeVersion:unicodeVersion];
+                                                  unicodeVersion:unicodeVersion
+                                                  fullWidthFlags:fullWidthFlags];
             }
         }
         if (composedOrNonBmpChar) {
@@ -663,13 +512,13 @@ void StringToScreenChars(NSString *s,
             }
             isDoubleWidth = [NSString isDoubleWidthCharacter:baseChar
                                       ambiguousIsDoubleWidth:ambiguousIsDoubleWidth
-                                              unicodeVersion:unicodeVersion];
+                                              unicodeVersion:unicodeVersion
+                                              fullWidthFlags:fullWidthFlags];
             if (!isDoubleWidth && composedLength > next) {
                 const unichar peek = [composedOrNonBmpChar characterAtIndex:next];
                 if (peek == 0xfe0f) {
                     // VS16
-                    if ([[NSCharacterSet emojiAcceptingVS16] characterIsMember:baseChar] &&
-                        [iTermAdvancedSettingsModel vs16Supported]) {
+                    if ([[NSCharacterSet emojiAcceptingVS16] longCharacterIsMember:baseChar] && shouldSupportVS16) {
                         isDoubleWidth = YES;
                     }
                 }
@@ -680,8 +529,7 @@ void StringToScreenChars(NSString *s,
         if (isDoubleWidth) {
             j++;
             buf[j] = buf[j - 1];
-            buf[j].code = DWC_RIGHT;
-            buf[j].complexChar = NO;
+            ScreenCharSetDWC_RIGHT(&buf[j]);
             if (foundDwc) {
                 *foundDwc = YES;
             }
@@ -726,75 +574,38 @@ void InitializeScreenChar(screen_char_t *s, screen_char_t fg, screen_char_t bg) 
     s->unused = 0;
 }
 
-void ConvertCharsToGraphicsCharset(screen_char_t *s, int len)
-{
-    int i;
-
-    for (i = 0; i < len; i++) {
-        assert(!s[i].complexChar);
-        s[i].complexChar = NO;
-        s[i].code = charmap[(int)(s[i].code)];
-    }
+void ConvertCharsToGraphicsCharset(screen_char_t *s, int len) {
+    [GetComplexCharRegistry() convertToGraphicsWithChars:s count:len];
 }
 
 NSInteger ScreenCharGeneration(void) {
-    return gScreenCharGeneration;
+    return [[iTermScreenCharGeneration counter] value];
 }
 
 NSDictionary *ScreenCharEncodedRestorableState(void) {
-    return @{ kScreenCharComplexCharMapKey: complexCharMap ?: @{},
-              kScreenCharSpacingCombiningMarksKey: spacingCombiningMarkCodeNumbers.allObjects ?: @[],
-              kScreenCharInverseComplexCharMapKey: inverseComplexCharMap ?: @{},
-              kScreenCharImageMapKey: gEncodableImageMap ?: @{},
-              kScreenCharCCMNextKeyKey: @(ccmNextKey),
-              kScreenCharHasWrappedKey: @(hasWrapped) };
+    return @{ kScreenCharComplexCharMapKey: [GetComplexCharRegistry() complexCharMap] ?: @{},
+              kScreenCharSpacingCombiningMarksKey: [GetComplexCharRegistry() spacingCombiningMarkCodeNumbers].allObjects ?: @[],
+              kScreenCharInverseComplexCharMapKey: [GetComplexCharRegistry() inverseComplexCharMap] ?: @{},
+              kScreenCharImageMapKey: [[iTermImageRegistry sharedInstance] imageMap],
+              kScreenCharCCMNextKeyKey: @([GetComplexCharRegistry() peekNextCode]),
+              kScreenCharHasWrappedKey: @([GetComplexCharRegistry() hasWrapped]) };
 }
 
 void ScreenCharGarbageCollectImages(void) {
-    NSArray<NSNumber *> *provisionalKeys = [gImages.allKeys filteredArrayUsingBlock:^BOOL(NSNumber *key) {
-        return gImages[key].provisional;
-    }];
-    DLog(@"Garbage collect: %@", provisionalKeys);
-    [gImages removeObjectsForKeys:provisionalKeys];
+    [[iTermImageRegistry sharedInstance] collectGarbage];
 }
 
 void ScreenCharClearProvisionalFlagForImageWithCode(int code) {
-    DLog(@"Clear provisional for %@", @(code));
-    gImages[@(code)].provisional = NO;
+    [[iTermImageRegistry sharedInstance] clearProvisionalFlagForCode:code];
 }
 
 void ScreenCharDecodeRestorableState(NSDictionary *state) {
-    NSDictionary *stateComplexCharMap = state[kScreenCharComplexCharMapKey];
-    CreateComplexCharMapIfNeeded();
-    for (id key in stateComplexCharMap) {
-        if (!complexCharMap[key]) {
-            complexCharMap[key] = stateComplexCharMap[key];
-        }
-    }
-    NSArray<NSString *> *spacingCombiningMarksArray = state[kScreenCharSpacingCombiningMarksKey];
-    for (NSNumber *number in spacingCombiningMarksArray) {
-        [spacingCombiningMarkCodeNumbers addObject:number];
-    }
-
-    NSDictionary *stateInverseMap = state[kScreenCharInverseComplexCharMapKey];
-    for (id key in stateInverseMap) {
-        if (!inverseComplexCharMap[key]) {
-            inverseComplexCharMap[key] = stateInverseMap[key];
-        }
-    }
-    NSDictionary *imageMap = state[kScreenCharImageMapKey];
-    AllocateImageMapsIfNeeded();
-    for (id key in imageMap) {
-        gEncodableImageMap[key] = imageMap[key];
-        iTermImageInfo *info = [[iTermImageInfo alloc] initWithDictionary:imageMap[key]];
-        if (info) {
-            info.provisional = YES;
-            gImages[key] = info;
-            DLog(@"Decoded restorable state for image %@: %@", key, info);
-        }
-    }
-    ccmNextKey = [state[kScreenCharCCMNextKeyKey] intValue];
-    hasWrapped = [state[kScreenCharHasWrappedKey] boolValue];
+    [GetComplexCharRegistry() loadCharMap:state[kScreenCharComplexCharMapKey]
+                    spacingCombiningMarks:state[kScreenCharSpacingCombiningMarksKey]
+                               inverseMap:state[kScreenCharInverseComplexCharMapKey]
+                                  nextKey:[state[kScreenCharCCMNextKeyKey] intValue]
+                               hasWrapped:[state[kScreenCharHasWrappedKey] boolValue]];
+    [[iTermImageRegistry sharedInstance] restoreFrom:state[kScreenCharImageMapKey]];
 }
 
 static NSString *ScreenCharColorDescription(unsigned int red,

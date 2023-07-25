@@ -36,8 +36,8 @@ typedef enum {
     // scroll flag
     MOUSE_BUTTON_SCROLL_FLAG = 64,  // this is a scroll event
 
-    // for SGR 1006 style, internal use only
-    MOUSE_BUTTON_SGR_RELEASE_FLAG = 128  // mouse button was released
+    // extra buttons flag
+    MOUSE_BUTTON_EXTRA_FLAG = 128,
 
 } MouseButtonModifierFlag;
 
@@ -70,7 +70,7 @@ typedef enum {
 #define KEY_BACKSPACE        "\010"
 
 // Reporting formats
-#define KEY_FUNCTION_FORMAT  "\033[%d~"
+#define KEY_FUNCTION_FORMAT  @"\033[%d~"
 
 #define REPORT_POSITION      "\033[%d;%dR"
 #define REPORT_POSITION_Q    "\033[?%d;%dR"
@@ -97,6 +97,35 @@ typedef enum {
         self.termType = @"dumb";
     }
     return self;
+}
+
+- (instancetype)initWithOutput:(VT100Output *)source {
+    self = [super init];
+    if (self) {
+        for (int i = 0; i < TERMINFO_KEYS; i ++) {
+            if (source->_keyStrings[i]) {
+                _keyStrings[i] = strdup(source->_keyStrings[i]);
+            }
+        }
+        _standard = source->_standard;
+        _termType = [source->_termType copy];
+        _keypadMode = source->_keypadMode;
+        _mouseFormat = source->_mouseFormat;
+        _cursorMode = source->_cursorMode;
+        _optionIsMetaForSpecialKeys = source->_optionIsMetaForSpecialKeys;
+        _vtLevel = source->_vtLevel;
+    }
+    return self;
+}
+
+- (NSDictionary *)configDictionary {
+    return @{ @"termType": _termType ?: @"",
+              @"keypadMode": @(_keypadMode),
+              @"mouseFormat": @(_mouseFormat),
+              @"cursorMode": @(_cursorMode),
+              @"optionIsMetaForSpecialKeys": @(_optionIsMetaForSpecialKeys),
+              @"vtLevel": @(_vtLevel)
+    };
 }
 
 - (void)dealloc {
@@ -575,6 +604,10 @@ typedef enum {
     return nil;
 }
 
+- (NSData *)dataForStandardFunctionKeyWithCode:(int)code {
+    return [[NSString stringWithFormat:KEY_FUNCTION_FORMAT, code] dataUsingEncoding:NSISOLatin1StringEncoding];
+}
+
 // Reference: http://www.utexas.edu/cc/faqs/unix/VT200-function-keys.html
 // http://www.cs.utk.edu/~shuford/terminal/misc_old_terminals_news.txt
 - (NSData *)keyFunction:(int)no modifiers:(NSEventModifierFlags)modifiers {
@@ -591,35 +624,35 @@ typedef enum {
             return [NSData dataWithBytes:_keyStrings[TERMINFO_KEY_F0+no]
                                   length:strlen(_keyStrings[TERMINFO_KEY_F0+no])];
         } else {
-            sprintf(str, KEY_FUNCTION_FORMAT, no + 10);
+            return [self dataForStandardFunctionKeyWithCode:no + 10];
         }
     } else if (no <= 10) {
         if (_keyStrings[TERMINFO_KEY_F0+no]) {
             return [NSData dataWithBytes:_keyStrings[TERMINFO_KEY_F0+no]
                                   length:strlen(_keyStrings[TERMINFO_KEY_F0+no])];
         } else {
-            sprintf(str, KEY_FUNCTION_FORMAT, no + 11);
+            return [self dataForStandardFunctionKeyWithCode:no + 11];
         }
     } else if (no <= 14) {
         if (_keyStrings[TERMINFO_KEY_F0+no]) {
             return [NSData dataWithBytes:_keyStrings[TERMINFO_KEY_F0+no]
                                   length:strlen(_keyStrings[TERMINFO_KEY_F0+no])];
         } else {
-            sprintf(str, KEY_FUNCTION_FORMAT, no + 12);
+            return [self dataForStandardFunctionKeyWithCode:no + 12];
         }
     } else if (no <= 16) {
         if (_keyStrings[TERMINFO_KEY_F0+no]) {
             return [NSData dataWithBytes:_keyStrings[TERMINFO_KEY_F0+no]
                                   length:strlen(_keyStrings[TERMINFO_KEY_F0+no])];
         } else {
-            sprintf(str, KEY_FUNCTION_FORMAT, no + 13);
+            return [self dataForStandardFunctionKeyWithCode:no + 13];
         }
     } else if (no <= 20) {
         if (_keyStrings[TERMINFO_KEY_F0+no]) {
             return [NSData dataWithBytes:_keyStrings[TERMINFO_KEY_F0+no]
                                   length:strlen(_keyStrings[TERMINFO_KEY_F0+no])];
         } else {
-            sprintf(str, KEY_FUNCTION_FORMAT, no + 14);
+            return [self dataForStandardFunctionKeyWithCode:no + 14];
         }
     } else if (no <= 35) {
         if (_keyStrings[TERMINFO_KEY_F0+no]) {
@@ -680,17 +713,24 @@ typedef enum {
                              lastPoint:(NSPoint)lastReportedPoint {
     switch (self.mouseFormat) {
         case MOUSE_FORMAT_SGR_PIXEL:
+            DLog(@"pixel report. point=%@ last=%@", NSStringFromPoint(point), NSStringFromPoint(lastReportedPoint));
             return !NSEqualPoints(point, lastReportedPoint);
         case MOUSE_FORMAT_XTERM_EXT:
         case MOUSE_FORMAT_URXVT:
         case MOUSE_FORMAT_SGR:
         case MOUSE_FORMAT_XTERM:
         default:
+            DLog(@"coord report. coord=%@ last=%@", VT100GridCoordDescription(coord),
+                 VT100GridCoordDescription(lastReportedCoord));
             return !VT100GridCoordEquals(coord, lastReportedCoord);
     }
 }
 
 - (NSData *)mouseReport:(int)button coord:(VT100GridCoord)coord point:(NSPoint)point {
+    return [self mouseReport:button release:false coord:coord point:point];
+}
+
+- (NSData *)mouseReport:(int)button release:(bool)release coord:(VT100GridCoord)coord point:(NSPoint)point {
     switch (self.mouseFormat) {
         case MOUSE_FORMAT_XTERM_EXT: {
             // TODO: This doesn't handle positions greater than 223 correctly. It should use UTF-8.
@@ -704,10 +744,10 @@ typedef enum {
             return [[NSString stringWithFormat:@"\033[%d;%d;%dM", 32 + button, coord.x, coord.y]  dataUsingEncoding:NSUTF8StringEncoding];
 
         case MOUSE_FORMAT_SGR:
-            return [[self reportForSGRButton:button x:coord.x y:coord.y]  dataUsingEncoding:NSUTF8StringEncoding];
+            return [[self reportForSGRButton:button release:release x:coord.x y:coord.y]  dataUsingEncoding:NSUTF8StringEncoding];
 
         case MOUSE_FORMAT_SGR_PIXEL:
-            return [[self reportForSGRButton:button x:point.x y:point.y]  dataUsingEncoding:NSUTF8StringEncoding];
+            return [[self reportForSGRButton:button release:release x:point.x y:point.y]  dataUsingEncoding:NSUTF8StringEncoding];
 
         case MOUSE_FORMAT_XTERM:
         default:
@@ -716,11 +756,11 @@ typedef enum {
     return [NSData data];
 }
 
-- (NSString *)reportForSGRButton:(int)button x:(int)x y:(int)y {
-    if (button & MOUSE_BUTTON_SGR_RELEASE_FLAG) {
+- (NSString *)reportForSGRButton:(int)button release:(bool)release x:(int)x y:(int)y {
+    if (release) {
         // Mouse release event.
         return [NSString stringWithFormat:@"\033[<%d;%d;%dm",
-                 button ^ MOUSE_BUTTON_SGR_RELEASE_FLAG,
+                 button,
                  x,
                  y];
     }
@@ -754,12 +794,14 @@ static int VT100OutputSafeAddInt(int l, int r) {
 - (NSData *)mousePress:(int)button withModifiers:(unsigned int)modflag at:(VT100GridCoord)coord point:(NSPoint)point {
     int cb;
 
-    cb = button;
-    if (button == MOUSE_BUTTON_SCROLLDOWN || button == MOUSE_BUTTON_SCROLLUP) {
-        // convert x11 scroll button number to terminal button code
-        const int offset = MOUSE_BUTTON_SCROLLDOWN;
-        cb -= offset;
+    // convert x11 button number to terminal button code
+    cb = button & 3;
+    if (button == MOUSE_BUTTON_SCROLLDOWN || button == MOUSE_BUTTON_SCROLLUP ||
+        button == MOUSE_BUTTON_SCROLLLEFT || button == MOUSE_BUTTON_SCROLLRIGHT) {
         cb |= MOUSE_BUTTON_SCROLL_FLAG;
+    }
+    if (button >= MOUSE_BUTTON_BACKWARD) {
+        cb |= MOUSE_BUTTON_EXTRA_FLAG;
     }
     if (modflag & NSEventModifierFlagControl) {
         cb |= MOUSE_BUTTON_CTRL_FLAG;
@@ -780,10 +822,9 @@ static int VT100OutputSafeAddInt(int l, int r) {
 - (NSData *)mouseRelease:(int)button withModifiers:(unsigned int)modflag at:(VT100GridCoord)coord point:(NSPoint)point {
     int cb;
 
-    if (self.mouseFormat == MOUSE_FORMAT_SGR || self.mouseFormat == MOUSE_FORMAT_SGR_PIXEL) {
-        // for SGR 1006 and 1016 modes
-        cb = button | MOUSE_BUTTON_SGR_RELEASE_FLAG;
-    } else {
+    // convert x11 button number to terminal button code
+    cb = button & 3;
+    if (self.mouseFormat != MOUSE_FORMAT_SGR && self.mouseFormat != MOUSE_FORMAT_SGR_PIXEL) {
         // for 1000/1005/1015 mode
         // To quote the xterm docs:
         // The low two bits of C b encode button information:
@@ -791,6 +832,9 @@ static int VT100OutputSafeAddInt(int l, int r) {
         cb = 3;
     }
 
+    if (button >= MOUSE_BUTTON_BACKWARD) {
+        cb |= MOUSE_BUTTON_EXTRA_FLAG;
+    }
     if (modflag & NSEventModifierFlagControl) {
         cb |= MOUSE_BUTTON_CTRL_FLAG;
     }
@@ -801,6 +845,7 @@ static int VT100OutputSafeAddInt(int l, int r) {
         cb |= MOUSE_BUTTON_META_FLAG;
     }
     return [self mouseReport:cb
+                       release:true
                        coord:VT100GridCoordMake(coord.x + 1,
                                                 coord.y + 1)
                        point:NSMakePoint(VT100OutputDoubleToInt(VT100OutputSafeAddInt(point.x, 1)),
@@ -815,8 +860,12 @@ static int VT100OutputSafeAddInt(int l, int r) {
     } else {
         cb = button % 3;
     }
-    if (button > 3) {
+    if (button == MOUSE_BUTTON_SCROLLDOWN || button == MOUSE_BUTTON_SCROLLUP ||
+        button == MOUSE_BUTTON_SCROLLLEFT || button == MOUSE_BUTTON_SCROLLRIGHT) {
         cb |= MOUSE_BUTTON_SCROLL_FLAG;
+    }
+    if (button >= MOUSE_BUTTON_BACKWARD) {
+        cb |= MOUSE_BUTTON_EXTRA_FLAG;
     }
     if (modflag & NSEventModifierFlagControl) {
         cb |= MOUSE_BUTTON_CTRL_FLAG;
@@ -1173,9 +1222,10 @@ static int VT100OutputSafeAddInt(int l, int r) {
                                    length:strlen(_keyStrings[terminfo])];
     } else {
         if (mod) {
-            char buf[20];
-            sprintf(buf, cursorMod, mod);
-            theSuffix = [NSData dataWithBytes:buf length:strlen(buf)];
+            NSString *format = [NSString stringWithCString:cursorMod encoding:NSUTF8StringEncoding];
+            NSString *string = [format stringByReplacingOccurrencesOfString:@"%d"
+                                                                 withString:[@(mod) stringValue]];
+            theSuffix = [string dataUsingEncoding:NSISOLatin1StringEncoding];
         } else {
             if (self.cursorMode) {
                 theSuffix = [NSData dataWithBytes:cursorSet
@@ -1358,6 +1408,110 @@ BOOL VT100OutputCursorInformationGetLineDrawingMode(VT100OutputCursorInformation
 - (NSData *)reportMemoryChecksum:(int)checksum id:(int)reqid {
     return [[NSString stringWithFormat:@"\eP%d!~%04X\e\\",
              MAX(1, reqid), checksum] dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+- (NSData *)reportVariableNamed:(NSString *)name value:(NSString *)variableValue {
+    NSString *encodedValue = @"";
+    if (variableValue) {
+        encodedValue = [[variableValue dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+    }
+    NSString *report = [NSString stringWithFormat:@"\e]1337;ReportVariable=%@\a",
+                        encodedValue ?: @""];
+    return [report dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+VT100Capabilities VT100OutputMakeCapabilities(BOOL compatibility24Bit,
+                                              BOOL full24Bit,
+                                              BOOL clipboardWritable,
+                                              BOOL decslrm,
+                                              BOOL mouse,
+                                              BOOL DECSCUSR14,
+                                              BOOL DECSCUSR56,
+                                              BOOL DECSCUSR0,
+                                              BOOL unicode,
+                                              BOOL ambiguousWide,
+                                              uint32_t unicodeVersion,
+                                              BOOL titleStacks,
+                                              BOOL titleSetting,
+                                              BOOL bracketedPaste,
+                                              BOOL focusReporting,
+                                              BOOL strikethrough,
+                                              BOOL overline,
+                                              BOOL sync,
+                                              BOOL hyperlinks,
+                                              BOOL notifications,
+                                              BOOL sixel,
+                                              BOOL file) {
+    const VT100Capabilities capabilities = {
+        .twentyFourBit = (compatibility24Bit ? 1 : 0) | (full24Bit ? 2 : 0),
+        .clipboardWritable = clipboardWritable,
+        .DECSLRM = decslrm,
+        .mouse = mouse,
+        .DECSCUSR = (DECSCUSR14 ? 1 : 0) | (DECSCUSR56 ? 2 : 0) | (DECSCUSR0 ? 4 : 0),
+        .unicodeBasic = unicode,
+        .ambiguousWide = ambiguousWide,
+        .unicodeWidths = unicodeVersion,
+        .titles = (titleStacks ? 1 : 0) | (titleSetting ? 2 : 0),
+        .bracketedPaste = bracketedPaste,
+        .focusReporting = focusReporting,
+        .strikethrough = strikethrough,
+        .overline = overline,
+        .sync = sync,
+        .hyperlinks = hyperlinks,
+        .notifications = notifications,
+        .sixel = sixel,
+        .file = file,
+    };
+    return capabilities;
+}
+
+- (NSData *)reportCapabilities:(VT100Capabilities)capabilities {
+    NSString *(^formatNumber)(NSString *, uint32_t) = ^NSString *(NSString *code, uint32_t value) {
+        if (value == 0) {
+            return @"";
+        }
+        return [NSString stringWithFormat:@"%@%@", code, @(value)];
+    };
+    NSArray<NSString *> *parts = @[
+        formatNumber(@"T", capabilities.twentyFourBit),
+        capabilities.clipboardWritable ? @"Cw" : @"",
+        capabilities.DECSLRM ? @"Lr" : @"",
+        capabilities.mouse ? @"M" : @"",
+        formatNumber(@"Sc", capabilities.DECSCUSR),
+        capabilities.unicodeBasic ? @"U" : @"",
+        capabilities.ambiguousWide ? @"Aw" : @"",
+        formatNumber(@"Uw", capabilities.unicodeWidths),
+        formatNumber(@"Ts", capabilities.titles),
+        capabilities.bracketedPaste ? @"B" : @"",
+        capabilities.focusReporting ? @"F" : @"",
+        capabilities.strikethrough ? @"Gs" : @"",
+        capabilities.overline ? @"Go" : @"",
+        capabilities.sync ? @"Sy" : @"",
+        capabilities.hyperlinks ? @"H" : @"",
+        capabilities.notifications ? @"No" : @"",
+        capabilities.sixel ? @"Sx" : @"",
+        capabilities.file ? @"F" : @"",
+    ];
+    NSString *encodedValue = [parts componentsJoinedByString:@""];
+    NSString *report = [NSString stringWithFormat:@"\e]1337;Capabilities=%@\a",
+                        encodedValue ?: @""];
+    return [report dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+- (NSData *)reportPasteboard:(NSString *)pasteboard contents:(NSString *)string {
+    NSString *report = [NSString stringWithFormat:@"\e]52;%@;%@\e\\",
+                        pasteboard, [string base64EncodedWithEncoding:NSUTF8StringEncoding]];
+    return [report dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+#pragma mark - NSCopying
+
+- (id)copyWithZone:(NSZone *)zone {
+    return [[VT100Output alloc] initWithOutput:self];
+}
+
+- (VT100Output *)copy {
+    return [self copyWithZone:nil];
 }
 
 @end

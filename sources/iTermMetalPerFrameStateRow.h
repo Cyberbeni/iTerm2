@@ -12,23 +12,26 @@ NS_ASSUME_NONNULL_BEGIN
 @class iTermData;
 @class iTermTextDrawingHelper;
 @class PTYTextView;
+@class ScreenCharArray;
 @class VT100Screen;
-@class iTermExternalAttributeIndex;
+@protocol iTermExternalAttributeIndexReading;
 @class iTermMetalPerFrameStateConfiguration;
 
 @interface iTermMetalPerFrameStateRow : NSObject {
 @public
-    NSInteger _generation;
     NSNumber *_markStyle;
-    iTermData *_screenCharLine;
+    BOOL _lineStyleMark;
+    ScreenCharArray *_screenCharLine;
     NSIndexSet *_selectedIndexSet;
     NSDate *_date;
     NSData *_matches;
     NSRange _underlinedRange;  // Underline for semantic history
-    iTermExternalAttributeIndex *_eaIndex;
+    id<iTermExternalAttributeIndexReading> _eaIndex;
 }
 
 - (instancetype)init NS_UNAVAILABLE;
+- (iTermMetalPerFrameStateRow *)emptyCopy;
+
 @end
 
 

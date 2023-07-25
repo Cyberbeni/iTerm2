@@ -6,6 +6,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "IntervalTree.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -15,6 +16,7 @@ typedef NS_ENUM(NSUInteger, iTermIntervalTreeObjectType) {
     iTermIntervalTreeObjectTypeErrorMark,
     iTermIntervalTreeObjectTypeManualMark,
     iTermIntervalTreeObjectTypeAnnotation,
+    iTermIntervalTreeObjectTypePorthole,
     iTermIntervalTreeObjectTypeUnknown,
 };
 
@@ -24,7 +26,16 @@ typedef NS_ENUM(NSUInteger, iTermIntervalTreeObjectType) {
                                 onLine:(NSInteger)line;
 - (void)intervalTreeDidRemoveObjectOfType:(iTermIntervalTreeObjectType)type
                                    onLine:(NSInteger)line;
+- (void)intervalTreeDidUnhideObject:(id<IntervalTreeImmutableObject>)object
+                             ofType:(iTermIntervalTreeObjectType)type
+                             onLine:(NSInteger)line;
+- (void)intervalTreeDidHideObject:(id<IntervalTreeImmutableObject>)object
+                           ofType:(iTermIntervalTreeObjectType)type
+                           onLine:(NSInteger)line;
 - (void)intervalTreeVisibleRangeDidChange;
+- (void)intervalTreeDidMoveObjects:(NSArray<id<IntervalTreeImmutableObject>> *)objects;
 @end
+
+iTermIntervalTreeObjectType iTermIntervalTreeObjectTypeForObject(id<IntervalTreeImmutableObject> object);
 
 NS_ASSUME_NONNULL_END

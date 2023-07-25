@@ -9,11 +9,11 @@
 #import <Foundation/Foundation.h>
 #import "VT100GridTypes.h"
 
-@class iTermImageInfo;
+@protocol iTermImageInfoReading;
 @class iTermSemanticHistoryController;
 @class iTermTextExtractor;
 @class SCPPath;
-@class VT100RemoteHost;
+@protocol VT100RemoteHostReading;
 
 typedef NS_ENUM(NSInteger, URLActionType) {
     kURLActionOpenURL,
@@ -66,6 +66,6 @@ typedef NS_ENUM(NSInteger, URLActionType) {
 + (instancetype)urlActionToPerformSmartSelectionRule:(NSDictionary *)rule
                                             onString:(NSString *)content;
 + (instancetype)urlActionToOpenExistingFile:(NSString *)filename;
-+ (instancetype)urlActionToOpenImage:(iTermImageInfo *)imageInfo;
++ (instancetype)urlActionToOpenImage:(id<iTermImageInfoReading>)imageInfo;
 
 @end

@@ -22,13 +22,17 @@
 // This code has been altered.
 
 #import <Foundation/Foundation.h>
+#import "NSFileManager+CommonAdditions.h"
 
 @interface NSFileManager (iTerm)
+
+extern NSNotificationName iTermScriptsFolderDidChange;
 
 + (NSString *)pathToSaveFileInFolder:(NSString *)destinationDirectory preferredName:(NSString *)preferredName;
 
 - (NSString *)legacyApplicationSupportDirectory;
 - (NSString *)applicationSupportDirectory;
+- (NSString *)applicationSupportDirectoryWithoutCreating;
 
 // Gives a symlink called ApplicationSupport because pip3 can't handle spaces and this breaks pyenv.
 // Creates the symlink if it doesn't already exist
@@ -41,18 +45,6 @@
 
 - (BOOL)directoryIsWritable:(NSString *)dir;
 
-// Returns YES if the file looks like it might be on a local filesystem, but doesn't check if it
-// actually exists.
-- (BOOL)fileIsLocal:(NSString *)filename
-additionalNetworkPaths:(NSArray<NSString *> *)additionalNetworkPaths;
-
-// Returns YES if the file exists on a local (non-network) filesystem.
-- (BOOL)fileExistsAtPathLocally:(NSString *)filename
-         additionalNetworkPaths:(NSArray<NSString *> *)additionalNetworkpaths;
-
-- (BOOL)fileHasForbiddenPrefix:(NSString *)filename
-        additionalNetworkPaths:(NSArray<NSString *> *)additionalNetworkpaths;
-
 // Returns the path to the user's desktop.
 - (NSString *)desktopDirectory;
 
@@ -63,6 +55,7 @@ additionalNetworkPaths:(NSArray<NSString *> *)additionalNetworkPaths;
 // Directory where scripts live. These are loaded and added to a menu or auto-run at startup.
 - (NSString *)scriptsPath;
 - (NSString *)scriptsPathWithoutSpaces;
+- (BOOL)customScriptsFolderIsValid:(NSString *)candidate;
 
 // Path to special auto-launch script that is run at startup.
 - (NSString *)legacyAutolaunchScriptPath;  // applescript

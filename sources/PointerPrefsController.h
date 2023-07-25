@@ -24,6 +24,7 @@ extern NSString *kMovePanePointerAction;
 extern NSString *kSendEscapeSequencePointerAction;
 extern NSString *kSendHexCodePointerAction;
 extern NSString *kSendTextPointerAction;
+extern NSString *kInvokeScriptFunction;
 extern NSString *kSelectPaneLeftPointerAction;
 extern NSString *kSelectPaneRightPointerAction;
 extern NSString *kSelectPaneAbovePointerAction;
@@ -37,6 +38,7 @@ extern NSString *kSelectPreviousPanePointerAction;
 extern NSString *kExtendSelectionPointerAction;
 extern NSString *kQuickLookAction;
 extern NSString *kIgnoreAction;
+extern NSString *kSelectMenuItemPointerAction;
 
 extern NSString *kThreeFingerClickGesture;
 extern NSString *kThreeFingerSwipeRight;

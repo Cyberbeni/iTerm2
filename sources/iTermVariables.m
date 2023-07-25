@@ -72,6 +72,7 @@ NSString *const iTermVariableKeySessionAutoName = @"autoName";
 NSString *const iTermVariableKeySessionTmuxWindowPane = @"tmuxWindowPane";
 NSString *const iTermVariableKeySessionJobPid = @"jobPid";
 NSString *const iTermVariableKeySessionChildPid = @"pid";
+NSString *const iTermVariableKeySessionEffectiveSessionRootPid = @"effective_root_pid";
 NSString *const iTermVariableKeySessionTmuxStatusLeft = @"tmuxStatusLeft";
 NSString *const iTermVariableKeySessionTmuxStatusRight = @"tmuxStatusRight";
 NSString *const iTermVariableKeySessionMouseReportingMode = @"mouseReportingMode";
@@ -86,6 +87,10 @@ NSString *const iTermVariableKeySessionLogFilename = @"logFilename";
 NSString *const iTermVariableKeySessionTmuxWindowPaneIndex = @"tmuxWindowPaneIndex";
 NSString *const iTermVariableKeySessionMouseInfo = @"mouseInfo";
 NSString *const iTermVariableKeySessionApplicationKeypad = @"applicationKeypad";
+NSString *const iTermVariableKeySessionHomeDirectory = @"homeDirectory";
+NSString *const iTermVariableKeySSHIntegrationLevel = @"sshIntegrationLevel";
+NSString *const iTermVariableKeyShell = @"shell";
+NSString *const iTermVariableKeyUname = @"uname";
 
 #pragma mark - Window Context
 
@@ -96,6 +101,7 @@ NSString *const iTermVariableKeyWindowID = @"id";
 NSString *const iTermVariableKeyWindowFrame = @"frame";
 NSString *const iTermVariableKeyWindowStyle = @"style";
 NSString *const iTermVariableKeyWindowNumber = @"number";
+NSString *const iTermVariableKeyWindowIsHotkeyWindow = @"isHotkeyWindow";
 
 // NOTE: If you add here, also update +recordBuiltInVariables and (if needed) -[ProfilesSessionPreferencesViewController prenatalPathSource]
 

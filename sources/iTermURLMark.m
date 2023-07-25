@@ -11,30 +11,25 @@
 
 @implementation iTermURLMark
 
-- (instancetype)initWithDictionary:(NSDictionary *)dict {
+- (instancetype)initWithCode:(unsigned int)code {
     self = [super init];
     if (self) {
-        _code = [dict[@"code"] unsignedIntValue];
-        // We trust that the iTermURLStore will be restored along with the refcounts.
+        [[iTermURLStore sharedInstance] retainCode:code];
+        _code = code;
     }
     return self;
+}
+
+- (instancetype)initWithDictionary:(NSDictionary *)dict {
+    return [self initWithCode:[dict[@"code"] unsignedIntValue]];
 }
 
 - (NSDictionary *)dictionaryValue {
     return @{ @"code": @(_code) };
 }
 
-- (void)setCode:(unsigned int)code {
-    if (code == _code) {
-        return;
-    }
-    if (_code) {
-        [[iTermURLStore sharedInstance] releaseCode:_code];
-    }
-    if (code) {
-        [[iTermURLStore sharedInstance] retainCode:code];
-    }
-    _code = code;
+- (NSString *)shortDebugDescription {
+    return [NSString stringWithFormat:@"[URL %@]", [[iTermURLStore sharedInstance] urlForCode:_code]];
 }
 
 - (void)dealloc {

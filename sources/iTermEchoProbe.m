@@ -9,6 +9,7 @@
 
 #import "DebugLogging.h"
 #import "iTermAdvancedSettingsModel.h"
+#import "iTermGCDTimer.h"
 #import "iTermUserDefaults.h"
 #import "VT100Token.h"
 
@@ -25,6 +26,16 @@ typedef NS_ENUM(NSUInteger, iTermEchoProbeState) {
 @implementation iTermEchoProbe {
     NSString *_password;
     iTermEchoProbeState _state;
+    iTermGCDTimer *_timer;
+    dispatch_queue_t _queue;
+}
+
+- (instancetype)initWithQueue:(dispatch_queue_t)queue {
+    self = [super init];
+    if (self) {
+        _queue = queue;
+    }
+    return self;
 }
 
 - (void)setDelegate:(id<iTermEchoProbeDelegate>)delegate {
@@ -38,7 +49,8 @@ typedef NS_ENUM(NSUInteger, iTermEchoProbeState) {
 - (void)beginProbeWithBackspace:(NSData *)backspace
                        password:(nonnull NSString *)password {
     _password = [password copy];
-    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(timeout) object:nil];
+    [_timer invalidate];
+    _timer = nil;
 
     if (![iTermUserDefaults probeForPassword] || [iTermAdvancedSettingsModel echoProbeDuration] == 0) {
         [self enterPassword];
@@ -54,9 +66,10 @@ typedef NS_ENUM(NSUInteger, iTermEchoProbeState) {
         @synchronized(self) {
             _state = iTermEchoProbeWaiting;
         }
-        [self performSelector:@selector(timeout)
-                   withObject:nil
-                   afterDelay:[iTermAdvancedSettingsModel echoProbeDuration]];
+        _timer = [[iTermGCDTimer alloc] initWithInterval:[iTermAdvancedSettingsModel echoProbeDuration]
+                                                   queue:_queue
+                                                  target:self
+                                                selector:@selector(timeout)];
     } else {
         // Rare case: we don't know how to send a backspace. Just enter the password.
         [self enterPassword];
@@ -71,6 +84,10 @@ typedef NS_ENUM(NSUInteger, iTermEchoProbeState) {
         const int count = CVectorCount(vector);
         for (int i = 0; i < count; i++) {
             VT100Token *token = CVectorGetObject(vector, i);
+            if (token.sshInfo.valid && token.sshInfo.channel >= 0) {
+                // This is not from the login shell so ignore it.
+                continue;
+            }
             const iTermEchoProbeState previousState = _state;
             _state = iTermEchoProbeGetNextState(_state, token);
             if (_state != previousState) {
@@ -88,6 +105,20 @@ typedef NS_ENUM(NSUInteger, iTermEchoProbeState) {
 }
 
 iTermEchoProbeState iTermEchoProbeGetNextState(iTermEchoProbeState state, VT100Token *token) {
+    switch (token.type) {
+        case SSH_INIT:
+        case SSH_BEGIN:
+        case SSH_LINE:
+        case SSH_UNHOOK:
+        case SSH_END:
+        case SSH_TERMINATE:
+        case DCS_SSH_HOOK:
+        case SSH_OUTPUT:
+        case SSH_RECOVERY_BOUNDARY:
+            return state;
+        default:
+            break;
+    }
     switch (state) {
         case iTermEchoProbeOff:
         case iTermEchoProbeFailed:
@@ -139,9 +170,17 @@ iTermEchoProbeState iTermEchoProbeGetNextState(iTermEchoProbeState state, VT100T
     _password = nil;
 }
 
+- (void)reset {
+    _password = nil;
+    _state = iTermEchoProbeOff;
+    [_timer invalidate];
+    _timer = nil;
+}
+
 #pragma mark - Private
 
 - (void)timeout {
+    _timer = nil;
     @synchronized (self) {
         switch (_state) {
             case iTermEchoProbeWaiting:
@@ -159,7 +198,6 @@ iTermEchoProbeState iTermEchoProbeGetNextState(iTermEchoProbeState state, VT100T
                 break;
         }
         _state = iTermEchoProbeOff;
-        _password = nil;
     }
 }
 

@@ -10,20 +10,16 @@
 
 @implementation VT100LineInfo {
     int width_;
-    int start_;
-    int bound_;
+    BOOL _dirty;
     NSData *_cachedEncodedMetadata;
 }
-
-static NSInteger VT100LineInfoNextGeneration = 1;
 
 - (instancetype)initWithWidth:(int)width {
     self = [super init];
     if (self) {
         width_ = width;
-        start_ = -1;
-        bound_ = -1;
-        [self setDirty:NO inRange:VT100GridRangeMake(0, width) updateTimestamp:NO];
+        _dirty = NO;
+        [self setDirty:NO inRange:VT100GridRangeMake(0, width) updateTimestampTo:0];
         iTermMetadataInit(&_metadata, 0, nil);
     }
     return self;
@@ -33,74 +29,59 @@ static NSInteger VT100LineInfoNextGeneration = 1;
     iTermMetadataRelease(_metadata);
 }
 
-- (void)setDirty:(BOOL)dirty inRange:(VT100GridRange)range updateTimestamp:(BOOL)updateTimestamp {
+- (void)setDirty:(BOOL)dirty inRange:(VT100GridRange)range updateTimestampTo:(NSTimeInterval)now {
 #ifdef ITERM_DEBUG
     assert(range.location >= 0);
     assert(range.length >= 0);
     assert(range.location + range.length <= width_);
 #endif
-    const VT100GridRange before = [self dirtyRange];
-    if (dirty && updateTimestamp) {
-        [self updateTimestamp];
+    if (dirty && now) {
+        [self updateTimestamp:now];
     }
-    if (dirty) {
-        if (start_ < 0) {
-            start_ = range.location;
-            bound_ = range.location + range.length;
-        } else {
-            start_ = MIN(start_, range.location);
-            bound_ = MAX(bound_, range.location + range.length);
-        }
-    } else if (start_ >= 0) {
-        // Unset part of the dirty region.
-        int clearBound = range.location + range.length;
-        if (range.location <= start_) {
-            if (clearBound >= bound_) {
-                start_ = bound_ = -1;
-            } else if (clearBound > start_) {
-                start_ = clearBound;
-            }
-        } else if (range.location < bound_ && clearBound >= bound_) {
-            // Clear the right-hand part of the dirty region
-            bound_ = range.location;
-        }
-    }
-    const VT100GridRange after = [self dirtyRange];
-    if (dirty && !VT100GridRangeEqualsRange(before, after)) {
-        _generation = VT100LineInfoNextGeneration++;
-    }
+    _dirty = dirty;
+}
+
+- (iTermImmutableMetadata)immutableMetadata {
+    return iTermMetadataMakeImmutable(self.metadata);
 }
 
 - (VT100GridRange)dirtyRange {
-    return VT100GridRangeMake(start_, bound_ - start_);
+    if (_dirty) {
+        return VT100GridRangeMake(0, width_);
+    } else {
+        return VT100GridRangeMake(-1, -1);
+    }
 }
 
-- (void)updateTimestamp {
-    _metadata.timestamp = [NSDate timeIntervalSinceReferenceDate];
+- (void)updateTimestamp:(NSTimeInterval)now __attribute__((objc_direct)) {
+#ifdef ITERM_DEBUG
+    assert(now > 0);
+#endif
+    _metadata.timestamp = round(now);
     _cachedEncodedMetadata = nil;
 }
 
 - (BOOL)isDirtyAtOffset:(int)x {
 #if ITERM_DEBUG
     assert(x >= 0 && x < width_);
-#else
-    x = MIN(width_ - 1, MAX(0, x));
 #endif
-    return x >= start_ && x < bound_;
+    return _dirty;
 }
 
 - (NSIndexSet *)dirtyIndexes {
-    return [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(start_, bound_ - start_)];
+    if (_dirty) {
+        return [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, width_)];
+    }
+    return [NSIndexSet indexSet];
 }
 
 - (BOOL)anyCharIsDirty {
-    return start_ >= 0;
+    return _dirty;
 }
 
 - (id)copyWithZone:(NSZone *)zone {
     VT100LineInfo *theCopy = [[VT100LineInfo alloc] initWithWidth:width_];
-    theCopy->start_ = start_;
-    theCopy->bound_ = bound_;
+    theCopy->_dirty = _dirty;
     iTermMetadataRelease(theCopy->_metadata);
     theCopy->_metadata = iTermMetadataCopy(_metadata);
 
@@ -131,6 +112,12 @@ static NSInteger VT100LineInfoNextGeneration = 1;
     iTermMetadataRelease(_metadata);
     _metadata = metadata;
     _cachedEncodedMetadata = nil;
+}
+
+- (void)setMetadataFromImmutable:(iTermImmutableMetadata)metadata {
+    iTermMetadata mutableCopy = iTermImmutableMetadataMutableCopy(metadata);
+    [self setMetadata:mutableCopy];
+    iTermMetadataRelease(mutableCopy);
 }
 
 - (iTermExternalAttributeIndex *)externalAttributesCreatingIfNeeded:(BOOL)create {

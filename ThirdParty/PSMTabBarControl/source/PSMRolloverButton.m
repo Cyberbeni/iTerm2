@@ -19,14 +19,13 @@ static const CGFloat PSMRolloverButtonMaxAlpha = 0.25;
     CGFloat _alpha;
     NSTimer *_timer;
     NSTrackingArea *_trackingArea;
+    BOOL _dragged;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        if (@available(macOS 10.14, *)) {
-            self.wantsLayer = YES;
-        }
+        self.wantsLayer = YES;
     }
     return self;
 }
@@ -95,18 +94,16 @@ static const CGFloat PSMRolloverButtonMaxAlpha = 0.25;
 }
 
 - (void)setTargetAlpha:(CGFloat)targetAlpha {
-    if (@available(macOS 10.14, *)) {
-        if (fabs(targetAlpha - _targetAlpha) < PSMRolloverButtonDifferenceThreshold) {
-            return;
-        }
-        _targetAlpha = targetAlpha;
-        if (!_timer) {
-            _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 / PSMRolloverButtonFramesPerSecond
-                                                      target:self
-                                                    selector:@selector(updateBackgroundAlphaTimer:)
-                                                    userInfo:nil
-                                                     repeats:YES];
-        }
+    if (fabs(targetAlpha - _targetAlpha) < PSMRolloverButtonDifferenceThreshold) {
+        return;
+    }
+    _targetAlpha = targetAlpha;
+    if (!_timer) {
+        _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 / PSMRolloverButtonFramesPerSecond
+                                                  target:self
+                                                selector:@selector(updateBackgroundAlphaTimer:)
+                                                userInfo:nil
+                                                 repeats:YES];
     }
 }
 
@@ -139,12 +136,14 @@ static const CGFloat PSMRolloverButtonMaxAlpha = 0.25;
 }
 
 - (void)mouseUp:(NSEvent *)event {
-    if (event.clickCount == 1) {
+    if (event.clickCount == 1 && !_dragged) {
         [self performClick:self];
     }
+    _dragged = NO;
 }
 
 - (void)mouseDragged:(NSEvent *)event {
+    _dragged = YES;
     [self.window makeKeyAndOrderFront:nil];
     [self.window performWindowDragWithEvent:event];
 }

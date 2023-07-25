@@ -33,6 +33,7 @@ const NSEventModifierFlags kHotKeyModifierMask = (NSEventModifierFlagCommand |
                                                   NSEventModifierFlagOption |
                                                   NSEventModifierFlagShift |
                                                   NSEventModifierFlagControl |
+                                                  iTermLeaderModifierFlag |
                                                   NSEventModifierFlagNumericPad);
 
 @implementation iTermShortcut {
@@ -115,11 +116,20 @@ const NSEventModifierFlags kHotKeyModifierMask = (NSEventModifierFlagCommand |
     return shortcut;
 }
 
-+ (instancetype)shortcutWithEvent:(NSEvent *)event {
++ (instancetype)shortcutWithEvent:(NSEvent *)event
+                    leaderAllowed:(BOOL)leaderAllowed {
+    NSEventModifierFlags flags = event.it_modifierFlags;
+    if (!leaderAllowed) {
+        flags &= ~iTermLeaderModifierFlag;
+    }
     return [[self alloc] initWithKeyCode:event.keyCode
-                               modifiers:event.it_modifierFlags
+                               modifiers:flags
                               characters:event.characters
              charactersIgnoringModifiers:event.charactersIgnoringModifiers];
+}
+
++ (instancetype)shortcutWithEvent:(NSEvent *)event {
+    return [self shortcutWithEvent:event leaderAllowed:YES];
 }
 
 - (instancetype)init {
@@ -146,6 +156,7 @@ const NSEventModifierFlags kHotKeyModifierMask = (NSEventModifierFlagCommand |
             [NSString stringForModifiersWithMask:self.modifiers], self.characters, [self.characters hexEncodedString],
             self.charactersIgnoringModifiers, [self.charactersIgnoringModifiers hexEncodedString]];
 }
+
 - (BOOL)isEqual:(id)object {
     if ([object isKindOfClass:[iTermShortcut class]]) {
         return [self isEqualToShortcut:object];
@@ -181,7 +192,8 @@ const NSEventModifierFlags kHotKeyModifierMask = (NSEventModifierFlagCommand |
 - (iTermKeystroke *)keystroke {
     return [[iTermKeystroke alloc] initWithVirtualKeyCode:self.keyCode
                                             modifierFlags:self.modifiers
-                                                character:[self.charactersIgnoringModifiers firstCharacter]];
+                                                character:[self.charactersIgnoringModifiers firstCharacter]
+                                        modifiedCharacter:[self.characters firstCharacter]];
 }
 
 - (NSString *)stringValue {

@@ -8,12 +8,16 @@
 
 #import "GeneralPreferencesViewController.h"
 
+#import "iTerm2SharedARC-Swift.h"
 #import "iTermAPIHelper.h"
 #import "iTermAdvancedGPUSettingsViewController.h"
 #import "iTermApplicationDelegate.h"
+#import "iTermBuriedSessions.h"
+#import "iTermHotKeyController.h"
 #import "iTermNotificationCenter.h"
 #import "iTermPreferenceDidChangeNotification.h"
 #import "iTermRemotePreferences.h"
+#import "iTermScriptsMenuController.h"
 #import "iTermShellHistoryController.h"
 #import "iTermUserDefaultsObserver.h"
 #import "iTermWarning.h"
@@ -38,6 +42,9 @@ enum {
     // Open saved window arrangement at startup
     IBOutlet NSPopUpButton *_openWindowsAtStartup;
     IBOutlet NSTextField *_openWindowsAtStartupLabel;
+    IBOutlet NSButton *_alwaysOpenWindowAtStartup;
+    IBOutlet NSTextField *_alwaysOpenLegend;
+    IBOutlet NSButton *_restoreWindowsToSameSpaces;
 
     IBOutlet NSMenuItem *_openDefaultWindowArrangementItem;
 
@@ -69,6 +76,8 @@ enum {
     // Enable bonjour
     IBOutlet NSButton *_enableBonjour;
 
+    IBOutlet NSButton *_notifyOnlyCriticalShellIntegrationUpdates;
+
     // Check for updates automatically
     IBOutlet NSButton *_checkUpdate;
 
@@ -86,6 +95,11 @@ enum {
     IBOutlet NSButton *_pushToCustomFolder;  // Push button to copy local to remote
     IBOutlet NSPopUpButton *_saveChanges;  // Save settings to folder when
     IBOutlet NSTextField *_saveChangesLabel;
+
+    IBOutlet NSButton *_useCustomScriptsFolder;
+    IBOutlet NSTextField *_customScriptsFolder;
+    IBOutlet NSImageView *_customScriptsFolderWarning;
+    IBOutlet NSButton *_browseCustomScriptsFolder;
 
     // Copy to clipboard on selection
     IBOutlet NSButton *_selectionCopiesText;
@@ -134,11 +148,27 @@ enum {
     IBOutlet NSButton *_unpauseTmuxAutomatically;
     IBOutlet NSButton *_tmuxWarnBeforePausing;
 
+    IBOutlet NSButton *_syncTmuxClipboard;
+
     IBOutlet NSTabView *_tabView;
 
     IBOutlet NSButton *_enterCopyModeAutomatically;
     IBOutlet NSButton *_warningButton;
     iTermUserDefaultsObserver *_observer;
+
+    IBOutlet NSPopUpButton *_allowsSendingClipboardContents;
+    IBOutlet NSTextField *_allowsSendingClipboardContentsLabel;
+
+    IBOutlet NSButton *_disableConfirmationOnShutdown;
+
+    IBOutlet NSTextField *_openAIAPIKey;
+    IBOutlet NSTextField *_openAIAPIKeyLabel;
+
+    IBOutlet NSTextField *_aiPrompt;
+    IBOutlet NSTextField *_aiPromptLabel;
+    IBOutlet NSImageView *_aiPromptWarning;  // Image shown when prompt lacks \(ai.prompt)
+
+    BOOL _customScriptsFolderDidChange;
 }
 
 - (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil {
@@ -151,6 +181,10 @@ enum {
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(didRevertPythonAuthenticationMethod:)
                                                      name:iTermAPIHelperDidDetectChangeOfPythonAuthMethodNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(updateAlwaysOpenLegend)
+                                                     name:iTermSessionBuriedStateChangeTabNotification
                                                    object:nil];
         _observer = [[iTermUserDefaultsObserver alloc] init];
         __weak __typeof(self) weakSelf = self;
@@ -213,6 +247,18 @@ enum {
              return YES;
          }];
     [_openDefaultWindowArrangementItem setEnabled:[WindowArrangements count] > 0];
+
+    [self defineControl:_restoreWindowsToSameSpaces
+                    key:kPreferenceKeyRestoreWindowsToSameSpaces
+            relatedView:nil
+                   type:kPreferenceInfoTypeCheckbox];
+
+    [self defineControl:_alwaysOpenWindowAtStartup
+                    key:kPreferenceKeyAlwaysOpenWindowAtStartup
+            relatedView:nil
+                   type:kPreferenceInfoTypeCheckbox];
+    [self updateAlwaysOpenLegend];
+
     [self defineControl:_quitWhenAllWindowsClosed
                     key:kPreferenceKeyQuitWhenAllWindowsClosed
             relatedView:nil
@@ -230,6 +276,11 @@ enum {
     info.onChange = ^{
         [weakSelf updateEnabledState];
     };
+
+    [self defineControl:_disableConfirmationOnShutdown
+                    key:kPreferenceKeyNeverBlockSystemShutdown
+            relatedView:nil
+                   type:kPreferenceInfoTypeCheckbox];
 
     [self defineControl:_evenIfThereAreNoWindows
                     key:kPreferenceKeyPromptOnQuitEvenIfThereAreNoWindows
@@ -250,19 +301,13 @@ enum {
         [[iTermShellHistoryController sharedInstance] backingStoreTypeDidChange];
     };
 
-    if (@available(macOS 10.12, *)) {
-        info = [self defineControl:_gpuRendering
-                               key:kPreferenceKeyUseMetal
-                       relatedView:nil
-                              type:kPreferenceInfoTypeCheckbox];
-        info.observer = ^{
-            [weakSelf updateAdvancedGPUEnabled];
-        };
-    } else {
-        _gpuRendering.enabled = NO;
-        _gpuRendering.state = NSControlStateValueOff;
-        [self updateAdvancedGPUEnabled];
-    }
+    info = [self defineControl:_gpuRendering
+                           key:kPreferenceKeyUseMetal
+                   relatedView:nil
+                          type:kPreferenceInfoTypeCheckbox];
+    info.observer = ^{
+        [weakSelf updateAdvancedGPUEnabled];
+    };
 
     info = [self defineControl:_enableAPI
                            key:kPreferenceKeyEnableAPIServer
@@ -309,6 +354,15 @@ enum {
         [[NSNotificationCenter defaultCenter] postNotificationName:iTermMetalSettingsDidChangeNotification object:nil];
     };
 
+    _advancedGPUWindowController.viewController.disableInLowPowerMode.target = self;
+    _advancedGPUWindowController.viewController.disableInLowPowerMode.action = @selector(settingChanged:);
+    info = [self defineUnsearchableControl:_advancedGPUWindowController.viewController.disableInLowPowerMode
+                                       key:kPreferenceKeyDisableInLowPowerMode
+                                      type:kPreferenceInfoTypeCheckbox];
+    info.observer = ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:iTermMetalSettingsDidChangeNotification object:nil];
+    };
+
     _advancedGPUWindowController.viewController.preferIntegratedGPU.target = self;
     _advancedGPUWindowController.viewController.preferIntegratedGPU.action = @selector(settingChanged:);
     info = [self defineUnsearchableControl:_advancedGPUWindowController.viewController.preferIntegratedGPU
@@ -339,12 +393,18 @@ enum {
     [self addViewToSearchIndex:_advancedGPUPrefsButton
                    displayName:@"Advanced GPU settings"
                        phrases:@[ _advancedGPUWindowController.viewController.disableWhenDisconnected.title,
+                                  _advancedGPUWindowController.viewController.disableInLowPowerMode.title,
                                   _advancedGPUWindowController.viewController.preferIntegratedGPU.title,
                                   _advancedGPUWindowController.viewController.maximizeThroughput.title ]
                            key:nil];
 
     [self defineControl:_enableBonjour
                     key:kPreferenceKeyAddBonjourHostsToProfiles
+            relatedView:nil
+                   type:kPreferenceInfoTypeCheckbox];
+
+    [self defineControl:_notifyOnlyCriticalShellIntegrationUpdates
+                    key:kPreferenceKeyNotifyOnlyForCriticalShellIntegrationUpdates
             relatedView:nil
                    type:kPreferenceInfoTypeCheckbox];
 
@@ -361,6 +421,36 @@ enum {
                     key:kPreferenceKeyCheckForTestReleases
             relatedView:nil
                    type:kPreferenceInfoTypeCheckbox];
+
+    // ---------------------------------------------------------------------------------------------
+    info = [self defineControl:_useCustomScriptsFolder
+                           key:kPreferenceKeyUseCustomScriptsFolder
+                   relatedView:nil
+                          type:kPreferenceInfoTypeCheckbox];
+    info.onChange = ^() {
+        [self useCustomScriptsFolderDidChange];
+        [weakSelf customScriptsFolderDidChange];
+        [weakSelf postCustomScriptsFolderDidChangeNotificationIfNeeded];
+    };
+    info.observer = ^() { [self updateCustomScriptsFolderViews]; };
+
+    info = [self defineControl:_customScriptsFolder
+                           key:kPreferenceKeyCustomScriptsFolder
+                   relatedView:nil
+                          type:kPreferenceInfoTypeStringTextField];
+    info.shouldBeEnabled = ^BOOL() {
+        return [iTermPreferences boolForKey:kPreferenceKeyUseCustomScriptsFolder];
+    };
+    info.onChange = ^() {
+        [self updateCustomScriptsFolderViews];
+        [weakSelf customScriptsFolderDidChange];
+    };
+    info.controlTextDidEndEditing = ^(NSNotification *notif) {
+        // Post here instead of onChange since a patial path, like "/", would kick off a very slow
+        // recursive search for scripts.
+        [weakSelf postCustomScriptsFolderDidChangeNotificationIfNeeded];
+    };
+    [self updateCustomScriptsFolderViews];
 
     // ---------------------------------------------------------------------------------------------
     info = [self defineControl:_loadPrefsFromCustomFolder
@@ -514,15 +604,104 @@ enum {
                     key:kPreferenceKeyTmuxWarnBeforePausing
             displayName:nil
                    type:kPreferenceInfoTypeCheckbox];
-    
+    [self defineControl:_syncTmuxClipboard
+                    key:kPreferenceKeyTmuxSyncClipboard
+            displayName:nil
+                   type:kPreferenceInfoTypeCheckbox];
+
+    [self defineControl:_openAIAPIKey
+                    key:kPreferenceKeyOpenAIAPIKey
+            relatedView:_openAIAPIKeyLabel
+                   type:kPreferenceInfoTypeStringTextField];
+    info = [self defineControl:_aiPrompt
+                           key:kPreferenceKeyAIPrompt
+                   relatedView:_aiPromptLabel
+                          type:kPreferenceInfoTypeStringTextField];
+    info.observer = ^{
+        [weakSelf updateAIPromptWarning];
+    };
+
+    info = [self defineControl:_allowsSendingClipboardContents
+                           key:kPreferenceKeyPhonyAllowSendingClipboardContents
+                   relatedView:_allowsSendingClipboardContentsLabel
+                          type:kPreferenceInfoTypePopup];
+    info.syntheticGetter = ^id{
+        return @([iTermPasteboardReporter configuration]);
+    };
+    info.syntheticSetter = ^(NSNumber *newValue) {
+        [iTermPasteboardReporter setConfiguration:newValue.intValue];
+    };
+    PreferenceInfo *allowSendingClipboardInfo = info;
+
     [self updateEnabledState];
     [self commitControls];
+    [self updateValueForInfo:allowSendingClipboardInfo];
+}
+
+- (void)customScriptsFolderDidChange {
+    _customScriptsFolderDidChange = YES;
+}
+
+- (void)postCustomScriptsFolderDidChangeNotificationIfNeeded {
+    if (_customScriptsFolderDidChange) {
+        _customScriptsFolderDidChange = NO;
+        [[NSNotificationCenter defaultCenter] postNotificationName:iTermScriptsFolderDidChange object:nil];
+    }
+}
+
+- (void)windowWillClose {
+    [self postCustomScriptsFolderDidChangeNotificationIfNeeded];
+}
+
+- (void)willDeselectTab {
+    [self postCustomScriptsFolderDidChangeNotificationIfNeeded];
+}
+
+- (void)updateAIPromptWarning {
+    if ([[self stringForKey:kPreferenceKeyAIPrompt] containsString:@"\\(ai.prompt)"]) {
+        _aiPromptWarning.alphaValue = 0.0;
+    } else {
+        _aiPromptWarning.alphaValue = 1.0;
+    }
+}
+
+- (NSString *)alwaysOpenLegend {
+    if ([iTermScriptsMenuController autoLaunchFolderExists]) {
+        return @"The presence of auto-launch scripts disables opening a window at startup.";
+    }
+    if ([[[iTermHotKeyController sharedInstance] profileHotKeys] count] > 0) {
+        return @"The existence of hotkey windows disables opening a window at startup.";
+    }
+    if ([[[iTermBuriedSessions sharedInstance] buriedSessions] count] > 0) {
+        return @"The existence of buried sessions disables opening a window at startup.";
+    }
+    return nil;
+}
+
+- (void)updateAlwaysOpenLegend {
+    NSString *legend = [self alwaysOpenLegend];
+    if (!legend) {
+        _alwaysOpenLegend.hidden = YES;
+        return;
+    }
+    _alwaysOpenLegend.stringValue = legend;
+    _alwaysOpenLegend.hidden = NO;
 }
 
 - (void)updateAPIEnabledState {
     _enableAPI.state = [self boolForKey:kPreferenceKeyEnableAPIServer];
     [_apiPermission selectItemWithTag:[iTermAPIHelper requireApplescriptAuth] ? 0 : 1];
     [self updateEnabledState];
+}
+
+- (BOOL)shouldEnableAlwaysOpenWindowAtStartup {
+    if ([self boolForKey:kPreferenceKeyOpenArrangementAtStartup]) {
+        return NO;
+    }
+    if ([self boolForKey:kPreferenceKeyOpenNoWindowsAtStartup]) {
+        return NO;
+    }
+    return YES;
 }
 
 - (void)updateEnabledState {
@@ -533,14 +712,12 @@ enum {
                                              ![self boolForKey:kPreferenceKeyOpenNoWindowsAtStartup]);
     const BOOL systemRestorationEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"NSQuitAlwaysKeepsWindows"];
     _warningButton.hidden = (!useSystemWindowRestoration || systemRestorationEnabled);
+    _alwaysOpenWindowAtStartup.enabled = [self shouldEnableAlwaysOpenWindowAtStartup];
+    _restoreWindowsToSameSpaces.enabled = systemRestorationEnabled && useSystemWindowRestoration;
 }
 
 - (void)updateAdvancedGPUEnabled {
-    if (@available(macOS 10.12, *)) {
-        _advancedGPU.enabled = [self boolForKey:kPreferenceKeyUseMetal];
-    } else {
-        _advancedGPU.enabled = NO;
-    }
+    _advancedGPU.enabled = [self boolForKey:kPreferenceKeyUseMetal];
 }
 
 - (BOOL)enableAPISettingDidChange {
@@ -570,9 +747,36 @@ enum {
 
 #pragma mark - Actions
 
+- (IBAction)exportAllSettingsAndData:(id)sender {
+    [self showMessage:[iTerm2ImportExport exportAll] title:@"Problem Exporting"];
+}
+
+- (IBAction)importAllSettingsAndData:(id)sender {
+    [self showMessage:[iTerm2ImportExport importAll] title:@"Problem Importing"];
+}
+
+- (void)showMessage:(NSString *)message title:(NSString *)title {
+    if (!message) {
+        return;
+    }
+    [iTermWarning showWarningWithTitle:message
+                               actions:@[ @"OK" ]
+                             accessory:nil
+                            identifier:nil
+                           silenceable:kiTermWarningTypePersistent
+                               heading:title
+                                window:self.view.window];
+}
+
 - (IBAction)warning:(id)sender {
+    NSString *message;
+    if (@available(macOS 14, *)) {
+        message = @"System window restoration has been disabled, which prevents iTerm2 from respecting this setting. Disable ”System Settings > Desktop & Dock > Close windows when quitting an application“ to enable window restoration.";
+    } else {
+        message = @"System window restoration has been disabled, which prevents iTerm2 from respecting this setting. Disable System Preferences > General > Close windows when quitting an app to enable window restoration.";
+    }
     const iTermWarningSelection selection =
-    [iTermWarning showWarningWithTitle:@"System window restoration has been disabled, which prevents iTerm2 from respecting this setting. Disable System Preferences > General > Close windows when quitting an app to enable window restoration."
+    [iTermWarning showWarningWithTitle:message
                                actions:@[ @"Open System Preferences", @"OK" ]
                              accessory:nil
                             identifier:@"NoSyncWindowRestorationDisabled"
@@ -601,6 +805,15 @@ enum {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://iterm2.com/python-api-auth.html"]];
 }
 
+- (IBAction)resetAIPrompt:(id)sender {
+    [self setString:iTermDefaultAIPrompt forKey:kPreferenceKeyAIPrompt];
+    _aiPrompt.stringValue = iTermDefaultAIPrompt;
+}
+
+- (IBAction)aiPromptHelp:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://iterm2.com/ai-prompt-help"]];
+}
+
 #pragma mark - Notifications
 
 - (void)savedArrangementChanged:(id)sender {
@@ -614,7 +827,30 @@ enum {
     [self updateAPIEnabledState];
 }
 
+- (void)preferenceDidChangeFromOtherPanel:(NSNotification *)notification {
+    [self updateAlwaysOpenLegend];
+    [super preferenceDidChangeFromOtherPanel:notification];
+}
+
+
 #pragma mark - Remote Prefs
+
+- (void)updateCustomScriptsFolderViews {
+    BOOL haveCustomFolder = [iTermPreferences boolForKey:kPreferenceKeyUseCustomScriptsFolder];
+    _browseCustomScriptsFolder.enabled = haveCustomFolder;
+    _customScriptsFolder.enabled = haveCustomFolder;
+    if (haveCustomFolder) {
+        _customScriptsFolderWarning.alphaValue = 1;
+    } else {
+        if (_customScriptsFolder.stringValue.length > 0) {
+            _customScriptsFolderWarning.alphaValue = 0.5;
+        } else {
+            _customScriptsFolderWarning.alphaValue = 0;
+        }
+    }
+    const BOOL locationIsValid = [[NSFileManager defaultManager] customScriptsFolderIsValid:_customScriptsFolder.stringValue];
+    _customScriptsFolderWarning.image = locationIsValid ? [NSImage it_imageNamed:@"CheckMark" forClass:self.class] : [NSImage it_imageNamed:@"WarningSign" forClass:self.class];
+}
 
 - (void)updateRemotePrefsViews {
     BOOL shouldLoadRemotePrefs =
@@ -640,6 +876,21 @@ enum {
     [_saveChanges setEnabled:isValidFile];
     [_saveChangesLabel setLabelEnabled:isValidFile];
     [_pushToCustomFolder setEnabled:isValidFile];
+}
+
+- (void)useCustomScriptsFolderDidChange {
+    const BOOL newValue = [iTermPreferences boolForKey:kPreferenceKeyUseCustomScriptsFolder];
+    [self updateCustomScriptsFolderViews];
+    if (newValue) {
+        // Just turned it on
+        if ([[_customScriptsFolder stringValue] length] == 0) {
+            // Filed was initially empty so browse for a dir.
+            if ([self chooseCustomScriptsFolder]) {
+                [[NSNotificationCenter defaultCenter] postNotificationName:iTermScriptsFolderDidChange object:nil];
+            }
+        }
+    }
+    [self updateCustomScriptsFolderViews];
 }
 
 - (void)loadPrefsFromCustomFolderDidChange {
@@ -669,6 +920,21 @@ enum {
 - (BOOL)pasteboardHasGitlabURL {
     NSString *pasteboardString = [NSString stringFromPasteboard];
     return [pasteboardString isMatchedByRegex:@"^https://gitlab.com/gnachman/iterm2/uploads/[a-f0-9]*/com.googlecode.iterm2.plist$"];
+}
+
+- (BOOL)chooseCustomScriptsFolder {
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    [panel setCanChooseFiles:NO];
+    [panel setCanChooseDirectories:YES];
+    [panel setAllowsMultipleSelection:NO];
+
+    if ([panel runModal] == NSModalResponseOK && panel.directoryURL.path) {
+        [_customScriptsFolder setStringValue:panel.directoryURL.path];
+        [self settingChanged:_customScriptsFolder];
+        return YES;
+    }  else {
+        return NO;
+    }
 }
 
 - (BOOL)choosePrefsCustomFolder {

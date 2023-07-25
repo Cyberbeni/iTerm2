@@ -6,6 +6,7 @@
 #import "FutureMethods.h"
 #import "FutureMethods.h"
 #import "ITAddressBookMgr.h"
+#import "iTerm2SharedARC-Swift.h"
 #import "iTerm.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermApplicationDelegate.h"
@@ -91,6 +92,11 @@
 
 #import <WebKit/WebKit.h>
 
+NSTimeInterval PTYTextViewHighlightLineAnimationDuration = 0.75;
+
+NSNotificationName iTermPortholesDidChange = @"iTermPortholesDidChange";
+NSNotificationName PTYTextViewWillChangeFontNotification = @"PTYTextViewWillChangeFontNotification";
+
 @interface iTermHighlightRowView: NSView<iTermMetalDisabling>
 @end
 
@@ -169,13 +175,11 @@
     iTermScrollAccumulator *_scrollAccumulator;
 
     iTermRateLimitedUpdate *_shadowRateLimit;
+    NSMutableArray<PTYNoteViewController *> *_notes;
+    iTermScrollAccumulator *_horizontalScrollAccumulator;
+    BOOL _cursorVisible;
 }
 
-
-- (instancetype)initWithFrame:(NSRect)frameRect {
-    // Must call initWithFrame:colorMap:.
-    assert(false);
-}
 
 // This is an attempt to fix performance problems that appeared in macOS 10.14
 // (rdar://45295749, also mentioned in PTYScrollView.m).
@@ -199,10 +203,7 @@
 // app settings and make a maximized window on a 2014 iMac. Run tests/spam.cc.
 // You should get just about 60 fps if it's fast, and 30-45 if it's slow.
 + (BOOL)useLayerForBetterPerformance {
-    if (@available(macOS 10.14, *)) {
-        return ![iTermAdvancedSettingsModel dismemberScrollView];
-    }
-    return NO;
+    return ![iTermAdvancedSettingsModel dismemberScrollView];
 }
 
 + (NSSize)charSizeForFont:(NSFont *)aFont
@@ -217,7 +218,7 @@
     return size;
 }
 
-- (instancetype)initWithFrame:(NSRect)aRect colorMap:(iTermColorMap *)colorMap {
+- (instancetype)initWithFrame:(NSRect)aRect {
     self = [super initWithFrame:aRect];
     if (self) {
         // This class has a complicated role.
@@ -254,13 +255,8 @@
         _drawingHelper = [[iTermTextDrawingHelper alloc] init];
         _drawingHelper.delegate = self;
 
-        _colorMap = [colorMap retain];
-        _colorMap.delegate = self;
-
-        _drawingHelper.colorMap = colorMap;
-
         [self updateMarkedTextAttributes];
-        _drawingHelper.cursorVisible = YES;
+        _cursorVisible = YES;
         _selection = [[iTermSelection alloc] init];
         _selection.delegate = self;
         _oldSelection = [_selection copy];
@@ -279,7 +275,7 @@
                                                    object:nil];
         [self useBackgroundIndicatorChanged:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(_settingsChanged:)
+                                                 selector:@selector(refreshTerminal:)
                                                      name:kRefreshTerminalNotification
                                                    object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self
@@ -295,8 +291,7 @@
         _contextMenuHelper = [[iTermTextViewContextMenuHelper alloc] initWithURLActionHelper:_urlActionHelper];
         _urlActionHelper.smartSelectionActionTarget = _contextMenuHelper;
 
-        _primaryFont = [[PTYFontInfo alloc] init];
-        _secondaryFont = [[PTYFontInfo alloc] init];
+        _fontTable = [[iTermFontTable alloc] init];
 
         DLog(@"Begin tracking touches in view %@", self);
         self.allowedTouchTypes = NSTouchTypeMaskIndirect;
@@ -324,6 +319,11 @@
         [self refuseFirstResponderAtCurrentMouseLocation];
 
         _scrollAccumulator = [[iTermScrollAccumulator alloc] init];
+
+        _horizontalScrollAccumulator = [[iTermScrollAccumulator alloc] init];
+        _horizontalScrollAccumulator.sensitivity = [iTermAdvancedSettingsModel horizontalScrollingSensitivity];
+        _horizontalScrollAccumulator.isVertical = NO;
+
         _keyboardHandler = [[iTermKeyboardHandler alloc] init];
         _keyboardHandler.delegate = self;
 
@@ -333,7 +333,9 @@
                                      pointerControllerDelegate:self
                      mouseReportingFrustrationDetectorDelegate:self];
         _mouseHandler.mouseDelegate = self;
-
+        _notes = [[NSMutableArray alloc] init];
+        _portholes = [[NSMutableArray alloc] init];
+        _trackingChildWindows = [[NSMutableArray alloc] init];
         [self initARC];
     }
     return self;
@@ -352,11 +354,9 @@
     [_findCursorWindow release];
 
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    _colorMap.delegate = nil;
     [_colorMap release];
 
-    [_primaryFont release];
-    [_secondaryFont release];
+    [_fontTable release];
 
     [_markedTextAttributes release];
 
@@ -382,14 +382,28 @@
     [_contextMenuHelper release];
     [_highlightedRows release];
     [_scrollAccumulator release];
+    [_horizontalScrollAccumulator release];
     [_shadowRateLimit release];
     _keyboardHandler.delegate = nil;
     [_keyboardHandler release];
     _urlActionHelper.delegate = nil;
     [_urlActionHelper release];
     [_indicatorMessagePopoverViewController release];
+    [_notes release];
+    [_lastUrlActionCanceler release];
+    [_portholes release];
+    [_portholesNeedUpdatesJoiner release];
+    [_trackingChildWindows release];
 
     [super dealloc];
+}
+
+- (void)setDataSource:(id<PTYTextViewDataSource>)dataSource {
+    _dataSource = dataSource;
+    if (dataSource) {
+        [_colorMap autorelease];
+        _colorMap = [_dataSource.colorMap retain];
+    }
 }
 
 #pragma mark - NSObject
@@ -462,15 +476,21 @@
         // We always validate the above commands
         return YES;
     }
+    if ([item action]==@selector(performFindPanelAction:) && item.tag == NSFindPanelActionShowFindPanel) {
+        return YES;
+    }
     if ([item action]==@selector(copy:) ||
         [item action]==@selector(copyWithStyles:) ||
-        [item action]==@selector(copyWithControlSequences:) ||
-        [item action]==@selector(performFindPanelAction:) ||
+        [item action]==@selector(copyWithControlSequences:)) {
+        // These commands are allowed only if there is a selection.
+        return [_selection hasSelection] || [self anyPortholeHasSelection];
+    }
+    if (([item action]==@selector(performFindPanelAction:) && item.tag == NSFindPanelActionSetFindString) ||
         ([item action]==@selector(print:) && [item tag] == 1)) { // print selection
         // These commands are allowed only if there is a selection.
         return [_selection hasSelection];
     } else if ([item action]==@selector(pasteSelection:)) {
-        return [[iTermController sharedInstance] lastSelection] != nil;
+        return [[iTermController sharedInstance] lastSelectionPromise] != nil && [[iTermController sharedInstance] lastSelectionPromise].maybeError == nil;
     } else if ([item action]==@selector(selectOutputOfLastCommand:)) {
         return [_delegate textViewCanSelectOutputOfLastCommand];
     } else if ([item action]==@selector(selectCurrentCommand:)) {
@@ -495,12 +515,19 @@
     if (item.action == @selector(terminalStateReset:)) {
         return YES;
     }
+    if (item.action == @selector(revealContentNavigationShortcuts:)) {
+        return self.findOnPageHelper.searchResults.count > 0;
+    }
 
     SEL theSel = [item action];
     if ([NSStringFromSelector(theSel) hasPrefix:@"contextMenuAction"]) {
         return YES;
     }
     return [self arcValidateMenuItem:item];
+}
+
+- (BOOL)it_isTerminalResponder {
+    return YES;
 }
 
 - (BOOL)resignFirstResponder {
@@ -676,7 +703,8 @@
                         NULL,
                         NULL,
                         [_delegate textViewUnicodeNormalizationForm],
-                        [_delegate textViewUnicodeVersion]);
+                        [_delegate textViewUnicodeVersion],
+                        self.dataSource.terminalSoftAlternateScreenMode);
 
     // Count how many additional cells are needed due to double-width chars
     // that span line breaks being wrapped to the next line.
@@ -689,7 +717,7 @@
     int extra = 0;
     int curX = x;
     for (int i = 0; i < len; ++i) {
-        if (curX == 0 && buf[i].code == DWC_RIGHT) {
+        if (curX == 0 && ScreenCharIsDWC_RIGHT(buf[i])) {
             ++extra;
             ++curX;
         }
@@ -786,6 +814,10 @@
     }];
 }
 
+- (void)lockScroll {
+    [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) setUserScroll:YES];
+}
+
 - (void)_scrollToLine:(int)line {
     NSRect aFrame;
     aFrame.origin.x = 0;
@@ -795,7 +827,7 @@
     [self scrollRectToVisible:aFrame];
 }
 
-- (void)_scrollToCenterLine:(int)line {
+- (void)scrollToCenterLine:(int)line {
     NSRect visible = [self visibleRect];
     int visibleLines = (visible.size.height - [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins] * 2) / _lineHeight;
     int lineMargin = (visibleLines - 1) / 2;
@@ -818,13 +850,15 @@
 - (void)scrollLineNumberRangeIntoView:(VT100GridRange)range {
     NSRect visibleRect = [[self enclosingScrollView] documentVisibleRect];
     int firstVisibleLine = visibleRect.origin.y / _lineHeight;
-    int lastVisibleLine = firstVisibleLine + [_dataSource height] - 1;
-    if (range.location >= firstVisibleLine && range.location + range.length <= lastVisibleLine) {
+    const int lastVisibleLine = firstVisibleLine + [_dataSource height];
+    const NSRange desiredRange = NSMakeRange(range.location, range.length);
+    const NSRange currentlyVisibleRange = NSMakeRange(firstVisibleLine, lastVisibleLine - firstVisibleLine);
+    if (NSIntersectionRange(desiredRange, currentlyVisibleRange).length == MIN(desiredRange.length, currentlyVisibleRange.length)) {
       // Already visible
       return;
     }
     if (range.length < [_dataSource height]) {
-        [self _scrollToCenterLine:range.location + range.length / 2];
+        [self scrollToCenterLine:range.location + range.length / 2];
     } else {
         const VT100GridRange rangeOfVisibleLines = [self rangeOfVisibleLines];
         const int currentBottomLine = rangeOfVisibleLines.location + rangeOfVisibleLines.length;
@@ -836,10 +870,6 @@
 }
 
 #pragma mark - NSView
-
-- (void)setAlphaValue:(CGFloat)alphaValue {
-    assert(NO);
-}
 
 // Overrides an NSView method.
 - (NSRect)adjustScroll:(NSRect)proposedVisibleRect {
@@ -870,6 +900,10 @@
 - (void)viewDidChangeBackingProperties {
     CGFloat scale = [[[self window] screen] backingScaleFactor];
     BOOL isRetina = scale > 1;
+    [self setDrawingHelperIsRetina:isRetina];
+}
+
+- (void)setDrawingHelperIsRetina:(BOOL)isRetina {
     _drawingHelper.antiAliasedShift = isRetina ? 0.5 : 0;
     _drawingHelper.isRetina = isRetina;
 }
@@ -891,12 +925,16 @@
 }
 
 - (BOOL)isOpaque {
-    return YES;
+    return NO;
 }
 
 - (void)setFrameSize:(NSSize)newSize {
+    DLog(@"Set frame size to %@ from\n%@",
+          NSStringFromSize(newSize),
+          [NSThread callStackSymbols]);
     [super setFrameSize:newSize];
     [self recomputeBadgeLabel];
+    [self updatePortholeFrames];
 }
 
 #pragma mark Set Needs Display Helpers
@@ -956,11 +994,7 @@
 #pragma mark - NSView Mouse-Related Overrides
 
 - (BOOL)wantsScrollEventsForSwipeTrackingOnAxis:(NSEventGestureAxis)axis {
-    if (@available(macOS 10.14, *)) {
-        return (axis == NSEventGestureAxisHorizontal) ? YES : NO;
-    } else {
-        return [super wantsScrollEventsForSwipeTrackingOnAxis:axis];
-    }
+    return (axis == NSEventGestureAxisHorizontal) ? YES : NO;
 }
 
 - (void)scrollWheel:(NSEvent *)event {
@@ -972,6 +1006,7 @@
 }
 
 - (void)mouseDown:(NSEvent *)event {
+    [self.delegate textViewWillHandleMouseDown:event];
     [_mouseHandler mouseDown:event superCaller:^{ [super mouseDown:event]; }];
 }
 
@@ -1094,7 +1129,8 @@
         DLog(@"Ignore mouse exited because app is not active");
     }
     [self updateUnderlinedURLs:event];
-    [_delegate textViewShowHoverURL:nil];
+    [_delegate textViewShowHoverURL:nil
+                             anchor:VT100GridWindowedRangeMake(VT100GridCoordRangeMake(-1, -1, -1, -1), -1, -1)];
 }
 
 - (void)mouseEntered:(NSEvent *)event {
@@ -1112,6 +1148,11 @@
         }
     }
     [self updateUnderlinedURLs:event];
+    if ([self hitTest:[self convertPoint:event.locationInWindow fromView:nil]] == nil) {
+        DLog(@"Event %@ at window coord %@ failed hit test for view with window coords %@",
+             event, NSStringFromPoint(event.locationInWindow), NSStringFromRect([self convertRect:self.bounds toView:nil]));
+        return;
+    }
     if ([iTermPreferences boolForKey:kPreferenceKeyFocusFollowsMouse] &&
         [[self window] alphaValue] > 0 &&
         ![NSApp modalWindow]) {
@@ -1183,20 +1224,20 @@
 // We don't draw exactly the document visible rect because there could be scrollback overflow
 // accumulated between the last call to -refresh and when it's time to draw. If `userScroll` is
 // on then we want to draw the rect you have scrolled to in order to keep it from bouncing around.
+// Note also that this excludes the top margin.
 - (NSRect)adjustedDocumentVisibleRect {
-    const NSRect documentVisibleRect = self.enclosingScrollView.documentVisibleRect;
     const BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
     if (!userScroll) {
-        DLog(@"User scroll is off so return documentVisibleRect of %@", NSStringFromRect(documentVisibleRect));
-        return documentVisibleRect;
+        const NSRect result = [self bottommostRectExcludingTopMargin];
+        DLog(@"User scroll is off so return bottommost rect of %@", NSStringFromRect(result));
+        return result;
     }
+    const NSRect documentVisibleRect = self.enclosingScrollView.documentVisibleRect;
     const int overflow = [_dataSource scrollbackOverflow];
-    NSRect adjusted = [self rect:documentVisibleRect minusRows:overflow];
-    DLog(@"adjustedDocumentVisibleRect is %@ with overflow %@", NSStringFromRect(adjusted), @(overflow));
-    if (adjusted.origin.y < 0) {
-        adjusted.origin.y = 0;
-    }
-    return adjusted;
+    const int firstRow = MAX(0, documentVisibleRect.origin.y / _lineHeight - overflow) + _drawingHelper.numberOfIMELines;
+    const NSRect result = [self visibleRectExcludingTopMarginStartingAtRow:firstRow];
+    DLog(@"adjustedDocumentVisibleRect is %@", NSStringFromRect(result));
+    return result;
 }
 
 - (CGFloat)virtualOffset {
@@ -1212,7 +1253,7 @@
     // called. Force the last lines to be drawn so the screen doesn't appear to jump as in issue
     // 9676.
     const int height = _dataSource.height;
-    const CGFloat virtualOffset = (_dataSource.numberOfLines - height) * _lineHeight - [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins];
+    const CGFloat virtualOffset = (_dataSource.numberOfLines - height + _drawingHelper.numberOfIMELines) * _lineHeight - [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins];
     DLog(@"Force draw last rows. numberOfLines=%@ height=%@ lineHeight=%@ bottomMargins=%@ -> virtualOffset=%@",
          @(_dataSource.numberOfLines), @(height), @(_lineHeight), @([iTermPreferences intForKey:kPreferenceKeyTopBottomMargins]), @(virtualOffset));
     return virtualOffset;
@@ -1275,7 +1316,8 @@
         [_indicatorsHelper drawInFrame:NSRectSubtractingVirtualOffset(_drawingHelper.indicatorFrame, MAX(0, virtualOffset))];
         [NSGraphicsContext restoreGraphicsState];
         [_drawingHelper drawTimestampsWithVirtualOffset:virtualOffset];
-
+        [_drawingHelper drawOffscreenCommandLineWithVirtualOffset:virtualOffset];
+        
         // Not sure why this is needed, but for some reason this view draws over its subviews.
         for (NSView *subview in [self subviews]) {
             [subview setNeedsDisplay:YES];
@@ -1289,46 +1331,68 @@
         }
     }];
     [self maybeInvalidateWindowShadow];
+    [self shiftTrackingChildWindows];
 }
 
+// This view is visible only when annotations are revealed. They are subviews, and while macOS does
+// sometimes decide to draw subviews of alpha=0 views, it doesn't always! So we make ourselves
+// alpha=1 but clear when an annotation is visible.
 - (void)drawRect:(NSRect)rect {
+    [[NSColor clearColor] set];
+    NSRectFillUsingOperation(rect, NSCompositingOperationCopy);
 }
 
+// Note that this isn't actually the visible rect because it starts below the top margin.
 - (NSRect)textDrawingHelperVisibleRect {
-    const BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
-    if (userScroll) {
-        return [self adjustedDocumentVisibleRect];
-    } else {
-        // This is necessary because of the special case in -drawRect:inView:
-        const int height = _dataSource.height;
-        NSRect rect = self.enclosingScrollView.documentVisibleRect;
-        rect.origin.y = (_dataSource.numberOfLines - height) * _lineHeight;
-        return rect;
-    }
+    return [self adjustedDocumentVisibleRect];
+}
+
+- (NSRect)bottommostRectExcludingTopMargin {
+    const int height = _dataSource.height;
+    return [self visibleRectExcludingTopMarginStartingAtRow:_dataSource.numberOfLines - height + _drawingHelper.numberOfIMELines];
+}
+
+- (NSRect)visibleRectExcludingTopMarginStartingAtRow:(int)row {
+    // This is necessary because of the special case in -drawRect:inView:
+    NSRect rect = self.enclosingScrollView.documentVisibleRect;
+    // Subtract the top margin's height.
+    rect.size.height -= [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins];
+    rect.origin.y = row * _lineHeight;
+    return rect;
 }
 
 - (void)performBlockWithFlickerFixerGrid:(void (NS_NOESCAPE ^)(void))block {
-    PTYTextViewSynchronousUpdateState *originalState = nil;
-    PTYTextViewSynchronousUpdateState *savedState = [_dataSource setUseSavedGridIfAvailable:YES];
-    if (savedState) {
-        originalState = [[[PTYTextViewSynchronousUpdateState alloc] init] autorelease];
-        originalState.colorMap = _colorMap;
-        originalState.cursorVisible = _drawingHelper.cursorVisible;
+    __block PTYTextViewSynchronousUpdateState *originalState = nil;
+    [_dataSource performBlockWithSavedGrid:^(id<PTYTextViewSynchronousUpdateStateReading>  _Nullable savedState) {
+        if (savedState) {
+            originalState = [self syncUpdateState];
+            DLog(@"PTYTextView.performBlockWithFlickerFixerGrid: set cusrorVisible=%@", _cursorVisible ? @"true": @"false");
+            [self loadSyncUpdateState:savedState];
+        } else {
+            DLog(@"PTYTextView.performBlockWithFlickerFixerGrid: (no saved grid) cusrorVisible=%@", _cursorVisible ? @"true": @"false");
+        }
 
-        _drawingHelper.cursorVisible = savedState.cursorVisible;
-        _drawingHelper.colorMap = savedState.colorMap;
-        _colorMap = savedState.colorMap;
-    }
-
-    block();
-
-    [_dataSource setUseSavedGridIfAvailable:NO];
+        block();
+    }];
     if (originalState) {
-        _drawingHelper.colorMap = originalState.colorMap;
-        _colorMap = originalState.colorMap;
-        _drawingHelper.cursorVisible = originalState.cursorVisible;
+        [self loadSyncUpdateState:originalState];
     }
 }
+
+- (void)loadSyncUpdateState:(id<PTYTextViewSynchronousUpdateStateReading>)savedState {
+    _cursorVisible = savedState.cursorVisible;
+    _drawingHelper.colorMap = savedState.colorMap;
+    [_colorMap autorelease];
+    _colorMap = [savedState.colorMap retain];
+}
+
+- (PTYTextViewSynchronousUpdateState *)syncUpdateState {
+    PTYTextViewSynchronousUpdateState *originalState = [[[PTYTextViewSynchronousUpdateState alloc] init] autorelease];
+    originalState.colorMap = _colorMap;
+    originalState.cursorVisible = _cursorVisible;
+    return originalState;
+}
+
 
 - (void)setSuppressDrawing:(BOOL)suppressDrawing {
     if (suppressDrawing == _suppressDrawing) {
@@ -1369,7 +1433,7 @@
                                                     _dataSource.cursorY - 1);
     _drawingHelper.totalScrollbackOverflow = [_dataSource totalScrollbackOverflow];
     _drawingHelper.numberOfScrollbackLines = [_dataSource numberOfScrollbackLines];
-    _drawingHelper.reverseVideo = [[_dataSource terminal] reverseVideo];
+    _drawingHelper.reverseVideo = _dataSource.terminalReverseVideo;
     _drawingHelper.textViewIsActiveSession = [self.delegate textViewIsActiveSession];
     _drawingHelper.isInKeyWindow = [self isInKeyWindow];
     // Draw the cursor filled in when we're inactive if there's a popup open or key focus was stolen.
@@ -1384,8 +1448,8 @@
     _drawingHelper.underlineOffset = [self minimumUnderlineOffset];
     _drawingHelper.boldAllowed = _useBoldFont;
     _drawingHelper.unicodeVersion = [_delegate textViewUnicodeVersion];
-    _drawingHelper.asciiLigatures = _primaryFont.hasDefaultLigatures || _asciiLigatures;
-    _drawingHelper.nonAsciiLigatures = _secondaryFont.hasDefaultLigatures || _nonAsciiLigatures;
+    _drawingHelper.asciiLigatures = _fontTable.anyASCIIDefaultLigatures || _asciiLigatures;
+    _drawingHelper.nonAsciiLigatures = _fontTable.anyNonASCIIDefaultLigatures || _nonAsciiLigatures;
     _drawingHelper.copyMode = _delegate.textViewCopyMode;
     _drawingHelper.copyModeSelecting = _delegate.textViewCopyModeSelecting;
     _drawingHelper.copyModeCursorCoord = _delegate.textViewCopyModeCursorCoord;
@@ -1398,10 +1462,25 @@
     _drawingHelper.forceAntialiasingOnRetina = [iTermAdvancedSettingsModel forceAntialiasingOnRetina];
     _drawingHelper.blend = MIN(MAX(0.05, [_delegate textViewBlend]), 1);
     _drawingHelper.shouldShowTimestamps = self.showTimestamps;
+    _drawingHelper.colorMap = _colorMap;
+    _drawingHelper.softAlternateScreenMode = self.dataSource.terminalSoftAlternateScreenMode;
+    _drawingHelper.useSelectedTextColor = self.delegate.textViewShouldUseSelectedTextColor;
+    _drawingHelper.fontTable = self.fontTable;
+    const BOOL autoComposerOpen = [self.delegate textViewIsAutoComposerOpen];
+    _drawingHelper.isCursorVisible = _cursorVisible && !autoComposerOpen;
+    _drawingHelper.linesToSuppress = self.delegate.textViewLinesToSuppressDrawing;
+    
+    const VT100GridRange range = [self rangeOfVisibleLines];
+    if ([_delegate textViewShouldShowOffscreenCommandLine]) {
+        _drawingHelper.offscreenCommandLine = [self.dataSource offscreenCommandLineBefore:range.location];
+        [_drawingHelper.offscreenCommandLine setBackgroundColor:[_drawingHelper offscreenCommandLineBackgroundColor]];
+    } else {
+        _drawingHelper.offscreenCommandLine = nil;
+    }
 
     CGFloat rightMargin = 0;
     if (self.showTimestamps) {
-        [_drawingHelper createTimestampDrawingHelperWithFont:self.font];
+        [_drawingHelper createTimestampDrawingHelperWithFont:_fontTable.asciiFont.font];
         rightMargin = _drawingHelper.timestampDrawHelper.maximumWidth + 8;
     }
     _drawingHelper.indicatorFrame = [self configureIndicatorsHelperWithRightMargin:rightMargin];
@@ -1426,7 +1505,7 @@
     NSDictionary *theAttributes =
         @{ NSBackgroundColorAttributeName: [self defaultBackgroundColor] ?: [NSColor blackColor],
            NSForegroundColorAttributeName: [self defaultTextColor] ?: [NSColor whiteColor],
-           NSFontAttributeName: self.nonAsciiFont ?: [NSFont systemFontOfSize:12],
+           NSFontAttributeName: _fontTable.defaultNonASCIIFont.font ?: [NSFont systemFontOfSize:12],
            NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle | NSUnderlineByWord) };
 
     [self setMarkedTextAttributes:theAttributes];
@@ -1440,7 +1519,7 @@
     if (isDark) {
         // Dark background, any theme, any OS version
         scroller.knobStyle = NSScrollerKnobStyleLight;
-    } else if (@available(macOS 10.14, *)) {
+    } else {
         if (self.effectiveAppearance.it_isDark) {
             // Light background, dark theme — issue 8322
             scroller.knobStyle = NSScrollerKnobStyleDark;
@@ -1448,52 +1527,50 @@
             // Light background, light theme
             scroller.knobStyle = NSScrollerKnobStyleDefault;
         }
-    } else {
-        // Pre-10.4, light background
-        scroller.knobStyle = NSScrollerKnobStyleDefault;
     }
 
     // The knob style is used only for overlay scrollers. In the minimal theme, the window decorations'
     // colors are based on the terminal background color. That means the appearance must be changed to get
     // legacy scrollbars to change color.
-    if (@available(macOS 10.14, *)) {
-        if ([self.delegate textViewTerminalBackgroundColorDeterminesWindowDecorationColor]) {
-            scroller.appearance = isDark ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : [NSAppearance appearanceNamed:NSAppearanceNameAqua];
-        } else {
-            scroller.appearance = nil;
-        }
+    if ([self.delegate textViewTerminalBackgroundColorDeterminesWindowDecorationColor]) {
+        DLog(@"%@ set scroller appearance using isDark=%@", self, @(isDark));
+        scroller.appearance = isDark ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    } else {
+        DLog(@"%@ set scroller appearance to nil", self);
+        scroller.appearance = nil;
     }
 }
 
 // Number of extra lines below the last line of text that are always the background color.
 // This is 2 except for just after the frame has changed and things are resizing.
 - (double)excess {
-    NSRect visible = [self scrollViewContentSize];
-    visible.size.height -= [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins] * 2;  // Height without top and bottom margins.
-    int rows = visible.size.height / _lineHeight;
-    double usablePixels = rows * _lineHeight;
-    return MAX(visible.size.height - usablePixels + [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins], [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins]);  // Never have less than VMARGIN excess, but it can be more (if another tab has a bigger font)
+    NSRect visibleRectExcludingTopAndBottomMargins = [self scrollViewContentSize];
+    visibleRectExcludingTopAndBottomMargins.size.height -= [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins] * 2;  // Height without top and bottom margins.
+    int rows = visibleRectExcludingTopAndBottomMargins.size.height / _lineHeight;
+    double heightOfTextRows = rows * _lineHeight;
+    const CGFloat bottomMarginHeight = [iTermPreferences intForKey:kPreferenceKeyTopBottomMargins];
+    const CGFloat visibleHeightExceptTopMargin = NSHeight(visibleRectExcludingTopAndBottomMargins) + bottomMarginHeight;
+    return MAX(visibleHeightExceptTopMargin - heightOfTextRows,
+               bottomMarginHeight);  // Never have less than VMARGIN excess, but it can be more (if another tab has a bigger font)
 }
 
 - (void)maybeInvalidateWindowShadow {
     if (@available(macOS 10.16, *)) {
         return;
     }
-    if (@available(macOS 10.14, *)) {
-        const double invalidateFPS = [iTermAdvancedSettingsModel invalidateShadowTimesPerSecond];
-        if (invalidateFPS > 0) {
-            if (self.transparencyAlpha < 1) {
-                if ([self.window conformsToProtocol:@protocol(PTYWindow)]) {
-                    if (_shadowRateLimit == nil) {
-                        _shadowRateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Shadow"
-                                                                        minimumInterval:1.0 / invalidateFPS];
-                    }
-                    id<PTYWindow> ptyWindow = (id<PTYWindow>)self.window;
-                    [_shadowRateLimit performRateLimitedBlock:^{
-                        DLog(@"Called");
-                        [ptyWindow it_setNeedsInvalidateShadow];
-                    }];
+    const double invalidateFPS = [iTermAdvancedSettingsModel invalidateShadowTimesPerSecond];
+    if (invalidateFPS > 0) {
+        if (self.transparencyAlpha < 1) {
+            if ([self.window conformsToProtocol:@protocol(PTYWindow)]) {
+                if (_shadowRateLimit == nil) {
+                    _shadowRateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Shadow"
+                                                                    minimumInterval:1.0 / invalidateFPS];
                 }
+                id<PTYWindow> ptyWindow = (id<PTYWindow>)self.window;
+                [_shadowRateLimit performRateLimitedBlock:^{
+                    DLog(@"Called");
+                    [ptyWindow it_setNeedsInvalidateShadow];
+                }];
             }
         }
     }
@@ -1541,6 +1618,14 @@
                             visible:gDebugLogging];
     [_indicatorsHelper setIndicator:kiTermIndicatorFilter
                             visible:[_delegate textViewIsFiltered]];
+
+    const BOOL secureByUser = [[iTermSecureKeyboardEntryController sharedInstance] enabledByUserDefault];
+    const BOOL secure = [[iTermSecureKeyboardEntryController sharedInstance] isEnabled];
+    [_indicatorsHelper setIndicator:kiTermIndicatorSecureKeyboardEntry_User
+                            visible:secure && secureByUser];
+    [_indicatorsHelper setIndicator:kiTermIndicatorSecureKeyboardEntry_Forced
+                            visible:secure && !secureByUser];
+
     NSRect rect = self.visibleRect;
     rect.size.width -= rightMargin;
     return rect;
@@ -1557,14 +1642,24 @@
 - (void)refuseFirstResponderAtCurrentMouseLocation {
     DLog(@"set refuse location");
     _mouseLocationToRefuseFirstResponderAt = [NSEvent mouseLocation];
+    [self.delegate textViewUpdateTrackingAreas];
 }
 
 - (void)resetMouseLocationToRefuseFirstResponderAt {
     DLog(@"reset refuse location from\n%@", [NSThread callStackSymbols]);
     _mouseLocationToRefuseFirstResponderAt = NSMakePoint(DBL_MAX, DBL_MAX);
+    [self.delegate textViewUpdateTrackingAreas];
 }
 
 #pragma mark - Geometry
+
+- (NSRect)offscreenCommandLineFrameForView:(NSView *)view {
+    NSRect base = [iTermTextDrawingHelper offscreenCommandLineFrameForVisibleRect:self.enclosingScrollView.documentVisibleRect
+                                                                         cellSize:NSMakeSize(self.charWidth, self.lineHeight)
+                                                                         gridSize:VT100GridSizeMake(self.dataSource.width,
+                                                                                                    self.dataSource.height)];
+    return [self convertRect:base toView:view];
+}
 
 - (NSRect)scrollViewContentSize {
     NSRect r = NSMakeRect(0, 0, 0, 0);
@@ -1714,23 +1809,14 @@
     _markedTextAttributes = [attr retain];
 }
 
-- (NSFont *)font {
-    return _primaryFont.font;
-}
+- (void)setFontTable:(iTermFontTable *)fontTable
+   horizontalSpacing:(CGFloat)horizontalSpacing
+     verticalSpacing:(CGFloat)verticalSpacing {
+    if (_fontTable != nil) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:PTYTextViewWillChangeFontNotification object:self];
+    }
 
-- (NSFont *)nonAsciiFont {
-    return _useNonAsciiFont ? _secondaryFont.font : _primaryFont.font;
-}
-
-- (NSFont *)nonAsciiFontEvenIfNotUsed {
-    return _secondaryFont.font;
-}
-
-- (void)setFont:(NSFont*)aFont
-    nonAsciiFont:(NSFont *)nonAsciiFont
-    horizontalSpacing:(CGFloat)horizontalSpacing
-    verticalSpacing:(CGFloat)verticalSpacing {
-    NSSize sz = [PTYTextView charSizeForFont:aFont
+    NSSize sz = [PTYTextView charSizeForFont:fontTable.fontForCharacterSizeCalculations
                            horizontalSpacing:1.0
                              verticalSpacing:1.0];
 
@@ -1741,15 +1827,8 @@
     self.charWidth = ceil(_charWidthWithoutSpacing * horizontalSpacing);
     self.lineHeight = ceil(_charHeightWithoutSpacing * verticalSpacing);
 
-    _primaryFont.font = aFont;
-    _primaryFont.boldVersion = [_primaryFont computedBoldVersion];
-    _primaryFont.italicVersion = [_primaryFont computedItalicVersion];
-    _primaryFont.boldItalicVersion = [_primaryFont computedBoldItalicVersion];
-
-    _secondaryFont.font = nonAsciiFont;
-    _secondaryFont.boldVersion = [_secondaryFont computedBoldVersion];
-    _secondaryFont.italicVersion = [_secondaryFont computedItalicVersion];
-    _secondaryFont.boldItalicVersion = [_secondaryFont computedBoldItalicVersion];
+    [_fontTable autorelease];
+    _fontTable = [fontTable retain];
 
     [self updateMarkedTextAttributes];
 
@@ -1757,6 +1836,7 @@
     [scrollview setLineScroll:[self lineHeight]];
     [scrollview setPageScroll:2 * [self lineHeight]];
     [self updateNoteViewFrames];
+    [self updatePortholeFrames];
     [_delegate textViewFontDidChange];
 
     // Refresh to avoid drawing before and after resize.
@@ -1810,20 +1890,21 @@
 }
 
 - (void)setCursorVisible:(BOOL)cursorVisible {
+    DLog(@"setCursorVisible:%@", cursorVisible ? @"true" : @"false");
     [self markCursorDirty];
-    _drawingHelper.cursorVisible = cursorVisible;
+    _cursorVisible = cursorVisible;
 }
 
 - (BOOL)cursorVisible {
-    return _drawingHelper.cursorVisible;
+    return _cursorVisible;
 }
 
 - (CGFloat)minimumBaselineOffset {
-    return _primaryFont.baselineOffset;
+    return _fontTable.baselineOffset;
 }
 
 - (CGFloat)minimumUnderlineOffset {
-    return _primaryFont.underlineOffset;
+    return _fontTable.underlineOffset;
 }
 
 - (void)setTransparency:(double)fVal {
@@ -1858,8 +1939,8 @@
 }
 
 - (void)setMinimumContrast:(double)value {
+    DLog(@"Text view's min contrast for delegate %p is %f", self.delegate, value);
     _drawingHelper.minimumContrast = value;
-    [_colorMap setMinimumContrast:value];
 }
 
 - (BOOL)useTransparency {
@@ -1867,6 +1948,9 @@
 }
 
 - (double)transparencyAlpha {
+    if (self.window.isKeyWindow && [iTermPreferences boolForKey:kPreferenceKeyDisableTransparencyForKeyWindow]) {
+        return 1;
+    }
     return [self useTransparency] ? 1.0 - _transparency : 1.0;
 }
 
@@ -1951,10 +2035,9 @@
 // -[refresh] instead, as it ensures scrollback overflow
 // is dealt with so that this function can dereference
 // [_dataSource dirty] correctly.
-- (BOOL)updateDirtyRects:(BOOL *)foundDirtyPtr {
+- (BOOL)updateDirtyRects:(BOOL *)foundDirtyPtr haveScrolled:(BOOL)haveScrolled {
     BOOL anythingIsBlinking = NO;
     BOOL foundDirty = NO;
-    assert([_dataSource scrollbackOverflow] == 0);
 
     // Flip blink bit if enough time has passed. Mark blinking cursor dirty
     // when it blinks.
@@ -1966,46 +2049,42 @@
             [self setCursorNeedsDisplay];
         }
     }
-    int WIDTH = [_dataSource width];
+    const int width = [_dataSource width];
 
     // Any characters that changed selection status since the last update or
     // are blinking should be set dirty.
-    anythingIsBlinking = [self _markChangedSelectionAndBlinkDirty:redrawBlink width:WIDTH];
+    anythingIsBlinking = [self _markChangedSelectionAndBlinkDirty:redrawBlink width:width];
 
     // Copy selection position to detect change in selected chars next call.
     [_oldSelection release];
     _oldSelection = [_selection copy];
 
     // Redraw lines with dirty characters
-    int lineStart = [_dataSource numberOfLines] - [_dataSource height];
+    const int numberOfLines = _dataSource.numberOfLines;
+    int lineStart = numberOfLines - [_dataSource height];
     int lineEnd = [_dataSource numberOfLines];
     // lineStart to lineEnd is the region that is the screen when the scrollbar
     // is at the bottom of the frame.
 
-    [_dataSource setUseSavedGridIfAvailable:YES];
     long long totalScrollbackOverflow = [_dataSource totalScrollbackOverflow];
     int allDirty = [_dataSource isAllDirty] ? 1 : 0;
-    [_dataSource resetAllDirty];
 
     VT100GridCoord cursorPosition = VT100GridCoordMake([_dataSource cursorX] - 1,
                                                        [_dataSource cursorY] - 1);
+    int cursorLines[2] = { -1, -1 };
     if (_previousCursorCoord.x != cursorPosition.x ||
         _previousCursorCoord.y - totalScrollbackOverflow != cursorPosition.y) {
-        // Mark previous and current cursor position dirty
-        DLog(@"Mark previous cursor position %d,%lld dirty",
-             _previousCursorCoord.x, _previousCursorCoord.y - totalScrollbackOverflow);
-        int maxX = [_dataSource width] - 1;
-        if (_drawingHelper.highlightCursorLine) {
-            [_dataSource setLineDirtyAtY:_previousCursorCoord.y - totalScrollbackOverflow];
-            DLog(@"Mark current cursor line %d dirty", cursorPosition.y);
-            [_dataSource setLineDirtyAtY:cursorPosition.y];
+        DLog(@"Redraw previous cursor line (%d) and current cursor line (%d)",
+             (int)(_previousCursorCoord.y - totalScrollbackOverflow),
+             cursorPosition.y);
+        const int previous = totalScrollbackOverflow - totalScrollbackOverflow;
+        if (previous >= 0 && previous < numberOfLines) {
+            cursorLines[0] = lineStart + _previousCursorCoord.y - totalScrollbackOverflow;
         } else {
-            [_dataSource setCharDirtyAtCursorX:MIN(maxX, _previousCursorCoord.x)
-                                             Y:_previousCursorCoord.y - totalScrollbackOverflow];
-            DLog(@"Mark current cursor position %d,%lld dirty", _previousCursorCoord.x,
-                 _previousCursorCoord.y - totalScrollbackOverflow);
-            [_dataSource setCharDirtyAtCursorX:MIN(maxX, cursorPosition.x) Y:cursorPosition.y];
+            cursorLines[0] = lineStart + cursorPosition.y;
         }
+        cursorLines[1] = lineStart + cursorPosition.y;
+
         // Set _previousCursorCoord to new cursor position
         _previousCursorCoord = VT100GridAbsCoordMake(cursorPosition.x,
                                                      cursorPosition.y + totalScrollbackOverflow);
@@ -2021,15 +2100,18 @@
         [_findOnPageHelper removeSearchResultsInRange:range];
         [self setNeedsDisplayInRect:[self gridRect]];
     } else {
-        const BOOL hasScrolled = [self.dataSource textViewGetAndResetHasScrolled];
         for (int y = lineStart; y < lineEnd; y++) {
             VT100GridRange range = [_dataSource dirtyRangeForLine:y - lineStart];
+            if (y == cursorLines[0] || y == cursorLines[1]) {
+                range = VT100GridRangeMake(0, width);
+            }
             if (range.length > 0) {
                 foundDirty = YES;
+                // TODO: It would be more correct to remove all search results from this point down and reset the cursor location to the start of the first dirty line. VT100Screen.savedFindContextAbsPos can be after some of the dirty cells causing them not to be searched.
                 [_findOnPageHelper removeHighlightsInRange:NSMakeRange(y + totalScrollbackOverflow, 1)];
                 [_findOnPageHelper removeSearchResultsInRange:NSMakeRange(y + totalScrollbackOverflow, 1)];
                 [self setNeedsDisplayOnLine:y inRange:range];
-            } else if (!hasScrolled) {
+            } else if (!haveScrolled) {
                 [cleanLines addIndex:y - lineStart];
             }
         }
@@ -2061,8 +2143,6 @@
     if (foundDirty && [_dataSource shouldSendContentsChangedNotification]) {
         [_delegate textViewPostTabContentsChangedNotification];
     }
-
-    [_dataSource setUseSavedGridIfAvailable:NO];
 
     // If you're viewing the scrollback area and it contains an animated gif it will need
     // to be redrawn periodically. The set of animated lines is added to while drawing and then
@@ -2129,6 +2209,7 @@
 
     // Move subviews up
     [self updateNoteViewFrames];
+    [self updatePortholeFrames];
 
     // Update find on page
     [_findOnPageHelper overflowAdjustmentDidChange];
@@ -2163,14 +2244,18 @@
 // Returns YES if blinking text or cursor was found.
 - (BOOL)refresh {
     DLog(@"PTYTextView refresh called with delegate %@", _delegate);
-    if (_dataSource == nil || _inRefresh) {
+    if (_dataSource == nil || _delegate == nil || _inRefresh) {
         return YES;
     }
-
     // Get the number of lines that have disappeared if scrollback buffer is full.
-    const int scrollbackOverflow = [_dataSource scrollbackOverflow];
-    [_dataSource resetScrollbackOverflow];
+    _inRefresh = YES;
+    const VT100SyncResult syncResult = [self.delegate textViewWillRefresh];
+    _inRefresh = NO;
+    const int scrollbackOverflow = syncResult.overflow;
     const BOOL frameDidChange = [_delegate textViewResizeFrameIfNeeded];
+
+    assert(_delegate != nil);
+
     // Perform adjustments if lines were lost from the head of the buffer.
     BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
     if (scrollbackOverflow > 0) {
@@ -2203,26 +2288,40 @@
 
     // See if any characters are dirty and mark them as needing to be redrawn.
     // Return if anything was found to be blinking.
-    BOOL foundDirty = NO;
-    const BOOL foundBlink = [self updateDirtyRects:&foundDirty] || [self isCursorBlinking];
-
-    // Update accessibility.
-    if (foundDirty) {
-        [self refreshAccessibility];
-    }
+    __block BOOL foundBlink = NO;
+    [self.dataSource performBlockWithSavedGrid:^(id<PTYTextViewSynchronousUpdateStateReading>  _Nullable state) {
+        BOOL foundDirty = NO;
+        foundBlink = [self updateDirtyRects:&foundDirty haveScrolled:syncResult.haveScrolled] || [self isCursorBlinking];
+        // Update accessibility.
+        if (foundDirty) {
+            [self refreshAccessibility];
+        }
+    }];
     if (scrollbackOverflow > 0 || frameDidChange) {
         // Need to redraw locations of search results.
         [self.delegate textViewFindOnPageLocationsDidChange];
     }
 
+    if (_needsUpdateSubviewFrames) {
+        [self updateSubviewFrames];
+    }
     return foundBlink;
 }
 
+- (void)updateSubviewFrames {
+    if (_inRefresh) {
+        _needsUpdateSubviewFrames = YES;
+        return;
+    }
+    _needsUpdateSubviewFrames = NO;
+    [self updateNoteViewFrames];
+    [self updatePortholeFrames];
+    [self setNeedsDisplay:YES];
+}
+
 - (void)markCursorDirty {
-    int currentCursorX = [_dataSource cursorX] - 1;
-    int currentCursorY = [_dataSource cursorY] - 1;
-    DLog(@"Mark cursor position %d, %d dirty.", currentCursorX, currentCursorY);
-    [_dataSource setCharDirtyAtCursorX:currentCursorX Y:currentCursorY];
+    DLog(@"Cursor marked dirty. Schedule redraw.");
+    [self setNeedsDisplay:YES];
 }
 
 - (BOOL)shouldRedrawBlinkingObjects {
@@ -2259,7 +2358,7 @@
     for (int y = lineStart, i = 0; y < lineEnd; y++, i++) {
         if (_blinkAllowed && i < numLines) {
             // First, mark blinking chars as dirty.
-            screen_char_t *theLine = lines[i].line;
+            const screen_char_t *theLine = lines[i].line;
             for (int x = 0; x < lines[i].length; x++) {
                 const BOOL charBlinks = theLine[x].blink;
                 anyBlinkers |= charBlinks;
@@ -2323,11 +2422,14 @@
     VT100GridCoordRange result = range;
     int width = [_dataSource width];
     int lineY = result.start.y;
-    screen_char_t *line = [_dataSource getLineAtIndex:lineY];
+    const screen_char_t *line = [_dataSource screenCharArrayForLine:lineY].line;
     while (!VT100GridCoordEquals(result.start, range.end)) {
         if (lineY != result.start.y) {
             lineY = result.start.y;
-            line = [_dataSource getLineAtIndex:lineY];
+            line = [_dataSource screenCharArrayForLine:lineY].line;
+        }
+        if (line[result.start.x].complexChar || line[result.start.x].image) {
+            break;
         }
         unichar code = line[result.start.x].code;
         BOOL trim = ((code == 0) ||
@@ -2353,7 +2455,10 @@
         }
         if (lineY != y) {
             lineY = y;
-            line = [_dataSource getLineAtIndex:y];
+            line = [_dataSource screenCharArrayForLine:y].line;
+        }
+        if (line[x].complexChar || line[x].image) {
+            break;
         }
         unichar code = line[x].code;
         BOOL trim = ((code == 0) ||
@@ -2366,6 +2471,10 @@
     }
 
     return result;
+}
+
+- (IBAction)revealContentNavigationShortcuts:(id)sender {
+    [self convertVisibleSearchResultsToContentNavigationShortcuts];
 }
 
 - (IBAction)selectAll:(id)sender {
@@ -2422,122 +2531,27 @@
 }
 
 - (NSString *)selectedText {
-    if (_contextMenuHelper.savedSelectedText) {
+    return [self selectedTextInSelection:self.selection];
+}
+
+- (NSString *)selectedTextInSelection:(iTermSelection *)selection {
+    if (selection == self.selection && _contextMenuHelper.savedSelectedText) {
         DLog(@"Returning saved selected text");
         return _contextMenuHelper.savedSelectedText;
     }
-    return [self selectedTextCappedAtSize:0];
+    return [self selectedTextCappedAtSize:0 inSelection:selection];
 }
 
 - (NSString *)selectedTextCappedAtSize:(int)maxBytes {
-    return [self selectedTextWithStyle:iTermCopyTextStylePlainText cappedAtSize:maxBytes minimumLineNumber:0];
+    return [self selectedTextCappedAtSize:0 inSelection:self.selection];
 }
 
-// Does not include selected text on lines before |minimumLineNumber|.
-// Returns an NSAttributedString* if style is iTermCopyTextStyleAttributed, or an NSString* if not.
-- (id)selectedTextWithStyle:(iTermCopyTextStyle)style
-               cappedAtSize:(int)maxBytes
-          minimumLineNumber:(int)minimumLineNumber {
-    if (![_selection hasSelection]) {
-        DLog(@"startx < 0 so there is no selected text");
-        return nil;
-    }
-    BOOL copyLastNewline = [iTermPreferences boolForKey:kPreferenceKeyCopyLastNewline];
-    BOOL trimWhitespace = [iTermAdvancedSettingsModel trimWhitespaceOnCopy];
-    id theSelectedText;
-    NSAttributedStringKey sgrAttribute = @"iTermSGR";
-    NSDictionary *(^attributeProvider)(screen_char_t, iTermExternalAttribute *ea);
-    switch (style) {
-        case iTermCopyTextStyleAttributed:
-            theSelectedText = [[[NSMutableAttributedString alloc] init] autorelease];
-            attributeProvider = ^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
-                return [self charAttributes:theChar externalAttributes:ea];
-            };
-            break;
-
-        case iTermCopyTextStylePlainText:
-            theSelectedText = [[[NSMutableString alloc] init] autorelease];
-            attributeProvider = nil;
-            break;
-
-        case iTermCopyTextStyleWithControlSequences:
-            theSelectedText = [[[NSMutableAttributedString alloc] init] autorelease];
-            attributeProvider = ^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
-                return @{ sgrAttribute: [self.dataSource sgrCodesForChar:theChar
-                                                      externalAttributes:ea] };
-            };
-            break;
-    }
-
-    [_selection enumerateSelectedAbsoluteRanges:^(VT100GridAbsWindowedRange absRange, BOOL *stop, BOOL eol) {
-        [self withRelativeWindowedRange:absRange block:^(VT100GridWindowedRange range) {
-            if (range.coordRange.end.y < minimumLineNumber) {
-                return;
-            } else {
-                range.coordRange.start.y = MAX(range.coordRange.start.y, minimumLineNumber);
-            }
-            int cap = INT_MAX;
-            if (maxBytes > 0) {
-                cap = maxBytes - [theSelectedText length];
-                if (cap <= 0) {
-                    *stop = YES;
-                    return;
-                }
-            }
-            iTermTextExtractor *extractor =
-            [iTermTextExtractor textExtractorWithDataSource:_dataSource];
-            id content = [extractor contentInRange:range
-                                 attributeProvider:attributeProvider
-                                        nullPolicy:kiTermTextExtractorNullPolicyMidlineAsSpaceIgnoreTerminal
-                                               pad:NO
-                                includeLastNewline:copyLastNewline
-                            trimTrailingWhitespace:trimWhitespace
-                                      cappedAtSize:cap
-                                      truncateTail:YES
-                                 continuationChars:nil
-                                            coords:nil];
-            if (attributeProvider != nil) {
-                [theSelectedText appendAttributedString:content];
-            } else {
-                [theSelectedText appendString:content];
-            }
-            NSString *contentString = (attributeProvider != nil) ? [content string] : content;
-            if (eol && ![contentString hasSuffix:@"\n"]) {
-                if (attributeProvider != nil) {
-                    [theSelectedText iterm_appendString:@"\n"];
-                } else {
-                    [theSelectedText appendString:@"\n"];
-                }
-            }
-        }];
-    }];
-
-    if (style == iTermCopyTextStyleWithControlSequences) {
-        NSAttributedString *attributedString = theSelectedText;
-        NSMutableString *string = [NSMutableString string];
-        [attributedString enumerateAttribute:sgrAttribute
-                                     inRange:NSMakeRange(0, attributedString.length)
-                                     options:0
-                                  usingBlock:^(NSSet *_Nullable value, NSRange range, BOOL * _Nonnull stop) {
-            NSString *code = [NSString stringWithFormat:@"%c[%@m", VT100CC_ESC, [value.allObjects componentsJoinedByString:@";"]];
-            [string appendString:code];
-            [string appendString:[attributedString.string substringWithRange:range]];
-        }];
-        return string;
-    }
-
-    return theSelectedText;
-}
-
-- (NSString *)selectedTextCappedAtSize:(int)maxBytes
-                     minimumLineNumber:(int)minimumLineNumber {
+- (NSString *)selectedTextCappedAtSize:(int)maxBytes inSelection:(iTermSelection *)selection {
     return [self selectedTextWithStyle:iTermCopyTextStylePlainText
                           cappedAtSize:maxBytes
-                     minimumLineNumber:minimumLineNumber];
-}
-
-- (NSAttributedString *)selectedAttributedTextWithPad:(BOOL)pad {
-    return [self selectedTextWithStyle:iTermCopyTextStyleAttributed cappedAtSize:0 minimumLineNumber:0];
+                     minimumLineNumber:0
+                            timestamps:NO
+                             selection:selection];
 }
 
 - (BOOL)_haveShortSelection {
@@ -2697,22 +2711,33 @@
 }
 
 - (void)copy:(id)sender {
-    // TODO: iTermSelection should use absolute coordinates everywhere. Until that is done, we must
-    // call refresh here to take care of any scrollback overflow that would cause the selected range
-    // to not match reality.
-    [self refresh];
+    if ([self anyPortholeHasSelection]) {
+        [self copyFromPortholeAsPlainText];
+        return;
+    }
+    [self copySelection:self.selection];
+}
 
+- (void)copySelection:(iTermSelection *)selection {
     DLog(@"-[PTYTextView copy:] called");
     DLog(@"%@", [NSThread callStackSymbols]);
 
-    NSString *copyString = [self selectedText];
+    if ([self selectionIsBig:selection]) {
+        [self asynchronouslyVendSelectedTextWithStyle:iTermCopyTextStylePlainText
+                                         cappedAtSize:INT_MAX
+                                    minimumLineNumber:0
+                                            selection:selection];
+        return;
+    }
+
+    NSString *copyString = [self selectedTextInSelection:selection];
     [self copyString:copyString];
 }
 
-- (void)copyString:(NSString *)copyString {
+- (BOOL)copyString:(NSString *)copyString {
     if ([iTermAdvancedSettingsModel disallowCopyEmptyString] && copyString.length == 0) {
         DLog(@"Disallow copying empty string");
-        return;
+        return NO;
     }
     DLog(@"Will copy this string: “%@”. selection=%@", copyString, _selection);
     if (copyString) {
@@ -2722,20 +2747,38 @@
     }
 
     [[PasteboardHistory sharedInstance] save:copyString];
+    return YES;
 }
 
 - (IBAction)copyWithStyles:(id)sender {
+    if ([self anyPortholeHasSelection]) {
+        [self copyFromPortholeAsAttributedString];
+        return;
+    }
+    [self copySelectionWithStyles:self.selection];
+}
+
+- (void)copySelectionWithStyles:(iTermSelection *)selection {
+    if ([self selectionIsBig:selection]) {
+        [self asynchronouslyVendSelectedTextWithStyle:iTermCopyTextStyleAttributed
+                                         cappedAtSize:INT_MAX
+                                    minimumLineNumber:0
+                                            selection:selection];
+        return;
+    }
+
     NSPasteboard *pboard = [NSPasteboard generalPasteboard];
 
     DLog(@"-[PTYTextView copyWithStyles:] called");
-    NSAttributedString *copyAttributedString = [self selectedAttributedTextWithPad:NO];
+    NSAttributedString *copyAttributedString = [self selectedAttributedTextWithPad:NO
+                                                                         selection:selection];
     if ([iTermAdvancedSettingsModel disallowCopyEmptyString] &&
         copyAttributedString.length == 0) {
         DLog(@"Disallow copying empty string");
         return;
     }
 
-    DLog(@"Have selected text of length %d. selection=%@", (int)[copyAttributedString length], _selection);
+    DLog(@"Have selected text of length %d. selection=%@", (int)[copyAttributedString length], selection);
     NSMutableArray *types = [NSMutableArray array];
     if (copyAttributedString) {
         [types addObject:NSPasteboardTypeRTF];
@@ -2755,12 +2798,18 @@
 }
 
 - (IBAction)copyWithControlSequences:(id)sender {
+    if ([self anyPortholeHasSelection]) {
+        [self copyFromPortholeWithControlSequences];
+        return;
+    }
     DLog(@"-[PTYTextView copyWithControlSequences:] called");
     DLog(@"%@", [NSThread callStackSymbols]);
 
     NSString *copyString = [self selectedTextWithStyle:iTermCopyTextStyleWithControlSequences
                                           cappedAtSize:-1
-                                     minimumLineNumber:0];
+                                     minimumLineNumber:0
+                                            timestamps:NO
+                                             selection:self.selection];
 
     if ([iTermAdvancedSettingsModel disallowCopyEmptyString] && copyString.length == 0) {
         DLog(@"Disallow copying empty string");
@@ -2830,6 +2879,9 @@
                 }
             }
 
+            if (filenames.count >= 1 && [_delegate textViewPasteFiles:filenames]) {
+                return YES;
+            }
             // Paste filenames separated by spaces.
             [stringToPaste appendString:[filenames componentsJoinedByString:@" "]];
             if (pasteNewline) {
@@ -2859,24 +2911,29 @@
 #pragma mark - Content
 
 - (NSAttributedString *)attributedContent {
-    return [self contentWithAttributes:YES];
+    return [self contentWithAttributes:YES timestamps:NO];
 }
 
 - (NSString *)content {
-    return [self contentWithAttributes:NO];
+    return [self contentWithAttributes:NO timestamps:NO];
 }
 
-- (id)contentWithAttributes:(BOOL)attributes {
+- (NSDictionary *(^)(screen_char_t, iTermExternalAttribute *))attributeProviderUsingProcessedColors:(BOOL)processed {
+    return [[^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
+        return [self charAttributes:theChar externalAttributes:ea processed:processed];
+    } copy] autorelease];
+}
+
+- (id)contentWithAttributes:(BOOL)attributes timestamps:(BOOL)timestamps {
     iTermTextExtractor *extractor = [iTermTextExtractor textExtractorWithDataSource:_dataSource];
+    extractor.addTimestamps = timestamps;
     VT100GridCoordRange theRange = VT100GridCoordRangeMake(0,
                                                            0,
                                                            [_dataSource width],
                                                            [_dataSource numberOfLines] - 1);
     NSDictionary *(^attributeProvider)(screen_char_t, iTermExternalAttribute *) = nil;
     if (attributes) {
-        attributeProvider =^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
-            return [self charAttributes:theChar externalAttributes:ea];
-        };
+        attributeProvider = [self attributeProviderUsingProcessedColors:NO];
     }
     return [extractor contentInRange:VT100GridWindowedRangeMake(theRange, 0, 0)
                    attributeProvider:attributeProvider
@@ -2892,18 +2949,14 @@
 
 // Save method
 - (void)saveDocumentAs:(id)sender {
-    // We get our content of the textview or selection, if any
-    NSString *aString = [self selectedText];
-    if (!aString) {
-        aString = [self content];
-    }
-
-    NSData *aData = [aString dataUsingEncoding:[_delegate textViewEncoding]
-                          allowLossyConversion:YES];
-
-    // initialize a save panel
     NSSavePanel *aSavePanel = [NSSavePanel savePanel];
-    [aSavePanel setAccessoryView:nil];
+    NSButton *timestampsButton = [[[NSButton alloc] init] autorelease];
+    [timestampsButton setButtonType:NSButtonTypeSwitch];
+    timestampsButton.title = @"Include timestamps";
+    NSString *userDefaultsKey = @"NoSyncSaveWithTimestamps";
+    timestampsButton.state = [[NSUserDefaults standardUserDefaults] boolForKey:userDefaultsKey] ? NSControlStateValueOn : NSControlStateValueOff;
+    [timestampsButton sizeToFit];
+    [aSavePanel setAccessoryView:timestampsButton];
 
     NSString *path = @"";
     NSArray *searchPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
@@ -2928,11 +2981,32 @@
         if (result != NSModalResponseOK) {
             return;
         }
-        if (![aData writeToFile:aSavePanel.URL.path atomically:YES]) {
+        const BOOL wantTimestamps = timestampsButton.state == NSControlStateValueOn;
+        [[NSUserDefaults standardUserDefaults] setBool:wantTimestamps forKey:userDefaultsKey];
+        if (![[self dataToSaveWithTimestamps:wantTimestamps] writeToFile:aSavePanel.URL.path atomically:YES]) {
             DLog(@"Beep: can't write to %@", aSavePanel.URL);
             NSBeep();
         }
     }];
+}
+
+- (NSData *)dataToSaveWithTimestamps:(BOOL)timestamps {
+    if (!timestamps) {
+        NSString *string = [self selectedText];
+        if (!string) {
+            string = [self content];
+        }
+
+        return [string dataUsingEncoding:[_delegate textViewEncoding]
+                     allowLossyConversion:YES];
+    }
+
+    return [[self selectedTextWithStyle:iTermCopyTextStylePlainText
+                           cappedAtSize:0
+                      minimumLineNumber:0
+                             timestamps:YES
+                              selection:self.selection] dataUsingEncoding:[_delegate textViewEncoding]
+            allowLossyConversion:YES];
 }
 
 #pragma mark - Miscellaneous Actions
@@ -3001,7 +3075,7 @@
         [highlightingView removeFromSuperview];
         [highlightingView release];
     }];
-    const NSTimeInterval duration = 0.75;
+    const NSTimeInterval duration = PTYTextViewHighlightLineAnimationDuration;
 
     CABasicAnimation *animation = [CABasicAnimation animationWithKeyPath:@"opacity"];
     animation.fromValue = (id)@0.75;
@@ -3034,13 +3108,26 @@
 
 #pragma mark - Annotations
 
-- (void)addViewForNote:(PTYNoteViewController *)note {
+- (void)addViewForNote:(id<PTYAnnotationReading>)annotation focus:(BOOL)focus visible:(BOOL)visible {
+    PTYNoteViewController *note = [[[PTYNoteViewController alloc] initWithAnnotation:annotation] autorelease];
+    note.delegate = self;
+    [_notes addObject:note];
     // Make sure scrollback overflow is reset.
+    if (note.annotation.stringValue.length) {
+        [note sizeToFit];
+    }
     [self refresh];
     [note.view removeFromSuperview];
     [self addSubview:note.view];
     [self updateNoteViewFrames];
-    [note setNoteHidden:NO];
+    [note setNoteHidden:!visible];
+    if (visible) {
+        [self setNeedsDisplay:YES];
+        if (focus) {
+            [note makeFirstResponder];
+        }
+        [self updateAlphaValue];
+    }
 }
 
 - (void)addNote {
@@ -3048,16 +3135,8 @@
         return;
     }
     [self withRelativeCoordRange:_selection.lastAbsRange.coordRange block:^(VT100GridCoordRange range) {
-        PTYNoteViewController *note = [[[PTYNoteViewController alloc] init] autorelease];
-        [_dataSource addNote:note inRange:range];
-
-        // Make sure scrollback overflow is reset.
-        [self refresh];
-        [note.view removeFromSuperview];
-        [self addSubview:note.view];
-        [self updateNoteViewFrames];
-        [note setNoteHidden:NO];
-        [note beginEditing];
+        PTYAnnotation *annotation = [[[PTYAnnotation alloc] init] autorelease];
+        [_dataSource addNote:annotation inRange:range focus:YES];
     }];
 }
 
@@ -3065,19 +3144,13 @@
 }
 
 - (void)updateNoteViewFrames {
-    for (NSView *view in [self subviews]) {
-        if ([view isKindOfClass:[PTYNoteView class]]) {
-            PTYNoteView *noteView = (PTYNoteView *)view;
-            PTYNoteViewController *note =
-                (PTYNoteViewController *)noteView.delegate.noteViewController;
-            VT100GridCoordRange coordRange = [_dataSource coordRangeOfNote:note];
-            if (coordRange.end.y >= 0) {
-                [note setAnchor:NSMakePoint(coordRange.end.x * _charWidth + [iTermPreferences intForKey:kPreferenceKeySideMargins],
-                                            (1 + coordRange.end.y) * _lineHeight)];
-            }
+    for (PTYNoteViewController *note in _notes) {
+        VT100GridCoordRange coordRange = [_dataSource coordRangeOfAnnotation:note.annotation];
+        if (coordRange.end.y >= 0) {
+            [note setAnchor:NSMakePoint(coordRange.end.x * _charWidth + [iTermPreferences intForKey:kPreferenceKeySideMargins],
+                                        (1 + coordRange.end.y) * _lineHeight)];
         }
     }
-    [_dataSource removeInaccessibleNotes];
 }
 
 - (BOOL)anyAnnotationsAreVisible {
@@ -3104,7 +3177,7 @@
 - (VT100GridCoord)moveCursorHorizontallyTo:(VT100GridCoord)target from:(VT100GridCoord)cursor {
     DLog(@"Moving cursor horizontally from %@ to %@",
          VT100GridCoordDescription(cursor), VT100GridCoordDescription(target));
-    VT100Terminal *terminal = [_dataSource terminal];
+    VT100Output *terminalOutput = [_dataSource terminalOutput];
     iTermTextExtractor *extractor = [iTermTextExtractor textExtractorWithDataSource:_dataSource];
     NSComparisonResult initialOrder = VT100GridCoordOrder(cursor, target);
     // Note that we could overshoot the destination because of double-width characters if the target
@@ -3112,12 +3185,12 @@
     while (![extractor coord:cursor isEqualToCoord:target]) {
         switch (initialOrder) {
             case NSOrderedAscending:
-                [_delegate writeStringWithLatin1Encoding:[[terminal.output keyArrowRight:0] stringWithEncoding:NSISOLatin1StringEncoding]];
+                [_delegate writeStringWithLatin1Encoding:[[terminalOutput keyArrowRight:0] stringWithEncoding:NSISOLatin1StringEncoding]];
                 cursor = [extractor successorOfCoord:cursor];
                 break;
 
             case NSOrderedDescending:
-                [_delegate writeStringWithLatin1Encoding:[[terminal.output keyArrowLeft:0] stringWithEncoding:NSISOLatin1StringEncoding]];
+                [_delegate writeStringWithLatin1Encoding:[[terminalOutput keyArrowLeft:0] stringWithEncoding:NSISOLatin1StringEncoding]];
                 cursor = [extractor predecessorOfCoord:cursor];
                 break;
 
@@ -3134,7 +3207,7 @@
 
     NSPoint clickPoint = [self clickPoint:event allowRightMarginOverflow:NO];
     VT100GridCoord target = VT100GridCoordMake(clickPoint.x, clickPoint.y);
-    VT100Terminal *terminal = [_dataSource terminal];
+    VT100Output *terminalOutput = [_dataSource terminalOutput];
 
     VT100GridCoord cursor = VT100GridCoordMake([_dataSource cursorX] - 1,
                                                [_dataSource absoluteLineNumberOfCursor] - [_dataSource totalScrollbackOverflow]);
@@ -3157,10 +3230,10 @@
     DLog(@"Move cursor vertically from %@ to y=%d", VT100GridCoordDescription(cursor), target.y);
     while (cursor.y != target.y) {
         if (cursor.y > target.y) {
-            [_delegate writeStringWithLatin1Encoding:[[terminal.output keyArrowUp:0] stringWithEncoding:NSISOLatin1StringEncoding]];
+            [_delegate writeStringWithLatin1Encoding:[[terminalOutput keyArrowUp:0] stringWithEncoding:NSISOLatin1StringEncoding]];
             cursor.y--;
         } else {
-            [_delegate writeStringWithLatin1Encoding:[[terminal.output keyArrowDown:0] stringWithEncoding:NSISOLatin1StringEncoding]];
+            [_delegate writeStringWithLatin1Encoding:[[terminalOutput keyArrowDown:0] stringWithEncoding:NSISOLatin1StringEncoding]];
             cursor.y++;
         }
     }
@@ -3250,8 +3323,32 @@
                                       ignoringNewlines:ignoringNewlines];
 }
 
+- (BOOL)showCommandInfoForEvent:(NSEvent *)event {
+    iTermOffscreenCommandLine *offscreenCommandLine = [self offscreenCommandLineForClickAt:event.locationInWindow];
+    if (offscreenCommandLine) {
+        [self presentCommandInfoForOffscreenCommandLine:offscreenCommandLine event:event];
+        return YES;
+    }
+    id<VT100ScreenMarkReading> mark = [_contextMenuHelper markForClick:event];
+    if (mark.startDate != nil) {
+        const VT100GridCoord coord = [self coordForPointInWindow:event.locationInWindow];
+        const long long overflow = [self.dataSource totalScrollbackOverflow];
+        NSDate *date = [self.dataSource timestampForLine:coord.y];
+        [self presentCommandInfoForMark:mark
+                     absoluteLineNumber:VT100GridAbsCoordFromCoord(coord, overflow).y
+                                   date:date
+                                  event:event];
+        return YES;
+    }
+    return NO;
+}
+
 // Called for a right click that isn't control+click (e.g., two fingers on trackpad).
 - (void)openContextMenuWithEvent:(NSEvent *)event {
+    if ([self showCommandInfoForEvent:event]) {
+        return;
+    }
+
     NSPoint clickPoint = [self clickPoint:event allowRightMarginOverflow:NO];
     [_contextMenuHelper openContextMenuAt:VT100GridCoordMake(clickPoint.x, clickPoint.y)
                                     event:event];
@@ -3346,6 +3443,12 @@
     [_delegate textViewSelectPreviousPane];
 }
 
+- (void)selectMenuItemWithIdentifier:(NSString *)identifier
+                               title:(NSString *)title
+                               event:(NSEvent *)event {
+    [_delegate textViewSelectMenuItemWithIdentifier:identifier title:title];
+}
+
 - (void)advancedPasteWithConfiguration:(NSString *)configuration
                              fromSelection:(BOOL)fromSelection
                              withEvent:(NSEvent *)event {
@@ -3355,6 +3458,10 @@
 
 - (NSMenu *)titleBarMenu {
     return [_contextMenuHelper titleBarMenu];
+}
+
+- (void)invokeScriptFunction:(NSString *)function withEvent:(NSEvent *)event {
+    [self.delegate textViewInvokeScriptFunction:function];
 }
 
 #pragma mark - Drag and Drop
@@ -3435,7 +3542,7 @@
     const BOOL optionPressed = ([NSEvent modifierFlags] & NSEventModifierFlagOption) != 0;
     NSDragOperation sourceMask = [sender draggingSourceOperationMask];
     DLog(@"source mask=%@, optionPressed=%@, pasteOk=%@", @(sourceMask), @(optionPressed), @(pasteOK));
-    if (!optionPressed && pasteOK && (sourceMask & (NSDragOperationGeneric | NSDragOperationCopy)) != 0) {
+    if (!optionPressed && pasteOK && (sourceMask & (NSDragOperationGeneric | NSDragOperationCopy | NSDragOperationLink)) != 0) {
         DLog(@"Allowing a filename drag");
         // No modifier key was pressed and pasting is OK, so select the paste operation.
         NSArray *filenames = [pb filenamesOnPasteboardWithShellEscaping:YES];
@@ -3450,6 +3557,10 @@
         if (sourceMask & NSDragOperationGeneric) {
             // This is preferred since it doesn't have the green plus indicating a copy
             return NSDragOperationGeneric;
+        } else if (sourceMask & NSDragOperationLink) {
+            // This fixes dragging from Fork, issue 10538. Apple doesn't deign to
+            // describe the purpose of NSDragOperationLink so I'll assume this isn't a crime.
+            return NSDragOperationLink;
         } else {
             // Even if the source only allows copy, we allow it. See issue 4286.
             // Such sources are silly and we route around the damage.
@@ -3471,7 +3582,7 @@
     }
 }
 
-- (void)_dragImage:(iTermImageInfo *)imageInfo forEvent:(NSEvent *)theEvent {
+- (void)_dragImage:(id<iTermImageInfoReading>)imageInfo forEvent:(NSEvent *)theEvent {
     NSImage *icon = [imageInfo imageWithCellSize:NSMakeSize(_charWidth, _lineHeight)
                                            scale:1];
 
@@ -3488,7 +3599,7 @@
 
     VT100GridCoord coord = VT100GridCoordMake((dragPoint.x - [iTermPreferences intForKey:kPreferenceKeySideMargins]) / _charWidth,
                                               dragPoint.y / _lineHeight);
-    screen_char_t* theLine = [_dataSource getLineAtIndex:coord.y];
+    const screen_char_t* theLine = [_dataSource screenCharArrayForLine:coord.y].line;
     if (theLine &&
         coord.x < [_dataSource width] &&
         theLine[coord.x].image &&
@@ -3653,7 +3764,7 @@
     NSPasteboard *draggingPasteboard = [sender draggingPasteboard];
     NSDragOperation dragOperation = [sender draggingSourceOperationMask];
     DLog(@"Perform drag operation");
-    if (dragOperation & (NSDragOperationCopy | NSDragOperationGeneric)) {
+    if (dragOperation & (NSDragOperationCopy | NSDragOperationGeneric | NSDragOperationLink)) {
         DLog(@"Drag operation is acceptable");
         if ([NSEvent modifierFlags] & NSEventModifierFlagOption) {
             DLog(@"Holding option so doing an upload");
@@ -3690,8 +3801,8 @@
                                                                      lineOffset + numLines - 1);
             [self printContent:[extractor contentInRange:VT100GridWindowedRangeMake(coordRange, 0, 0)
                                        attributeProvider:^NSDictionary *(screen_char_t theChar, iTermExternalAttribute *ea) {
-                                           return [self charAttributes:theChar externalAttributes:ea];
-                                       }
+                return [self charAttributes:theChar externalAttributes:ea processed:NO];
+            }
                                               nullPolicy:kiTermTextExtractorNullPolicyTreatAsSpace
                                                      pad:NO
                                       includeLastNewline:YES
@@ -3741,7 +3852,7 @@
         NSDictionary *attributes =
             @{ NSBackgroundColorAttributeName: [NSColor textBackgroundColor],
                NSForegroundColorAttributeName: [NSColor textColor],
-               NSFontAttributeName: self.font ?: [NSFont userFixedPitchFontOfSize:0] };
+               NSFontAttributeName: _fontTable.asciiFont.font ?: [NSFont userFixedPitchFontOfSize:0] };
         attributedString = [[[NSAttributedString alloc] initWithString:content
                                                             attributes:attributes] autorelease];
     }
@@ -3846,7 +3957,31 @@
 }
 
 - (NSRange)selectedRange {
-    return NSMakeRange(0, 0);
+    DLog(@"selectedRange");
+    if (_selection.hasSelection) {
+        DLog(@"Use range of selection");
+        return [self nsRangeForAbsCoordRange:_selection.allSubSelections.lastObject.absRange.coordRange];
+    }
+    DLog(@"Use range of cursor");
+    return [self nsrangeOfCursor];
+}
+
+- (NSRange)nsrangeOfCursor {
+    const int y = [_dataSource cursorY] - 1;
+    const int x = [_dataSource cursorX] - 1;
+    const long long offset = _dataSource.totalScrollbackOverflow + _dataSource.numberOfScrollbackLines;
+    VT100GridAbsCoordRange range = VT100GridAbsCoordRangeMake(x,
+                                                              offset + y,
+                                                              x,
+                                                              offset + y);
+    return [self nsRangeForAbsCoordRange:range];
+}
+
+- (NSRange)nsRangeForAbsCoordRange:(VT100GridAbsCoordRange)range {
+    DLog(@"%@", VT100GridAbsCoordRangeDescription(range));
+    const long long width = _dataSource.width;
+    return NSMakeRange(range.start.x + range.start.y * width,
+                       VT100GridAbsCoordDistance(range.start, range.end, width));
 }
 
 - (NSArray *)validAttributesForMarkedText {
@@ -3913,12 +4048,18 @@
         return;
     }
     switch ((NSFindPanelAction)menuItem.tag) {
+        case NSFindPanelActionShowFindPanel:
+            [self.delegate textViewShowFindPanel];
+            return;
+
+        case NSFindPanelActionSelectAll:
+            [self convertMatchesToSelections];
+            return;
+
         case NSFindPanelActionNext:
         case NSFindPanelActionReplace:
         case NSFindPanelActionPrevious:
-        case NSFindPanelActionSelectAll:
         case NSFindPanelActionReplaceAll:
-        case NSFindPanelActionShowFindPanel:
         case NSFindPanelActionReplaceAndFind:
         case NSFindPanelActionSelectAllInSelection:
         case NSFindPanelActionReplaceAllInSelection:
@@ -3940,6 +4081,10 @@
     return _findOnPageHelper.findInProgress;
 }
 
+- (void)removeSearchResultsInRange:(VT100GridAbsCoordRange)range {
+    [_findOnPageHelper removeSearchResultsInRange:NSMakeRange(range.start.y, range.end.y - range.start.y)];
+}
+
 - (void)addSearchResult:(SearchResult *)searchResult {
     [_findOnPageHelper addSearchResult:searchResult width:[_dataSource width]];
 }
@@ -3948,16 +4093,23 @@
     return _findOnPageHelper.copiedContext;
 }
 
-- (BOOL)continueFind:(double *)progress {
+- (BOOL)continueFind:(double *)progress range:(NSRange *)rangePtr {
     return [_findOnPageHelper continueFind:progress
+                                  rangeOut:rangePtr
                                    context:[_dataSource findContext]
                                      width:[_dataSource width]
                              numberOfLines:[_dataSource numberOfLines]
                         overflowAdjustment:[_dataSource totalScrollbackOverflow] - [_dataSource scrollbackOverflow]];
 }
 
-- (BOOL)continueFindAllResults:(NSMutableArray *)results inContext:(FindContext *)context {
-    return [_dataSource continueFindAllResults:results inContext:context];
+- (BOOL)continueFindAllResults:(NSMutableArray *)results
+                      rangeOut:(NSRange *)rangePtr
+                     inContext:(FindContext *)context
+                 rangeSearched:(VT100GridAbsCoordRange *)rangeSearched {
+    return [_dataSource continueFindAllResults:results
+                                      rangeOut:rangePtr
+                                     inContext:context
+                                 rangeSearched:rangeSearched];
 }
 
 - (void)findOnPageSetFindString:(NSString*)aString
@@ -3977,6 +4129,15 @@
                     withOffset:offset
                      inContext:context
                multipleResults:multipleResults];
+}
+
+- (void)findOnPageHelperSearchExternallyFor:(NSString *)query mode:(iTermFindMode)mode {
+    [_findOnPageHelper addExternalResults:[self searchPortholesFor:query mode:mode]
+                                    width:self.dataSource.width ?: 1];
+}
+
+- (void)findOnPageHelperRemoveExternalHighlights {
+    [self removePortholeHighlights];
 }
 
 - (void)selectCoordRange:(VT100GridCoordRange)range {
@@ -3999,9 +4160,23 @@
 
 - (void)findOnPageSelectRange:(VT100GridCoordRange)range wrapped:(BOOL)wrapped {
     [self selectCoordRange:range];
+    VT100GridAbsCoordRange absRange = VT100GridAbsCoordRangeFromCoordRange(range, _dataSource.totalScrollbackOverflow);
+    // Let the scrollview scroll if needs to before showing the find indicator.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self showFindIndicator:absRange];
+    });
     if (!wrapped) {
         [self setNeedsDisplay:YES];
     }
+}
+
+- (void)showFindIndicator:(VT100GridAbsCoordRange)absRange {
+    VT100GridCoordRange range = VT100GridCoordRangeFromAbsCoordRange(absRange, _dataSource.totalScrollbackOverflow);
+    [self.delegate textViewShowFindIndicator:range];
+}
+
+- (VT100GridCoordRange)findOnPageSelectExternalResult:(iTermExternalSearchResult *)result {
+    return [self selectExternalSearchResult:result multiple:NO scroll:YES];
 }
 
 - (void)findOnPageSaveFindContextAbsPos {
@@ -4017,10 +4192,23 @@
 }
 
 - (void)findOnPageRevealRange:(VT100GridCoordRange)range {
+    const VT100GridRange visibleLines = [self rangeOfVisibleLines];
+    const VT100GridCoordRange visibleRange = VT100GridCoordRangeMake(0,
+                                                                     visibleLines.location,
+                                                                     _dataSource.width,
+                                                                     VT100GridRangeMax(visibleLines));
+    if (VT100GridCoordRangeContainsCoord(visibleRange, range.start) &&
+        VT100GridCoordRangeContainsCoord(visibleRange, range.end)) {
+        DLog(@"Entire range %@ is visible within %@ so don't scroll",
+             VT100GridCoordRangeDescription(range),
+             VT100GridCoordRangeDescription(visibleRange));
+        [self setNeedsDisplay:YES];
+        return;
+    }
     // Lock scrolling after finding text
     [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) setUserScroll:YES];
 
-    [self _scrollToCenterLine:range.end.y];
+    [self scrollToCenterLine:range.end.y];
     [self setNeedsDisplay:YES];
 }
 
@@ -4130,14 +4318,21 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 
 #pragma mark - Find Cursor
 
-- (NSRect)cursorFrame {
-    int lineStart = [_dataSource numberOfLines] - [_dataSource height];
-    int cursorX = [_dataSource cursorX] - 1;
-    int cursorY = [_dataSource cursorY] - 1;
-    return NSMakeRect([iTermPreferences intForKey:kPreferenceKeySideMargins] + cursorX * _charWidth,
-                      (lineStart + cursorY) * _lineHeight,
+- (NSRect)rectForCoord:(VT100GridCoord)coord {
+    return NSMakeRect([iTermPreferences intForKey:kPreferenceKeySideMargins] + coord.x * _charWidth,
+                      coord.y * _lineHeight,
                       _charWidth,
                       _lineHeight);
+}
+
+- (NSRect)rectForGridCoord:(VT100GridCoord)coord {
+    const int firstGridLine = [_dataSource numberOfLines] - [_dataSource height];
+    return [self rectForCoord:VT100GridCoordMake(coord.x, firstGridLine + coord.y)];
+}
+
+- (NSRect)cursorFrame {
+    return [self rectForGridCoord:VT100GridCoordMake(_dataSource.cursorX - 1,
+                                                     _dataSource.cursorY - 1)];
 }
 
 - (CGFloat)verticalOffset {
@@ -4214,7 +4409,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (void)beginFindCursor:(BOOL)hold forceFireworks:(BOOL)forceFireworks {
-    _drawingHelper.cursorVisible = YES;
+    _cursorVisible = YES;
     [self setNeedsDisplayInRect:self.cursorFrame];
     if (!_findCursorView) {
         [self createFindCursorWindowWithFireworks:forceFireworks];
@@ -4273,15 +4468,14 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 - (PTYFontInfo *)getFontForChar:(UniChar)ch
                       isComplex:(BOOL)isComplex
                      renderBold:(BOOL *)renderBold
-                   renderItalic:(BOOL *)renderItalic {
-    return [PTYFontInfo fontForAsciiCharacter:(!isComplex && (ch < 128))
-                                    asciiFont:_primaryFont
-                                 nonAsciiFont:_secondaryFont
-                                  useBoldFont:_useBoldFont
-                                useItalicFont:_useItalicFont
-                             usesNonAsciiFont:_useNonAsciiFont
-                                   renderBold:renderBold
-                                 renderItalic:renderItalic];
+                   renderItalic:(BOOL *)renderItalic
+                       remapped:(UTF32Char *)remapped {
+    return [_fontTable fontForCharacter:isComplex ? [CharToStr(ch, isComplex) longCharacterAtIndex:0] : ch
+                            useBoldFont:_useBoldFont
+                          useItalicFont:_useItalicFont
+                             renderBold:renderBold
+                           renderItalic:renderItalic
+                               remapped:remapped];
 }
 
 #pragma mark - Miscellaneous Notifications
@@ -4292,24 +4486,29 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     [self refuseFirstResponderAtCurrentMouseLocation];
 }
 
-- (void)_settingsChanged:(NSNotification *)notification {
+- (void)refreshTerminal:(NSNotification *)notification {
     [self setNeedsDisplay:YES];
-    _colorMap.dimOnlyText = [iTermPreferences boolForKey:kPreferenceKeyDimOnlyText];
 }
 
 #pragma mark - iTermSelectionDelegate
 
 - (void)selectionDidChange:(iTermSelection *)selection {
-    NSString *selectionString = @"";
     DLog(@"selectionDidChange to %@", selection);
-    [_delegate refresh];
-    if (!_selection.live && selection.hasSelection) {
-        const NSInteger MAX_SELECTION_SIZE = 10 * 1000 * 1000;
-        selectionString = [self selectedTextCappedAtSize:MAX_SELECTION_SIZE minimumLineNumber:0];
-        [[iTermController sharedInstance] setLastSelection:
-            selectionString.length < MAX_SELECTION_SIZE ? selectionString : nil];
+    if (selection != _selection && selection != _oldSelection) {
+        DLog(@"Not my selection. Ignore it.");
+        return;
     }
-    [_delegate textViewSelectionDidChangeToTruncatedString:selectionString];
+    if (!_selection.live && selection.hasSelection) {
+        iTermPromise<NSString *> *promise = [self recordSelection:selection];
+        [promise onQueue:dispatch_get_main_queue() then:^(NSString * _Nonnull value) {
+            DLog(@"Update scope variables for selection");
+            [_delegate textViewSelectionDidChangeToTruncatedString:value];
+        }];
+    } else {
+        [_delegate textViewSelectionDidChangeToTruncatedString:@""];
+    }
+    [self removePortholeSelections];
+    [self setNeedsDisplay:YES];
     DLog(@"Selection did change: selection=%@. stack=%@",
          selection, [NSThread callStackSymbols]);
 }
@@ -4421,7 +4620,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     const BOOL ok =
     [self withRelativeCoord:absCoord block:^(VT100GridCoord relativeCoord) {
         VT100GridCoord coord = relativeCoord;
-        screen_char_t *theLine;
+        const screen_char_t *theLine;
         do {
             coord.x--;
             if (coord.x < 0) {
@@ -4433,8 +4632,8 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
                 }
              }
 
-            theLine = [_dataSource getLineAtIndex:coord.y];
-        } while (theLine[coord.x].code == DWC_RIGHT);
+            theLine = [_dataSource screenCharArrayForLine:coord.y].line;
+        } while (ScreenCharIsDWC_RIGHT(theLine[coord.x]));
         result = VT100GridAbsCoordFromCoord(coord, totalScrollbackOverflow);
     }];
     if (!ok) {
@@ -4462,30 +4661,33 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 
 #pragma mark - iTermColorMapDelegate
 
-- (void)colorMap:(iTermColorMap *)colorMap didChangeColorForKey:(iTermColorMapKey)theKey {
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap didChangeColorForKey:(iTermColorMapKey)theKey from:(NSColor *)before to:(NSColor *)after {
     if (theKey == kColorMapBackground) {
         [self updateScrollerForBackgroundColor];
         [[self enclosingScrollView] setBackgroundColor:[colorMap colorForKey:theKey]];
         [self recomputeBadgeLabel];
-        [_delegate textViewBackgroundColorDidChange];
+        [_delegate textViewBackgroundColorDidChangeFrom:before to:after];
         [_delegate textViewProcessedBackgroundColorDidChange];
     } else if (theKey == kColorMapForeground) {
         [self recomputeBadgeLabel];
-        [_delegate textViewForegroundColorDidChange];
+        [_delegate textViewForegroundColorDidChangeFrom:before to:after];
+    } else if (theKey == kColorMapCursor) {
+        [_delegate textViewCursorColorDidChangeFrom:before to:after];
     } else if (theKey == kColorMapSelection) {
         _drawingHelper.unfocusedSelectionColor = [[_colorMap colorForKey:theKey] colorDimmedBy:2.0/3.0
                                                                               towardsGrayLevel:0.5];
     }
+    [self updatePortholeColorsWithUseSelectedTextColor:[_delegate textViewShouldUseSelectedTextColor]];
     [self setNeedsDisplay:YES];
 }
 
-- (void)colorMap:(iTermColorMap *)colorMap
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap
     dimmingAmountDidChangeTo:(double)dimmingAmount {
     [_delegate textViewProcessedBackgroundColorDidChange];
     [[self superview] setNeedsDisplay:YES];
 }
 
-- (void)colorMap:(iTermColorMap *)colorMap
+- (void)immutableColorMap:(id<iTermColorMapReading>)colorMap
     mutingAmountDidChangeTo:(double)mutingAmount {
     [_delegate textViewProcessedBackgroundColorDidChange];
     [[self superview] setNeedsDisplay:YES];
@@ -4545,7 +4747,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     } else {
         color = [self.colorMap colorForKey:key];
         if (isFaint) {
-            color = [color colorWithAlphaComponent:0.5];
+            color = [color colorWithAlphaComponent:self.colorMap.faintTextAlpha];
         }
     }
     return color;
@@ -4575,28 +4777,20 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     [_delegate textViewDrawBackgroundImageInView:self viewRect:rect blendDefaultBackground:blend virtualOffset:virtualOffset];
 }
 
-- (VT100ScreenMark *)drawingHelperMarkOnLine:(int)line {
+- (id<VT100ScreenMarkReading>)drawingHelperMarkOnLine:(int)line {
     return [_dataSource markOnLine:line];
 }
 
-- (screen_char_t *)drawingHelperLineAtIndex:(int)line {
-    return [_dataSource getLineAtIndex:line];
+- (const screen_char_t *)drawingHelperLineAtIndex:(int)line {
+    return [_dataSource screenCharArrayForLine:line].line;
 }
 
-- (iTermExternalAttributeIndex *)drawingHelperExternalAttributesOnLine:(int)lineNumber {
+- (id<iTermExternalAttributeIndexReading>)drawingHelperExternalAttributesOnLine:(int)lineNumber {
     return [_dataSource externalAttributeIndexForLine:lineNumber];
 }
 
-- (screen_char_t *)drawingHelperLineAtScreenIndex:(int)line {
-    return [_dataSource getLineAtScreenIndex:line];
-}
-
-- (screen_char_t *)drawingHelperCopyLineAtIndex:(int)line toBuffer:(screen_char_t *)buffer {
-    return [_dataSource getLineAtIndex:line withBuffer:buffer];
-}
-
-- (iTermTextExtractor *)drawingHelperTextExtractor {
-    return [[[iTermTextExtractor alloc] initWithDataSource:_dataSource] autorelease];
+- (const screen_char_t *)drawingHelperLineAtScreenIndex:(int)line {
+    return [_dataSource screenCharArrayAtScreenIndex:line].line;
 }
 
 - (NSArray *)drawingHelperCharactersWithNotesOnLine:(int)line {
@@ -4636,11 +4830,13 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 - (PTYFontInfo *)drawingHelperFontForChar:(UniChar)ch
                                 isComplex:(BOOL)isComplex
                                renderBold:(BOOL *)renderBold
-                             renderItalic:(BOOL *)renderItalic {
+                             renderItalic:(BOOL *)renderItalic
+                                 remapped:(UTF32Char *)remapped {
     return [self getFontForChar:ch
                       isComplex:isComplex
                      renderBold:renderBold
-                   renderItalic:renderItalic];
+                   renderItalic:renderItalic
+                       remapped:remapped];
 }
 
 - (NSData *)drawingHelperMatchesOnLine:(int)line {
@@ -4660,6 +4856,10 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     return [NSString stringWithFormat:@"%@@%@:%@", scpFile.username, scpFile.hostname, scpFile.path];
 }
 
+- (BOOL)drawingHelperShouldPadBackgrounds:(out NSSize *)padding {
+    return NO;
+}
+
 #pragma mark - Accessibility
 
 // See WebCore's FrameSelectionMac.mm for the inspiration.
@@ -4672,6 +4872,15 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
         return rect;
     }
     return CGRectZero;
+}
+
+// These two are needed to make "Enable Full Keyboard Access" able to send spaces. Issue 10023.
+- (void)setAccessibilityContents:(NSArray *)accessibilityContents {
+    DLog(@"setAccessibilityContents::%@", accessibilityContents);
+}
+
+- (void)setAccessibilityValue:(id)accessibilityValue {
+    DLog(@"setAccessibilityValue:%@", accessibilityValue);
 }
 
 - (BOOL)isAccessibilityElement {
@@ -4897,15 +5106,21 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 - (NSString *)accessibilityHelperSelectedText {
     return [self selectedTextWithStyle:iTermCopyTextStylePlainText
                           cappedAtSize:0
-                     minimumLineNumber:[self accessibilityHelperLineNumberForAccessibilityLineNumber:0]];
+                     minimumLineNumber:[self accessibilityHelperLineNumberForAccessibilityLineNumber:0]
+                            timestamps:NO
+                             selection:self.selection];
 }
 
 - (NSURL *)accessibilityHelperCurrentDocumentURL {
     return [_delegate textViewCurrentLocation];
 }
 
-- (screen_char_t *)accessibilityHelperLineAtIndex:(int)accessibilityIndex {
-    return [_dataSource getLineAtIndex:[self accessibilityHelperLineNumberForAccessibilityLineNumber:accessibilityIndex]];
+- (const screen_char_t *)accessibilityHelperLineAtIndex:(int)accessibilityIndex continuation:(screen_char_t *)continuation {
+    ScreenCharArray *sca = [_dataSource screenCharArrayForLine:[self accessibilityHelperLineNumberForAccessibilityLineNumber:accessibilityIndex]];
+    if (continuation) {
+        *continuation = sca.continuation;
+    }
+    return sca.line;
 }
 
 - (int)accessibilityHelperWidth {
@@ -4968,7 +5183,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     context->hasActionableKeyMapping = [_delegate hasActionableKeyMappingForEvent:event];
     context->leftOptionKey = [_delegate optionKey];
     context->rightOptionKey = [_delegate rightOptionKey];
-    context->autorepeatMode = [[_dataSource terminal] autorepeatMode];
+    context->autorepeatMode = [_dataSource terminalAutorepeatMode];
 }
 
 - (void)keyboardHandler:(iTermKeyboardHandler *)keyboardhandler
@@ -5012,6 +5227,16 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     }
 }
 
+- (NSInteger)keyboardHandlerWindowNumber:(iTermKeyboardHandler *)keyboardhandler {
+    return self.window.windowNumber;
+}
+
+- (BOOL)keyboardHandler:(iTermKeyboardHandler *)keyboardhandler shouldBackspaceAt:(NSUInteger)location {
+    const NSRange cursorRange = [self nsrangeOfCursor];
+    DLog(@"cursor range=%@ location=%@", @(NSMaxRange(cursorRange)), @(location));
+    return NSMaxRange(cursorRange) == location;
+}
+
 #pragma mark - iTermBadgeLabelDelegate
 
 - (NSSize)badgeLabelSizeFraction {
@@ -5041,6 +5266,67 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     return _drawingHelper.cursorShadow;
 }
 
+#pragma mark - PTYNoteViewControllerDelegate
+
+- (void)noteDidRequestRemoval:(PTYNoteViewController *)note {
+    const iTermWarningSelection selection = [iTermWarning showWarningWithTitle:@"Really remove annotation?"
+                                                                       actions:@[ @"OK", @"Cancel" ]
+                                                                     accessory:nil
+                                                                    identifier:@"NoSyncConfirmRemoveAnnotation"
+                                                                   silenceable:kiTermWarningTypePermanentlySilenceable
+                                                                       heading:@"Confirm"
+                                                                        window:self.window];
+    if (selection == kiTermWarningSelection1) {
+        return;
+    }
+    [self.dataSource removeAnnotation:note.annotation];
+    [self removeNote:note];
+    [self.window makeFirstResponder:self];
+}
+
+// This removes the view controller and view. It assumes the PTYAnnotation was already removed from the datasource.
+- (void)removeNote:(PTYNoteViewController *)note {
+    [note.view removeFromSuperview];
+    [_notes removeObject:note];
+    [self updateAlphaValue];
+}
+
+- (void)noteDidEndEditing:(PTYNoteViewController *)note {
+    [self.window makeFirstResponder:self];
+}
+
+- (void)noteVisibilityDidChange:(PTYNoteViewController *)note {
+    if (!note.isNoteHidden) {
+        [self setAlphaValue:1];
+        return;
+    }
+    [self updateAlphaValue];
+}
+
+- (void)noteWillBeRemoved:(PTYNoteViewController *)note {
+    [self removeNote:note];
+}
+
+- (void)note:(PTYNoteViewController *)note setAnnotation:(id<PTYAnnotationReading>)annotation stringValue:(NSString *)stringValue {
+    [_dataSource setStringValueOfAnnotation:annotation to:stringValue];
+}
+
+- (void)updateAlphaValue {
+    if ([self allAnnotationsAreHidden] &&
+        !self.hasPortholes &&
+        self.contentNavigationShortcuts.count == 0) {
+        [self setAlphaValue:0.0];
+    } else {
+        [self setAlphaValue:1.0];
+    }
+}
+
+- (BOOL)allAnnotationsAreHidden {
+    return [_notes allWithBlock:^BOOL(PTYNoteViewController *note) {
+        return note.isNoteHidden;
+    }];
+}
+
 @end
 
 @implementation PTYTextView(MouseHandler)
@@ -5056,6 +5342,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (void)mouseHandlerMakeFirstResponder:(PTYMouseHandler *)handler {
+    [_delegate textViewDidReceiveSingleClick];
     [[self window] makeFirstResponder:self];
 }
 
@@ -5072,11 +5359,24 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
                  allowOverflow:(BOOL)allowRightMarginOverflow {
     if (event.type == NSEventTypeLeftMouseUp && event.clickCount == 1) {
         const NSPoint windowPoint = [event locationInWindow];
-        const NSPoint viewPoint = [self.enclosingScrollView convertPoint:windowPoint fromView:nil];
-        NSString *message = [_indicatorsHelper helpTextForIndicatorAt:viewPoint];
+        const NSPoint enclosingViewPoint = [self.enclosingScrollView convertPoint:windowPoint fromView:nil];
+        NSString *message = [_indicatorsHelper helpTextForIndicatorAt:enclosingViewPoint];
         if (message) {
-            [self showIndicatorMessage:message at:viewPoint];
+            [self showIndicatorMessage:message at:enclosingViewPoint];
             return VT100GridCoordMake(-1, -1);
+        }
+        if (_drawingHelper.offscreenCommandLine) {
+            NSRect rect = [iTermTextDrawingHelper offscreenCommandLineFrameForVisibleRect:[self adjustedDocumentVisibleRect]
+                                                                                 cellSize:NSMakeSize(_charWidth, _lineHeight)
+                                                                                 gridSize:VT100GridSizeMake(_dataSource.width, _dataSource.height)];
+            const NSPoint viewPoint = [self convertPoint:windowPoint fromView:nil];
+            if (NSPointInRect(viewPoint, rect)) {
+                DLog(@"Highlight %@", @(_drawingHelper.offscreenCommandLine.absoluteLineNumber));
+                [self highlightMarkOnLine:_drawingHelper.offscreenCommandLine.absoluteLineNumber - _dataSource.totalScrollbackOverflow
+                             hasErrorCode:NO];
+                [self scrollToAbsoluteOffset:_drawingHelper.offscreenCommandLine.absoluteLineNumber height:1];
+                return VT100GridCoordMake(-1, -1);
+            }
         }
     }
     const NSPoint temp =
@@ -5090,7 +5390,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (MouseMode)mouseHandlerMouseMode:(PTYMouseHandler *)handler {
-    return _dataSource.terminal.mouseMode;
+    return _dataSource.terminalMouseMode;
 }
 
 - (void)mouseHandlerDidSingleClick:(PTYMouseHandler *)handler {
@@ -5106,7 +5406,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
     return _selection;
 }
 
-- (iTermImageInfo *)mouseHandler:(PTYMouseHandler *)handler imageAt:(VT100GridCoord)coord {
+- (id<iTermImageInfoReading>)mouseHandler:(PTYMouseHandler *)handler imageAt:(VT100GridCoord)coord {
     return [self imageInfoAtCoord:coord];
 }
 
@@ -5121,7 +5421,8 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 }
 
 - (void)mouseHandlerDidMutateState:(PTYMouseHandler *)handler {
-    [_delegate refresh];
+    // Make changes to selection appear right away.
+    [self setNeedsDisplay:YES];
 }
 
 - (void)mouseHandlerDidInferScrollingIntent:(PTYMouseHandler *)handler trying:(BOOL)trying {
@@ -5203,10 +5504,10 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
 
 - (BOOL)mouseHandler:(PTYMouseHandler *)handler
  getFindOnPageCursor:(VT100GridCoord *)coord {
-    if (!_findOnPageHelper.haveFindCursor) {
+    if (_findOnPageHelper.findCursor.type != FindCursorTypeCoord) {
         return NO;
     }
-    const VT100GridAbsCoord findOnPageCursor = [_findOnPageHelper findCursorAbsCoord];
+    const VT100GridAbsCoord findOnPageCursor = _findOnPageHelper.findCursor.coord;
     *coord = VT100GridCoordMake(findOnPageCursor.x,
                                 findOnPageCursor.y -
                                 [_dataSource totalScrollbackOverflow]);
@@ -5249,7 +5550,7 @@ scrollToFirstResult:(BOOL)scrollToFirstResult {
           coordinate:(VT100GridCoord)coord
                point:(NSPoint)point
               event:(NSEvent *)event
-              deltaY:(CGFloat)deltaY
+               delta:(CGSize)delta
 allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
             testOnly:(BOOL)testOnly {
     return [_delegate textViewReportMouseEvent:eventType
@@ -5257,7 +5558,7 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
                                         button:button
                                     coordinate:coord
                                          point:point
-                                        deltaY:deltaY
+                                         delta:delta
                       allowDragBeforeMouseDown:allowDragBeforeMouseDown
                                       testOnly:testOnly];
 }
@@ -5279,9 +5580,20 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
     [self scrollLineDown:nil];
 }
 
-- (CGFloat)mouseHandler:(PTYMouseHandler *)mouseHandler accumulateVerticalScrollFromEvent:(NSEvent *)event {
+- (CGFloat)mouseHandler:(PTYMouseHandler *)mouseHandler accumulateScrollFromEvent:(NSEvent *)event {
     PTYScrollView *scrollView = (PTYScrollView *)self.enclosingScrollView;
-    return [self scrollDeltaYAdjustedForMouseReporting:[scrollView accumulateVerticalScrollFromEvent:event]];
+    if (event.it_isVerticalScroll) {
+        return [self scrollDeltaYAdjustedForMouseReporting:[scrollView accumulateVerticalScrollFromEvent:event]];
+    }
+
+    // Horizontal scroll
+    CGFloat delta;
+    if ([iTermAdvancedSettingsModel useModernScrollWheelAccumulator]) {
+        delta = [_horizontalScrollAccumulator deltaForEvent:event increment:self.charWidth];
+    } else {
+        delta = [_horizontalScrollAccumulator legacyDeltaForEvent:event increment:self.charWidth];
+    }
+    return [self scrollDeltaXAdjustedForMouseReporting:delta];
 }
 
 - (void)mouseHandler:(PTYMouseHandler *)handler
@@ -5309,26 +5621,35 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
 
 - (BOOL)mouseHandler:(PTYMouseHandler *)mouseHandler moveSelectionToGridCoord:(VT100GridCoord)coord
            viewCoord:(NSPoint)locationInTextView {
-    [self refresh];
     return [self moveSelectionEndpointToX:coord.x
                                         Y:coord.y
                        locationInTextView:locationInTextView];
 }
 
 - (NSString *)mouseHandler:(PTYMouseHandler *)mouseHandler
-               stringForUp:(BOOL)up  // if NO, then down
+        stringForUpOrRight:(BOOL)upOrRight  // if NO, then down/left
+                  vertical:(BOOL)vertical
                      flags:(NSEventModifierFlags)flags
                     latin1:(out BOOL *)forceLatin1 {
-    const BOOL down = !up;
+    const BOOL downOrLeft = !upOrRight;
 
     if ([self mouseHandlerAlternateScrollModeIsEnabled:mouseHandler]) {
         *forceLatin1 = YES;
-        NSData *data = down ? [_dataSource.terminal.output keyArrowDown:flags] :
-                              [_dataSource.terminal.output keyArrowUp:flags];
+        NSData *data;
+        if (vertical) {
+            data = downOrLeft ? [_dataSource.terminalOutput keyArrowDown:flags] :
+            [_dataSource.terminalOutput keyArrowUp:flags];
+        } else {
+            data = downOrLeft ? [_dataSource.terminalOutput keyArrowRight:flags] : [_dataSource.terminalOutput keyArrowLeft:flags];
+        }
         return [[[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] autorelease];
     } else {
         *forceLatin1 = NO;
-        NSString *string = down ? [iTermAdvancedSettingsModel alternateMouseScrollStringForDown] :
+        if (!vertical) {
+            // Legacy code path not supported
+            return @"";
+        }
+        NSString *string = downOrLeft ? [iTermAdvancedSettingsModel alternateMouseScrollStringForDown] :
                                   [iTermAdvancedSettingsModel alternateMouseScrollStringForUp];
         return [string stringByExpandingVimSpecialCharacters];
     }
@@ -5338,11 +5659,11 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
     if ([iTermAdvancedSettingsModel alternateMouseScroll]) {
         return YES;
     }
-    return [self.dataSource.terminal alternateScrollMode];
+    return self.dataSource.terminalAlternateScrollMode;
 }
 
 - (BOOL)mouseHandlerShowingAlternateScreen:(PTYMouseHandler *)mouseHandler {
-    return [self.dataSource.terminal softAlternateScreenMode];
+    return self.dataSource.terminalSoftAlternateScreenMode;
 }
 
 - (void)mouseHandlerWillDrag:(PTYMouseHandler *)mouseHandler {
@@ -5350,7 +5671,7 @@ allowDragBeforeMouseDown:(BOOL)allowDragBeforeMouseDown
 }
 
 - (void)mouseHandler:(PTYMouseHandler *)mouseHandler
-           dragImage:(iTermImageInfo *)image
+           dragImage:(id<iTermImageInfoReading>)image
             forEvent:(NSEvent *)event {
     [self _dragImage:image forEvent:event];
 }
@@ -5375,23 +5696,48 @@ dragSemanticHistoryWithEvent:(NSEvent *)event
     return [self.delegate textViewSwipeHandler];
 }
 
+- (CGSize)scrollDeltaAdjustedForMouseReporting:(CGSize)delta {
+    if (fabs(delta.width) > fabs(delta.height)) {
+        return CGSizeMake([self scrollDeltaXAdjustedForMouseReporting:delta.width], 0);
+    }
+    return CGSizeMake(0, [self scrollDeltaYAdjustedForMouseReporting:delta.height]);
+}
+
 - (CGFloat)scrollDeltaYAdjustedForMouseReporting:(CGFloat)deltaY {
+    return [self scrollDeltaWithUnit:self.enclosingScrollView.verticalLineScroll
+                               delta:deltaY];
+}
+
+- (CGFloat)scrollDeltaXAdjustedForMouseReporting:(CGFloat)deltaX {
+    return [self scrollDeltaWithUnit:self.charWidth delta:deltaX];
+}
+
+- (CGFloat)scrollDeltaWithUnit:(CGFloat)unit delta:(CGFloat)delta {
     if (![iTermAdvancedSettingsModel fastTrackpad]) {
-        return deltaY;
+        return delta;
     }
     // This value is used for mouse reporting and we need to report lines, not pixels.
-    const CGFloat frac = deltaY / self.enclosingScrollView.verticalLineScroll;
+    const CGFloat frac = delta / unit;
     if (frac < 0) {
         return floor(frac);
     }
     return ceil(frac);
 }
 
-- (CGFloat)mouseHandlerAccumulatedDeltaY:(PTYMouseHandler *)sender
-                                forEvent:(NSEvent *)event {
-    const CGFloat deltaY = [_scrollAccumulator deltaYForEvent:event
-                                                   lineHeight:self.enclosingScrollView.verticalLineScroll];
-    return [self scrollDeltaYAdjustedForMouseReporting:deltaY];
+- (CGSize)mouseHandlerAccumulatedDelta:(PTYMouseHandler *)sender
+                              forEvent:(NSEvent *)event {
+    CGSize delta = { 0 };
+    if (event.type != NSEventTypeScrollWheel) {
+        return delta;
+    }
+    if (event.it_isVerticalScroll) {
+        delta.height = [_scrollAccumulator deltaForEvent:event
+                                               increment:self.enclosingScrollView.verticalLineScroll];
+    } else {
+        delta.width = [_horizontalScrollAccumulator deltaForEvent:event
+                                                        increment:self.charWidth];
+    }
+    return [self scrollDeltaAdjustedForMouseReporting:delta];
 }
 
 - (long long)mouseHandlerTotalScrollbackOverflow:(nonnull PTYMouseHandler *)sender {
