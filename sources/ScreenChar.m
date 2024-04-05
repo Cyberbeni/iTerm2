@@ -179,7 +179,7 @@ screen_char_t ImageCharForNewImage(NSString *name,
 void SetPositionInImageChar(screen_char_t *charPtr, int x, int y)
 {
     charPtr->foregroundColor = x;
-    charPtr->backgroundColor = y;
+    charPtr->fgGreen = y;
 }
 
 void SetDecodedImage(unichar code, iTermImage *image, NSData *data) {
@@ -205,7 +205,7 @@ iTermImageInfo *GetMutableImageInfo(unichar code) {
 
 VT100GridCoord GetPositionOfImageInChar(screen_char_t c) {
     return VT100GridCoordMake(c.foregroundColor,
-                              c.backgroundColor);
+                              c.fgGreen);
 }
 
 int AppendToComplexChar(int key, unichar codePoint) {
